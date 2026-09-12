@@ -199,3 +199,69 @@ test('CodeBlock UI: Final render for edit-proposal card ensures code block body 
   assert.notStrictEqual(codeBlockWrapper, undefined);
   assert.strictEqual(codeBlockWrapper.className, 'code-block-wrapper');
 });
+
+test('CodeBlock UI: Renders collapsed with "lines pasted" label for user messages (> 15 lines)', () => {
+  const codeLines = Array.from({ length: 84 }, (_, i) => `note line ${i + 1}`);
+  const code = codeLines.join('\n');
+  const container = mockDocument.createElement('div');
+
+  const { wrapper, codeEl } = renderCodeBlock('dart:note.dart', code, container, mockDocument, { actionVerb: 'pasted' });
+
+  const header = wrapper.children[0];
+  const langSpan = header.children[0];
+
+  // Verify label contains "lines pasted" and correct line count & filename
+  assert.strictEqual(langSpan.textContent, 'note.dart — 84 lines pasted');
+
+  // Verify collapsed preview of 5 lines + ellipsis
+  const expectedSnippet = codeLines.slice(0, 5).join('\n') + '\n...';
+  assert.strictEqual(codeEl.textContent, expectedSnippet);
+
+  // Verify expand/collapse toggle
+  const actions = header.children[1];
+  const toggleBtn = actions.children.find(c => c.textContent === 'Expand' || c.textContent === 'Collapse');
+  assert.notStrictEqual(toggleBtn, undefined);
+  assert.strictEqual(toggleBtn!.textContent, 'Expand');
+
+  // Expand
+  toggleBtn!.click();
+  assert.strictEqual(toggleBtn!.textContent, 'Collapse');
+  assert.strictEqual(codeEl.textContent, code);
+
+  // Collapse again
+  toggleBtn!.click();
+  assert.strictEqual(toggleBtn!.textContent, 'Expand');
+  assert.strictEqual(codeEl.textContent, expectedSnippet);
+});
+
+test('CodeBlock UI: Independent collapse state between user-message blocks and AI-message blocks', () => {
+  const userLines = Array.from({ length: 50 }, (_, i) => `user line ${i + 1}`);
+  const userCode = userLines.join('\n');
+
+  const aiLines = Array.from({ length: 30 }, (_, i) => `ai line ${i + 1}`);
+  const aiCode = aiLines.join('\n');
+
+  const container = mockDocument.createElement('div');
+  const userBlock = renderCodeBlock('dart:note.dart', userCode, container, mockDocument, { actionVerb: 'pasted' });
+  const aiBlock = renderCodeBlock('typescript:solution.ts', aiCode, container, mockDocument, { actionVerb: 'written' });
+
+  const userLangSpan = userBlock.wrapper.children[0].children[0];
+  const aiLangSpan = aiBlock.wrapper.children[0].children[0];
+
+  assert.strictEqual(userLangSpan.textContent, 'note.dart — 50 lines pasted');
+  assert.strictEqual(aiLangSpan.textContent, 'solution.ts — 30 lines written');
+
+  const userToggle = userBlock.wrapper.children[0].children[1].children.find(c => c.textContent === 'Expand');
+  const aiToggle = aiBlock.wrapper.children[0].children[1].children.find(c => c.textContent === 'Expand');
+
+  // Expand user block
+  userToggle!.click();
+
+  assert.strictEqual(userToggle!.textContent, 'Collapse');
+  assert.strictEqual(userBlock.codeEl.textContent, userCode);
+
+  // AI block should remain collapsed
+  assert.strictEqual(aiToggle!.textContent, 'Expand');
+  assert.strictEqual(aiBlock.codeEl.textContent, aiLines.slice(0, 5).join('\n') + '\n...');
+});
+

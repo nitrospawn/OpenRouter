@@ -1517,10 +1517,13 @@ function renderInlineMarkdown(text: string, container: HTMLElement) {
   }
 }
 
-function renderFormattedContent(rawText: string, container: HTMLElement) {
+function renderFormattedContent(rawText: string, container: HTMLElement, role?: string) {
   // Strip out custom action blocks (create_file, edit_file, etc.) from displayed text 
   // because they will be rendered as interactive action cards below the message
   const cleanedText = rawText.replace(/```(?:create_file|edit_file|file):([^\r\n]+)\r?\n([\s\S]*?)```/gi, '').trim();
+
+  // Determine appropriate action verb for code block labels
+  const actionVerb = role === 'user' ? 'pasted' : 'written';
 
   // Split content by fenced code blocks: ```lang\ncode\n```
   const fenceRegex = /```([a-zA-Z0-9_\-+#]*)\r?\n([\s\S]*?)```/g;
@@ -1536,7 +1539,7 @@ function renderFormattedContent(rawText: string, container: HTMLElement) {
     const lang = (match[1] || 'text').trim();
     const code = match[2];
     
-    renderCodeBlock(lang, code, container, document);
+    renderCodeBlock(lang, code, container, document, { actionVerb });
 
     lastIndex = fenceRegex.lastIndex;
   }
@@ -1812,7 +1815,7 @@ function appendMessage(
     });
   }
 
-  renderFormattedContent(content, bodyEl);
+  renderFormattedContent(content, bodyEl, role);
 
   msgEl.appendChild(headerEl);
   msgEl.appendChild(bodyEl);

@@ -13,13 +13,30 @@ test('buildSystemPrompt: includes all four sequential behavioral directives', ()
   assert.ok(prompt.includes('Phase 2: Default-to-Plan Behavior'));
   assert.ok(prompt.includes('first produce a short implementation plan in plain language'));
 
-  // 3. Search Before Read
-  assert.ok(prompt.includes('Phase 3: Search-Before-Read Code Navigation'));
-  assert.ok(prompt.includes('Prefer targeted search and grep-style tools/queries'));
+  // 3. Targeted Navigation
+  assert.ok(prompt.includes('Phase 3: Targeted Navigation & Precision Code Generation'));
+  assert.ok(prompt.includes('Targeted scope over full-file dumping'));
 
   // 4. Code Verification Before Declaring Completion
   assert.ok(prompt.includes('Phase 4: Code Verification Before Declaring Completion'));
   assert.ok(prompt.includes('Re-check VS Code diagnostics on affected files'));
+});
+
+test('buildSystemPrompt: explicitly forbids mid-response pseudo tool-calls and explains context mechanism', () => {
+  const prompt = buildSystemPrompt();
+
+  // Tooling restrictions
+  assert.ok(prompt.includes('You do NOT have the ability to invoke tools (such as read_file, search_workspace, grep, or terminal runners) mid-response.'));
+  assert.ok(prompt.includes('There is NO tool-calling loop or mechanism in this extension watching for or executing tool calls.'));
+  assert.ok(prompt.includes('NEVER emit fake or pseudo tool-call syntax (such as `read_file:...`, `search:...`, or similar) expecting it to be executed.'));
+  
+  // Pre-gathered context explanation
+  assert.ok(prompt.includes('pre-gathered by the extension and injected directly into the prompt BEFORE you are called.'));
+  
+  // Missing file instruction
+  assert.ok(prompt.includes('If a Required File Is Not in Context:'));
+  assert.ok(prompt.includes('Do NOT simulate a tool call (e.g. do NOT write `read_file:...`).'));
+  assert.ok(prompt.includes('Directly and politely ask the user to open or provide the relevant content of that file'));
 });
 
 test('buildSystemPrompt: enforces strict order of operations in core workflow', () => {
@@ -40,16 +57,16 @@ test('buildSystemPrompt: enforces strict order of operations in core workflow', 
 
 test('buildSystemPrompt: skips search entirely when target file is explicitly stated', () => {
   const prompt = buildSystemPrompt();
-  assert.ok(prompt.includes('Skip search entirely when the file/location is already explicitly stated'));
-  assert.ok(prompt.includes('proceed directly against that named file without first running a workspace search'));
+  assert.ok(prompt.includes('When target file is explicitly named:'));
+  assert.ok(prompt.includes('proceed directly against that named file using the provided file context without questioning where it is'));
 });
 
 test('buildSystemPrompt: handles nonexistent named file with fallback search & plain language clarification', () => {
   const prompt = buildSystemPrompt();
   assert.ok(prompt.includes('Nonexistent Named File Fallback:'));
-  assert.ok(prompt.includes('do NOT hallucinate its contents or fail silently'));
-  assert.ok(prompt.includes('Check the workspace file tree for near matches or related files'));
-  assert.ok(prompt.includes('ask for clarification using plain language and list the closest candidate files found'));
+  assert.ok(prompt.includes('do NOT hallucinate its contents or pretend to fetch it via a tool call'));
+  assert.ok(prompt.includes('Check the workspace file tree list in your prompt for near matches or related files'));
+  assert.ok(prompt.includes('ask the user for clarification in plain language, suggesting the closest candidate files found'));
 });
 
 test('buildSystemPrompt: supports plan override phrases and trivial single-file exceptions', () => {

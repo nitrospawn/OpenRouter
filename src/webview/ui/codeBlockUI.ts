@@ -1,12 +1,18 @@
 import { parseCodeBlock, CODE_BLOCK_COLLAPSE_THRESHOLD } from './codeBlockUtils';
 
+export interface RenderCodeBlockOptions {
+  actionVerb?: 'written' | 'pasted' | string;
+}
+
 export function renderCodeBlock(
   lang: string,
   code: string,
   container: any,
-  documentObj: any // Pass document for testing, or use global document in browser
+  documentObj: any, // Pass document for testing, or use global document in browser
+  options: RenderCodeBlockOptions = {}
 ) {
   const state = parseCodeBlock(lang, code);
+  const actionVerb = options.actionVerb || 'written';
 
   const wrapper = documentObj.createElement('div');
   wrapper.className = 'code-block-wrapper';
@@ -16,7 +22,7 @@ export function renderCodeBlock(
 
   const langSpan = documentObj.createElement('span');
   if (state.isLarge) {
-    langSpan.textContent = `${state.displayTitle} — ${state.lineCount} lines written`;
+    langSpan.textContent = `${state.displayTitle} — ${state.lineCount} lines ${actionVerb}`;
   } else {
     langSpan.textContent = state.displayTitle;
   }
