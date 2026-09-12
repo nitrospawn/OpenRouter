@@ -1,0 +1,179 @@
+{
+  "name": "openrouter",
+  "displayName": "OpenRouter",
+  "description": "VS Code extension connecting to OpenRouter for flexible model choice, in-editor assistance, and transparent cost tracking.",
+  "version": "0.2.0",
+  "publisher": "qubators",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Machine Learning",
+    "Programming Languages"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "openrouter-view-container",
+          "title": "OpenRouter",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "views": {
+      "openrouter-view-container": [
+        {
+          "type": "webview",
+          "id": "openrouter.chatView",
+          "name": "Chat",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "openrouter.updateApiKey",
+        "title": "OpenRouter: Update API Key"
+      },
+      {
+        "command": "openrouter.clearApiKey",
+        "title": "OpenRouter: Clear API Key"
+      },
+      {
+        "command": "openrouter.clearHistory",
+        "title": "OpenRouter: Clear Chat History"
+      },
+      {
+        "command": "openrouter.openSettings",
+        "title": "OpenRouter: Open Settings"
+      },
+      {
+        "command": "openrouter.managePermissions",
+        "title": "OpenRouter: Manage Permissions"
+      },
+      {
+        "command": "openrouter.focusChat",
+        "title": "OpenRouter: Focus Chat Panel"
+      },
+      {
+        "command": "openrouter.resetPanelLocation",
+        "title": "OpenRouter: Reset Panel Location to Left"
+      },
+      {
+        "command": "openrouter.fixDiagnostic",
+        "title": "OpenRouter: Ask AI to Fix This Problem",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "openrouter.sendCurrentProblems",
+        "title": "OpenRouter: Send Current File Problems",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "openrouter.sendAllProblems",
+        "title": "OpenRouter: Send Entire Workspace Problems",
+        "icon": "$(project)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "openrouter.fixDiagnostic",
+          "group": "openrouter@1",
+          "when": "editorHasCodeActionsProvider || markersNavigationVisible"
+        }
+      ],
+      "problems/context": [
+        {
+          "command": "openrouter.fixDiagnostic",
+          "group": "openrouter@1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "openrouter.sendCurrentProblems",
+          "when": "view == workbench.panel.markers.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "openrouter.sendAllProblems",
+          "when": "view == workbench.panel.markers.view",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenRouter",
+      "properties": {
+        "openrouter.lastModel": {
+          "type": "string",
+          "default": "",
+          "description": "Last-used model for OpenRouter."
+        },
+        "openrouter.panelPosition": {
+          "type": "string",
+          "enum": [
+            "left",
+            "right"
+          ],
+          "default": "left",
+          "description": "Preferred panel position for OpenRouter view container."
+        },
+        "openrouter.privacy.redactionMode": {
+          "type": "string",
+          "enum": [
+            "mask",
+            "block_and_warn"
+          ],
+          "default": "mask",
+          "description": "Outgoing secret handling: mask automatically or block and warn before sending."
+        },
+        "openrouter.privacy.dataCollectionPolicy": {
+          "type": "string",
+          "enum": [
+            "deny",
+            "allow"
+          ],
+          "default": "deny",
+          "description": "Provider data collection & training policy: deny enforces Zero Data Retention (ZDR)."
+        },
+        "openrouter.privacy.warnOnDataTraining": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show warnings when selecting models whose providers may collect or train on prompt data."
+        },
+        "openrouter.diagnostics.includeWarnings": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include compiler and linter warnings when expanding problems in OpenRouter."
+        },
+        "openrouter.diagnostics.maxTokensWarningThreshold": {
+          "type": "number",
+          "default": 12000,
+          "description": "Token count warning threshold before expanding bulk diagnostics to AI."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.config.js --production",
+    "package": "vsce package --allow-missing-repository --no-git-tag-version",
+    "watch": "node esbuild.config.js --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node test/runTests.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.3"
+  }
+}

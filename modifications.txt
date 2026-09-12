@@ -1,0 +1,47 @@
+when an agent finished a tasks he should share a brief summary of what was carried out done ✅
+
+when an agent finished a tasks he should share a brief summary of what was carried out  done✅
+
+
+when the model is writing text to users it writes in markdown instead of rendering the text 
+let user messages be rendered and not in mark down done✅
+
+add  a tiny copu button to the use input text in case i want to copuy the request✅
+
+ability to select and aspect of agent output add to contectext to get moree clarification✅
+
+can we have a retry mechanism in the backen should we have a n error like this from openrouther✅
+
+
+when a previous conversation is openened  and it always contains approval messsages like preview diff, apply  and reject higlighted,  it should not be visible whenthe user has actually made a choice✅ 
+
+reset cotext token counter when the + sign is clicked ✅
+
+
+ability to rename a conversation history to aid recollection✅
+
+abbility to send all or specific prblems higlighted in vscode to the agent for resolution✅
+
+
+when the agent need user to apply edit or reject,can the option be not in the body of the message bu as a pop up below the hear of the page or above he input feils and an option to to say apply all if the cuses is required to acknowledge more than 2 changes✅
+
+
+
+i do not want redo button just undo✅
+
+when the we clic on undeo let the chat below that button be cleared out completely form use view and context✅
+
+after undo let the use input go to edit feild✅
+
+
+when model is writing code let the code be crrunhed when it so large to avoid scrolling  leaving just a snippet inview so that it does not fill the whole window but summaries should be visible since its written to a file ✅
+
+model selector high , low , mid✅
+
+
+context refinement ✅
+
+send confirmation notification for apply or approval to telegram
+
+
+please ensure that after edits, the file is saved when user click on apply

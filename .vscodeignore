@@ -1,0 +1,13 @@
+.vscode/**
+.vscode-test/**
+src/**
+!src/webview/ui/style.css
+test/**
+dist/test/**
+node_modules/**
+tsconfig.json
+esbuild.config.js
+PRD.md
+commands.txt
+.gitignore
+*.vsix
