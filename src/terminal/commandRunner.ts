@@ -1,9 +1,9 @@
 import * as vscode from 'vscode';
 import { PermissionManager } from '../permissions/permissionManager';
-import { ConfirmationDialogs } from '../permissions/confirmationDialogs';
 import { UsageStore } from '../usage/usageStore';
 import { ProjectResolver } from '../usage/projectResolver';
 import { SecretScanner } from '../privacy/secretScanner';
+import { TerminalOutputTracker } from './terminalOutputTracker';
 
 export interface CommandExecutionResult {
   executed: boolean;
@@ -14,8 +14,6 @@ export interface CommandExecutionResult {
 }
 
 export class CommandRunner {
-  private static allowedExactCommands: Set<string> = new Set();
-
   private static DESTRUCTIVE_PATTERNS = [
     /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*|-rf|-fr)\b/i,
     /\bdel\s+\/[sS]\b/i,
@@ -63,49 +61,49 @@ export class CommandRunner {
     permissionManager: PermissionManager,
     usageStore?: UsageStore
   ): Promise<CommandExecutionResult> {
-    const permState = permissionManager.getPermission('runTerminalCommand');
-    if (permState === 'deny') {
-      vscode.window.showErrorMessage('Terminal commands are disabled in OpenRouter permissions.');
-      return { executed: false, cancelled: true, command, cwd: '' };
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    const baseCwd = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : process.cwd();
+
+    // Check if OpenRouter Terminal already exists and has active shellIntegration cwd
+    let terminal = vscode.window.terminals.find((t) => t.name === 'OpenRouter Terminal');
+    let effectiveCwd = baseCwd;
+    if (terminal && (terminal as any).shellIntegration && (terminal as any).shellIntegration.cwd) {
+      const shellCwd = (terminal as any).shellIntegration.cwd;
+      effectiveCwd = typeof shellCwd === 'string' ? shellCwd : (shellCwd.fsPath || shellCwd.path || baseCwd);
     }
 
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    const cwd = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : process.cwd();
-
-    const normalizedCmd = command.trim();
+    const normalizedCmd = PermissionManager.normalizeCommand(command);
     const isDestructive = this.isDestructive(normalizedCmd);
     const suggestedReverse = this.getSuggestedReverse(normalizedCmd);
 
-    // If not in allowedExactCommands, prompt
-    if (!this.allowedExactCommands.has(normalizedCmd)) {
-      const confirmed = await ConfirmationDialogs.confirmTerminalCommand(
-        normalizedCmd,
-        cwd,
-        isDestructive,
-        suggestedReverse
-      );
+    // Single consolidated permission check
+    const permStatus = await permissionManager.checkTerminalCommandPermission(
+      normalizedCmd,
+      effectiveCwd,
+      isDestructive,
+      suggestedReverse
+    );
 
-      if (confirmed === 'deny') {
-        vscode.window.showInformationMessage('Command execution cancelled.');
-        return { executed: false, cancelled: true, command: normalizedCmd, cwd };
-      }
-
-      if (confirmed === 'allow_always') {
-        this.allowedExactCommands.add(normalizedCmd);
-      }
+    if (permStatus === 'denied') {
+      return { executed: false, cancelled: true, command: normalizedCmd, cwd: effectiveCwd };
     }
 
     // Run in VS Code integrated terminal
-    let terminal = vscode.window.terminals.find((t) => t.name === 'OpenRouter Terminal');
     if (!terminal) {
       terminal = vscode.window.createTerminal({
         name: 'OpenRouter Terminal',
-        cwd,
+        cwd: effectiveCwd,
       });
     }
 
     terminal.show();
-    terminal.sendText(normalizedCmd);
+    
+    if (terminal.shellIntegration) {
+      const execution = terminal.shellIntegration.executeCommand(normalizedCmd);
+      TerminalOutputTracker.trackExecution(execution, normalizedCmd, effectiveCwd);
+    } else {
+      terminal.sendText(normalizedCmd);
+    }
 
     // Log to local audit store with secrets redacted (PRD Phase 7 §7.1 / terminal audit requirement)
     if (usageStore) {
@@ -115,7 +113,11 @@ export class CommandRunner {
         type: 'terminal_command',
         project: projectName,
         command: sanitizedCmdForAudit,
-        cwd,
+        cwd: effectiveCwd,
+        cost: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
       });
     }
 
@@ -123,7 +125,8 @@ export class CommandRunner {
       executed: true,
       cancelled: false,
       command: normalizedCmd,
-      cwd,
+      cwd: effectiveCwd,
     };
   }
 }
+

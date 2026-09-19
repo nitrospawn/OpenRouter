@@ -56,3 +56,35 @@ export function parseCodeBlock(lang: string, code: string): CodeBlockRenderState
     };
   }
 }
+
+export const USER_MESSAGE_COLLAPSE_LINE_THRESHOLD = 15;
+export const USER_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 800;
+
+export function isLongUserMessage(content: string): boolean {
+  if (!content) return false;
+  const lines = content.split(/\r?\n/);
+  return lines.length > USER_MESSAGE_COLLAPSE_LINE_THRESHOLD || content.length > USER_MESSAGE_COLLAPSE_CHAR_THRESHOLD;
+}
+
+export function getUserMessagePreviewText(content: string): string {
+  if (!content) return '';
+  const lines = content.split(/\r?\n/);
+  if (lines.length > 5) {
+    let preview = lines.slice(0, 5).join('\n');
+    const fenceCount = (preview.match(/```/g) || []).length;
+    if (fenceCount % 2 !== 0) {
+      preview += '\n```';
+    }
+    return preview + '\n...';
+  }
+  if (content.length > 300) {
+    let preview = content.slice(0, 300);
+    const fenceCount = (preview.match(/```/g) || []).length;
+    if (fenceCount % 2 !== 0) {
+      preview += '\n```';
+    }
+    return preview + '...';
+  }
+  return content;
+}
+

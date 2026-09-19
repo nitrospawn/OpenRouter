@@ -157,6 +157,30 @@
           "type": "number",
           "default": 12000,
           "description": "Token count warning threshold before expanding bulk diagnostics to AI."
+        },
+        "openrouter.reviewer.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Enable Reviewer Model for evaluating implementation plans and verification walkthroughs (per-workspace)."
+        },
+        "openrouter.reviewer.model": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Selected model ID for the Reviewer Model (per-workspace)."
+        },
+        "openrouter.reviewer.reasoningEffort": {
+          "type": "string",
+          "default": "medium",
+          "scope": "resource",
+          "description": "Reasoning effort level for the Reviewer Model (per-workspace)."
+        },
+        "openrouter.reviewer.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Custom system prompt for the Reviewer Model (per-workspace)."
         }
       }
     }

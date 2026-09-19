@@ -82,4 +82,67 @@ export class Configuration {
     const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
     return config.get<number>('diagnostics.maxTokensWarningThreshold', 12000);
   }
+
+  // --- Reviewer Model Settings (PRD Phase 10 - Strictly Per-Workspace) ---
+
+  public static readonly DEFAULT_REVIEWER_SYSTEM_PROMPT =
+    `You are an expert, meticulous code reviewer and architectural critic.
+Your objective is to thoroughly evaluate the provided implementation plan or verification/walkthrough result.
+
+Critique Guidelines:
+1. Correctness & Logic: Identify faulty assumptions, subtle logic bugs, off-by-one errors, or concurrency/race conditions.
+2. Completeness & Edge Cases: Check if missing files, unhandled error paths, null/undefined states, or boundary cases were overlooked.
+3. Safety & Security: Flag security vulnerabilities, unescaped inputs, unauthorized actions, destructive commands, or secret exposure.
+4. Architectural Quality & Regression Risk: Ensure adherence to Clean Architecture, single responsibility, type safety, and minimal side effects on untouched files.
+5. Fenced Copy-Intended Content: Always emit code snippets, diffs, config samples, or terminal commands inside dedicated fenced code blocks with language tags, separate from prose explanation.
+
+Provide a constructive, prioritized critique with clear, actionable recommendations. Be concise, rigorous, and direct.`;
+
+  public static getReviewerEnabled(): boolean {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    return config.get<boolean>('reviewer.enabled', false);
+  }
+
+  public static async setReviewerEnabled(enabled: boolean): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('reviewer.enabled', enabled, vscode.ConfigurationTarget.Workspace);
+  }
+
+  public static getReviewerModel(): string {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    return config.get<string>('reviewer.model', '');
+  }
+
+  public static async setReviewerModel(modelId: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('reviewer.model', modelId, vscode.ConfigurationTarget.Workspace);
+  }
+
+  public static getReviewerReasoningEffort(): string {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    return config.get<string>('reviewer.reasoningEffort', 'medium');
+  }
+
+  public static async setReviewerReasoningEffort(effort: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('reviewer.reasoningEffort', effort, vscode.ConfigurationTarget.Workspace);
+  }
+
+  public static getReviewerSystemPrompt(): string {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    const custom = config.get<string>('reviewer.systemPrompt', '');
+    return custom && custom.trim().length > 0 ? custom : this.DEFAULT_REVIEWER_SYSTEM_PROMPT;
+  }
+
+  public static async setReviewerSystemPrompt(prompt: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('reviewer.systemPrompt', prompt, vscode.ConfigurationTarget.Workspace);
+  }
+
+  public static async resetReviewerSystemPrompt(): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    // Resetting to undefined removes the per-workspace override, reverting to default
+    await config.update('reviewer.systemPrompt', undefined, vscode.ConfigurationTarget.Workspace);
+  }
 }
+

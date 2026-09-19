@@ -95,3 +95,16 @@ export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilit
     outputModalities: outputModalities.length > 0 ? outputModalities : ['text'],
   };
 }
+
+export function getDefaultReasoningEffort(supportedLevels?: string[]): string {
+  if (!supportedLevels || supportedLevels.length === 0) {
+    return 'low';
+  }
+  if (supportedLevels.includes('low')) {
+    return 'low';
+  }
+  if (supportedLevels.includes('medium')) {
+    return 'medium';
+  }
+  return supportedLevels[0];
+}

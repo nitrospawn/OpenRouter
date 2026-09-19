@@ -1,4 +1,6 @@
 import { renderCodeBlock } from './codeBlockUI';
+import { isLongUserMessage, getUserMessagePreviewText } from './codeBlockUtils';
+import { getDefaultReasoningEffort } from '../../api/modelCapabilities';
 // Declared VS Code Webview API
 declare function acquireVsCodeApi(): {
   postMessage(message: any): void;
@@ -7,6 +9,14 @@ declare function acquireVsCodeApi(): {
 };
 
 const vscode = acquireVsCodeApi();
+
+// Live permission tracking for active webview session
+let currentPermissions: Record<string, string> = {
+  readActiveContext: 'allow',
+  applyEdit: 'ask',
+  runTerminalCommand: 'ask',
+  readWorkspaceFiles: 'allow',
+};
 
 // Persistent state for resolved file edits (applied or rejected)
 const resolvedEdits: Record<string, { status: 'applied' | 'rejected'; checkpointId?: string }> = (() => {
@@ -55,93 +65,349 @@ const copyInputBtn = document.getElementById('copy-input-btn') as HTMLButtonElem
 const sendBtn = document.getElementById('send-btn') as HTMLButtonElement;
 const stopBtn = document.getElementById('stop-btn') as HTMLButtonElement;
 const uploadImgBtn = document.getElementById('upload-img-btn') as HTMLButtonElement;
+const attachFileBtn = document.getElementById('attach-file-btn') as HTMLButtonElement;
 const voiceInputBtn = document.getElementById('voice-input-btn') as HTMLButtonElement;
 const imageFileInput = document.getElementById('image-file-input') as HTMLInputElement;
+const docFileInput = document.getElementById('doc-file-input') as HTMLInputElement;
 const attachmentPreviewBar = document.getElementById('attachment-preview-bar') as HTMLDivElement;
 const inputBoxWrapper = document.getElementById('input-box-wrapper') as HTMLDivElement;
 
-let attachments: Array<{ id: string; name: string; data: string; isImage: boolean }> = [];
-
-function addAttachment(name: string, data: string, isImage: boolean) {
-  const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
-  attachments.push({ id, name, data, isImage });
-  renderAttachments();
+export interface ChatInputAttachment {
+  id: string;
+  name: string;
+  data: string;
+  isImage: boolean;
+  isArtifact?: boolean;
+  artifactType?: 'plan' | 'walkthrough';
+  isQuote?: boolean;
+  isReviewerFeedback?: boolean;
 }
 
-function removeAttachment(id: string) {
-  attachments = attachments.filter(a => a.id !== id);
-  renderAttachments();
+export interface ChatInputController {
+  getAttachments(): ChatInputAttachment[];
+  clearAttachments(): void;
+  addAttachment(name: string, data: string, isImage: boolean, isArtifact?: boolean, artifactType?: 'plan' | 'walkthrough', isQuote?: boolean, isReviewerFeedback?: boolean): void;
+  getValue(): string;
+  setValue(val: string): void;
+  focus(): void;
+  resetHeight(): void;
+  setEnabled(enabled: boolean): void;
 }
 
-function clearAttachments() {
-  attachments = [];
-  renderAttachments();
-  if (imageFileInput) {
-    imageFileInput.value = '';
-  }
-}
+export function createChatInputController(options: {
+  textarea: HTMLTextAreaElement;
+  inputBoxWrapper: HTMLElement;
+  attachmentBar: HTMLElement;
+  dropZone?: HTMLElement;
+  fileInput?: HTMLInputElement;
+  uploadBtn?: HTMLButtonElement;
+  docFileInput?: HTMLInputElement;
+  uploadDocBtn?: HTMLButtonElement;
+  onSend: () => void;
+}): ChatInputController {
+  const { textarea, inputBoxWrapper, attachmentBar, dropZone, fileInput, uploadBtn, docFileInput, uploadDocBtn, onSend } = options;
+  let attachmentsList: ChatInputAttachment[] = [];
 
-function renderAttachments() {
-  if (!attachmentPreviewBar) return;
-  attachmentPreviewBar.innerHTML = '';
-  
-  if (attachments.length === 0) {
-    attachmentPreviewBar.classList.add('hidden');
-    return;
-  }
-  
-  attachmentPreviewBar.classList.remove('hidden');
-  attachments.forEach(att => {
-    const chip = document.createElement('div');
-    chip.className = 'attachment-chip';
-    
-    if (att.isImage) {
-      const img = document.createElement('img');
-      img.className = 'attachment-preview-img';
-      img.src = att.data;
-      img.alt = 'attachment';
-      chip.appendChild(img);
+  function render() {
+    if (!attachmentBar) return;
+    attachmentBar.innerHTML = '';
+    if (attachmentsList.length === 0) {
+      attachmentBar.classList.add('hidden');
+      return;
     }
-    
-    const nameSpan = document.createElement('span');
-    nameSpan.className = 'attachment-name';
-    nameSpan.textContent = att.name;
-    chip.appendChild(nameSpan);
-    
-    const btn = document.createElement('button');
-    btn.className = 'chip-remove-btn';
-    btn.title = 'Remove attachment';
-    btn.textContent = '✕';
-    btn.addEventListener('click', () => removeAttachment(att.id));
-    chip.appendChild(btn);
-    
-    attachmentPreviewBar.appendChild(chip);
+    attachmentBar.classList.remove('hidden');
+    let quoteIndex = 0;
+    attachmentsList.forEach((att) => {
+      const chip = document.createElement('div');
+      chip.className = 'attachment-chip';
+      if (att.isImage) {
+        const img = document.createElement('img');
+        img.className = 'attachment-preview-img';
+        img.src = att.data;
+        img.alt = 'attachment';
+        chip.appendChild(img);
+      } else if (att.isQuote) {
+        quoteIndex++;
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'attachment-quote-icon';
+        iconSpan.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+          </svg>
+        `;
+        chip.appendChild(iconSpan);
+      } else if (att.isReviewerFeedback) {
+        chip.classList.add('reviewer-chip');
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'attachment-reviewer-icon';
+        iconSpan.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="16" y1="13" x2="8" y2="13"></line>
+            <line x1="16" y1="17" x2="8" y2="17"></line>
+            <polyline points="10 9 9 9 8 9"></polyline>
+          </svg>
+        `;
+        chip.appendChild(iconSpan);
+        chip.title = att.data.length > 300 ? `${att.data.slice(0, 300)}...` : att.data;
+      }
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'attachment-name';
+      let displayName = att.name;
+      if (att.isQuote) {
+        displayName = att.name.replace(/^Quote(?:\s*\d+)?:/i, `Quote ${quoteIndex}:`);
+      }
+      nameSpan.textContent = displayName;
+      chip.appendChild(nameSpan);
+
+      const btn = document.createElement('button');
+      btn.className = 'chip-remove-btn';
+      btn.title = 'Remove attachment';
+      btn.textContent = '✕';
+      btn.addEventListener('click', () => {
+        attachmentsList = attachmentsList.filter((a) => a.id !== att.id);
+        render();
+      });
+      chip.appendChild(btn);
+      attachmentBar.appendChild(chip);
+    });
+  }
+
+  function isImageFile(file: any): boolean {
+    if (!file) return false;
+    if (file.type && typeof file.type === 'string' && file.type.startsWith('image/')) return true;
+    return /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i.test(file.name || '');
+  }
+
+  function handleImageFile(file: File) {
+    if (!file || !isImageFile(file)) return;
+    if (typeof FileReader === 'undefined') {
+      const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
+      attachmentsList.push({ id, name: file.name || 'Image attachment', data: (file as any).data || '', isImage: true });
+      render();
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result as string;
+      if (result) {
+        const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
+        attachmentsList.push({ id, name: file.name || 'Image attachment', data: result, isImage: true });
+        render();
+      }
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handleTextFile(file: File) {
+    if (!file) return;
+    if (typeof FileReader === 'undefined') {
+      const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
+      attachmentsList.push({ id, name: file.name || 'Attached document', data: (file as any).data || '', isImage: false });
+      render();
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result as string;
+      if (result) {
+        const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
+        attachmentsList.push({ id, name: file.name || 'Attached document', data: result, isImage: false });
+        render();
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // Auto-grow height
+  if (textarea) {
+    textarea.addEventListener('input', () => {
+      textarea.style.height = 'auto';
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
+    });
+
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        onSend();
+      }
+    });
+
+    // Paste handling scoped to this textarea
+    textarea.addEventListener('paste', (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file') {
+          const file = item.getAsFile();
+          if (file) {
+            if (isImageFile(file)) {
+              handleImageFile(file);
+            } else {
+              handleTextFile(file);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  // File input click (image)
+  if (uploadBtn && fileInput) {
+    uploadBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      fileInput.click();
+    });
+
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files?.[0];
+      if (file) {
+        handleImageFile(file);
+        fileInput.value = '';
+      }
+    });
+  }
+
+  // Document/file input click (general file attach)
+  if (uploadDocBtn && docFileInput) {
+    uploadDocBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      docFileInput.click();
+    });
+
+    docFileInput.addEventListener('change', () => {
+      const files = docFileInput.files;
+      if (files && files.length > 0) {
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          if (isImageFile(file)) {
+            handleImageFile(file);
+          } else {
+            handleTextFile(file);
+          }
+        }
+        docFileInput.value = '';
+      }
+    });
+  }
+
+  // Drag and Drop: apply to inputBoxWrapper and optionally an expanded dropZone
+  const dropTargets = [inputBoxWrapper];
+  if (dropZone && dropZone !== inputBoxWrapper) {
+    dropTargets.push(dropZone);
+  }
+
+  let dragCounter = 0;
+
+  dropTargets.forEach((target) => {
+    target.addEventListener('dragenter', (e: any) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = 'copy';
+      }
+      dragCounter++;
+      if (dragCounter === 1) {
+        inputBoxWrapper.classList.add('drag-over');
+      }
+    });
+
+    target.addEventListener('dragover', (e: any) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = 'copy';
+      }
+    });
+
+    target.addEventListener('dragleave', (e: any) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounter--;
+      if (dragCounter <= 0) {
+        dragCounter = 0;
+        inputBoxWrapper.classList.remove('drag-over');
+      }
+    });
+
+    target.addEventListener('drop', (e: any) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounter = 0;
+      inputBoxWrapper.classList.remove('drag-over');
+
+      const fileList: File[] = [];
+      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          if (file) fileList.push(file);
+        }
+      } else if (e.dataTransfer?.items && e.dataTransfer.items.length > 0) {
+        for (let i = 0; i < e.dataTransfer.items.length; i++) {
+          const item = e.dataTransfer.items[i];
+          if (item.kind === 'file') {
+            const file = item.getAsFile();
+            if (file) fileList.push(file);
+          }
+        }
+      }
+
+      fileList.forEach((file) => {
+        if (isImageFile(file)) {
+          handleImageFile(file);
+        } else {
+          handleTextFile(file);
+        }
+      });
+    });
   });
+
+  return {
+    getAttachments: () => [...attachmentsList],
+    clearAttachments: () => {
+      attachmentsList = [];
+      render();
+      if (fileInput) fileInput.value = '';
+      if (docFileInput) docFileInput.value = '';
+    },
+    addAttachment: (name: string, data: string, isImage: boolean, isArtifact?: boolean, artifactType?: 'plan' | 'walkthrough', isQuote?: boolean, isReviewerFeedback?: boolean) => {
+      if (isQuote && attachmentsList.some((a) => a.isQuote && a.data === data)) {
+        return;
+      }
+      if (isReviewerFeedback && attachmentsList.some((a) => a.isReviewerFeedback && a.data === data)) {
+        return;
+      }
+      const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
+      attachmentsList.push({ id, name, data, isImage, isArtifact, artifactType, isQuote, isReviewerFeedback });
+      render();
+    },
+    getValue: () => textarea?.value || '',
+    setValue: (val: string) => {
+      if (textarea) {
+        textarea.value = val;
+        textarea.style.height = 'auto';
+        textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`;
+      }
+    },
+    focus: () => textarea?.focus(),
+    resetHeight: () => {
+      if (textarea) {
+        textarea.style.height = 'auto';
+      }
+    },
+    setEnabled: (enabled: boolean) => {
+      if (textarea) textarea.disabled = !enabled;
+      if (uploadBtn) uploadBtn.disabled = !enabled;
+      if (uploadDocBtn) uploadDocBtn.disabled = !enabled;
+    },
+  };
 }
 
-function processImageFile(file: File) {
-  if (!file || !file.type.startsWith('image/')) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const result = e.target?.result as string;
-    if (result) {
-      addAttachment(file.name || 'Pasted image', result, true);
-    }
-  };
-  reader.readAsDataURL(file);
-}
-
-function processTextFile(file: File) {
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const result = e.target?.result as string;
-    if (result) {
-      addAttachment(file.name || 'Pasted document', result, false);
-    }
-  };
-  reader.readAsText(file);
-}
+// Controller instances
+let mainChatInputController: ChatInputController;
+let reviewerChatInputController: ChatInputController;
 
 const statusText = document.getElementById('status-text') as HTMLSpanElement;
 const tokenMeter = document.getElementById('token-meter') as HTMLSpanElement;
@@ -155,6 +421,7 @@ const viewSettings = document.getElementById('view-settings') as HTMLDivElement;
 const spendTodayEl = document.getElementById('spend-today') as HTMLDivElement;
 const spendWeekEl = document.getElementById('spend-week') as HTMLDivElement;
 const spendMonthEl = document.getElementById('spend-month') as HTMLDivElement;
+const spendTotalEl = document.getElementById('spend-total') as HTMLDivElement;
 
 const filterProject = document.getElementById('filter-project') as HTMLSelectElement;
 const filterModel = document.getElementById('filter-model') as HTMLSelectElement;
@@ -165,18 +432,11 @@ const auditTableBody = document.getElementById('audit-table-body') as HTMLTableS
 const settingsBackBtn = document.getElementById('settings-back-btn') as HTMLButtonElement;
 const settingsMaskedKey = document.getElementById('settings-masked-key') as HTMLSpanElement;
 const settingsUpdateKeyBtn = document.getElementById('settings-update-key-btn') as HTMLButtonElement;
-const posLeftBtn = document.getElementById('pos-left-btn') as HTMLButtonElement;
-const posRightBtn = document.getElementById('pos-right-btn') as HTMLButtonElement;
-const settingsDefaultModel = document.getElementById('settings-default-model') as HTMLSelectElement;
 const resetPermissionsBtn = document.getElementById('reset-permissions-btn') as HTMLButtonElement;
 const chkAutoSummarize = document.getElementById('chk-auto-summarize') as HTMLInputElement;
 const chkFullHistory = document.getElementById('chk-full-history') as HTMLInputElement;
 const settingsViewUsageBtn = document.getElementById('settings-view-usage-btn') as HTMLButtonElement;
 const settingsClearHistoryBtn = document.getElementById('settings-clear-history-btn') as HTMLButtonElement;
-const guideTitleText = document.getElementById('guide-title-text') as HTMLSpanElement;
-const guideBodyText = document.getElementById('guide-body-text') as HTMLDivElement;
-const positionGuideBox = document.getElementById('position-guide-box') as HTMLDivElement;
-const guideCloseBtn = document.getElementById('guide-close-btn') as HTMLButtonElement;
 const capabilityNoticeBanner = document.getElementById('capability-notice-banner') as HTMLDivElement;
 const capabilityNoticeText = document.getElementById('capability-notice-text') as HTMLSpanElement;
 const capabilityNoticeClose = document.getElementById('capability-notice-close') as HTMLButtonElement;
@@ -208,6 +468,95 @@ const chkStrictZdr = document.getElementById('chk-strict-zdr') as HTMLInputEleme
 const chkWarnTraining = document.getElementById('chk-warn-training') as HTMLInputElement;
 const settingsRedactionMode = document.getElementById('settings-redaction-mode') as HTMLSelectElement;
 
+// Reviewer Model Settings DOM References (PRD Phase 10 - Per-Workspace)
+const chkReviewerEnabled = document.getElementById('chk-reviewer-enabled') as HTMLInputElement;
+const reviewerConfigContainer = document.getElementById('reviewer-config-container') as HTMLDivElement;
+const reviewerModelSearchInput = document.getElementById('reviewer-model-search-input') as HTMLInputElement;
+const reviewerModelDropdown = document.getElementById('reviewer-model-dropdown') as HTMLDivElement;
+const reviewerModelWarning = document.getElementById('reviewer-model-warning') as HTMLDivElement;
+const reviewerReasoningContainer = document.getElementById('reviewer-reasoning-container') as HTMLDivElement;
+const reviewerReasoningSelect = document.getElementById('reviewer-reasoning-select') as HTMLSelectElement;
+const reviewerSystemPrompt = document.getElementById('reviewer-system-prompt') as HTMLTextAreaElement;
+const resetReviewerPromptBtn = document.getElementById('reset-reviewer-prompt-btn') as HTMLButtonElement;
+
+let currentReviewerModelId = '';
+let currentReviewerReasoningEffort = 'medium';
+let isReviewerEnabled = false;
+
+// Direct Reviewer Toggle Button (Main Chat Header)
+const reviewerToggleBtn = document.getElementById('reviewer-toggle-btn') as HTMLButtonElement;
+
+function updateReviewerToggleBtnVisibility(enabled: boolean) {
+  if (reviewerToggleBtn) {
+    if (enabled) {
+      if (reviewerToggleBtn.classList) {
+        reviewerToggleBtn.classList.remove('hidden');
+      } else {
+        reviewerToggleBtn.className = (reviewerToggleBtn.className || '').replace(/\bhidden\b/g, '').trim();
+      }
+    } else {
+      if (reviewerToggleBtn.classList) {
+        reviewerToggleBtn.classList.add('hidden');
+      } else if (!reviewerToggleBtn.className?.includes('hidden')) {
+        reviewerToggleBtn.className = ((reviewerToggleBtn.className || '') + ' hidden').trim();
+      }
+    }
+  }
+}
+updateReviewerToggleBtnVisibility(isReviewerEnabled);
+
+// Dedicated Reviewer View DOM References (PRD Phase 11 Consolidation)
+const viewReviewer = document.getElementById('view-reviewer') as HTMLDivElement;
+const reviewerBackBtn = document.getElementById('reviewer-back-btn') as HTMLButtonElement;
+const reviewerArtifactSection = document.getElementById('reviewer-artifact-section') as HTMLDivElement;
+const reviewerArtifactLabel = document.getElementById('reviewer-artifact-label') as HTMLSpanElement;
+const reviewerOpenTabBtn = document.getElementById('reviewer-open-tab-btn') as HTMLButtonElement;
+const reviewerToggleArtifactBtn = document.getElementById('reviewer-toggle-artifact-btn') as HTMLButtonElement;
+const reviewerArtifactPreviewBody = document.getElementById('reviewer-artifact-preview-body') as HTMLDivElement;
+const reviewerMessages = document.getElementById('reviewer-messages') as HTMLDivElement;
+const reviewerSelectionToolbar = document.getElementById('reviewer-selection-toolbar') as HTMLDivElement;
+const reviewerSendSelectionBtn = document.getElementById('reviewer-send-selection-btn') as HTMLButtonElement;
+const reviewerClarifySelectionBtn = document.getElementById('reviewer-clarify-selection-btn') as HTMLButtonElement;
+
+// In-Panel Reviewer Model Selector & Reasoning DOM References
+const reviewerPanelModelInput = document.getElementById('reviewer-panel-model-input') as HTMLInputElement;
+const reviewerPanelModelDropdown = document.getElementById('reviewer-panel-model-dropdown') as HTMLDivElement;
+const reviewerPanelReasoningContainer = document.getElementById('reviewer-panel-reasoning-container') as HTMLDivElement;
+const reviewerPanelReasoningSelect = document.getElementById('reviewer-panel-reasoning-select') as HTMLSelectElement;
+const reviewerCapabilityNoticeBanner = document.getElementById('reviewer-capability-notice-banner') as HTMLDivElement;
+const reviewerCapabilityNoticeText = document.getElementById('reviewer-capability-notice-text') as HTMLSpanElement;
+const reviewerCapabilityNoticeClose = document.getElementById('reviewer-capability-notice-close') as HTMLButtonElement;
+
+// Reviewer Sessions DOM References
+const reviewerNewChatBtn = document.getElementById('reviewer-new-chat-btn') as HTMLButtonElement;
+const reviewerSessionDropdown = document.getElementById('reviewer-session-dropdown') as HTMLDivElement;
+const reviewerSessionItemNew = document.getElementById('reviewer-session-item-new') as HTMLDivElement;
+const reviewerSessionHistoryList = document.getElementById('reviewer-session-history-list') as HTMLDivElement;
+const reviewerResetContextBtn = document.getElementById('reviewer-reset-context-btn') as HTMLButtonElement;
+
+// Reviewer Shared Input Bar DOM References
+const reviewerAttachmentPreviewBar = document.getElementById('reviewer-attachment-preview-bar') as HTMLDivElement;
+const reviewerInputBoxWrapper = document.getElementById('reviewer-input-box-wrapper') as HTMLDivElement;
+const reviewerPromptInput = document.getElementById('reviewer-prompt-input') as HTMLTextAreaElement;
+const reviewerImageFileInput = document.getElementById('reviewer-image-file-input') as HTMLInputElement;
+const reviewerDocFileInput = document.getElementById('reviewer-doc-file-input') as HTMLInputElement;
+const reviewerUploadImgBtn = document.getElementById('reviewer-upload-img-btn') as HTMLButtonElement;
+const reviewerAttachFileBtn = document.getElementById('reviewer-attach-file-btn') as HTMLButtonElement;
+const reviewerSendBtn = document.getElementById('reviewer-send-btn') as HTMLButtonElement;
+const reviewerStopBtn = document.getElementById('reviewer-stop-btn') as HTMLButtonElement;
+
+// Reviewer Footer DOM References
+const reviewerStatusText = document.getElementById('reviewer-status-text') as HTMLSpanElement;
+const reviewerTokenMeter = document.getElementById('reviewer-token-meter') as HTMLSpanElement;
+
+let currentReviewerArtifact: { type: 'plan' | 'walkthrough' | 'standalone'; content: string; uri?: string; messageId?: string } | null = null;
+let activeReviewerAssistantEl: HTMLElement | null = null;
+let activeReviewerAssistantContentEl: HTMLElement | null = null;
+let currentSelectedReviewerText = '';
+let activeReviewerSessionId = '';
+let activeReviewerModelId = '';
+let activeReviewerReasoningEffort = 'medium';
+
 let previousCapabilities: {
   supportsVision: boolean;
   supportsAudio: boolean;
@@ -226,6 +575,9 @@ interface ModelOption {
   name: string;
   context_length?: number;
   supports_zdr?: boolean;
+  supports_reasoning_effort?: boolean;
+  supported_reasoning_efforts?: string[];
+  supports_vision?: boolean;
 }
 
 interface ProposedEditData {
@@ -352,6 +704,158 @@ modelSearchInput.addEventListener('input', () => {
   filterAndRenderModels(modelSearchInput.value);
 });
 
+// Reviewer Model Combobox Controller (PRD Phase 10)
+function filterAndRenderReviewerModels(filter: string) {
+  if (!reviewerModelDropdown) return;
+  reviewerModelDropdown.innerHTML = '';
+  const search = filter.toLowerCase().trim();
+
+  const filtered = loadedModels.filter((m) => {
+    const matchSearch = m.name.toLowerCase().includes(search) || m.id.toLowerCase().includes(search);
+    const matchZdr = isZdrOnlyPolicyActive ? (m.supports_zdr !== false) : true;
+    return matchSearch && matchZdr;
+  });
+
+  if (filtered.length === 0) {
+    const emptyEl = document.createElement('div');
+    emptyEl.className = 'combobox-item';
+    emptyEl.style.cursor = 'default';
+    emptyEl.textContent = 'No matching models';
+    reviewerModelDropdown.appendChild(emptyEl);
+    return;
+  }
+
+  filtered.slice(0, 100).forEach((model) => {
+    const item = document.createElement('div');
+    item.className = 'combobox-item' + (model.id === currentReviewerModelId ? ' selected' : '');
+
+    const titleRow = document.createElement('div');
+    titleRow.style.display = 'flex';
+    titleRow.style.alignItems = 'center';
+    titleRow.style.justifyContent = 'space-between';
+
+    const title = document.createElement('div');
+    title.className = 'combobox-item-title';
+    title.textContent = model.name || model.id;
+
+    const zdrBadge = document.createElement('span');
+    if (model.supports_zdr !== false) {
+      zdrBadge.className = 'combobox-item-zdr ok';
+      zdrBadge.textContent = '🛡️ ZDR';
+      zdrBadge.title = 'Zero Data Retention / No Training';
+    } else {
+      zdrBadge.className = 'combobox-item-zdr warn';
+      zdrBadge.textContent = '⚠️ May Train';
+      zdrBadge.title = 'Provider may retain or train on data';
+    }
+
+    titleRow.appendChild(title);
+    titleRow.appendChild(zdrBadge);
+
+    const meta = document.createElement('div');
+    meta.className = 'combobox-item-meta';
+    meta.textContent = `${model.id} • ${model.context_length ? (model.context_length / 1000).toFixed(0) + 'k ctx' : 'standard ctx'}`;
+
+    item.appendChild(titleRow);
+    item.appendChild(meta);
+
+    item.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      selectReviewerModel(model.id, model.name);
+      closeReviewerDropdown();
+    });
+
+    reviewerModelDropdown.appendChild(item);
+  });
+}
+
+function selectReviewerModel(modelId: string, modelName?: string) {
+  currentReviewerModelId = modelId;
+  if (reviewerModelSearchInput) {
+    reviewerModelSearchInput.value = modelName || modelId;
+  }
+  if (reviewerModelWarning) {
+    if (modelId) {
+      reviewerModelWarning.classList.add('hidden');
+    } else {
+      reviewerModelWarning.classList.remove('hidden');
+    }
+  }
+
+  // Update Reviewer Reasoning Effort options if model supports it
+  updateReviewerReasoningControl(modelId);
+
+  vscode.postMessage({
+    type: 'SET_REVIEWER_SETTING',
+    key: 'model',
+    value: modelId,
+  });
+}
+
+function updateReviewerReasoningControl(modelId: string) {
+  if (!reviewerReasoningContainer || !reviewerReasoningSelect) return;
+
+  const model = loadedModels.find((m) => m.id === modelId);
+  const idLower = (modelId || '').toLowerCase();
+  const isReasoning =
+    model?.supports_reasoning_effort === true ||
+    idLower.includes('/o1') ||
+    idLower.includes('/o3') ||
+    idLower.includes('o1-') ||
+    idLower.includes('o3-') ||
+    idLower.includes('reasoning') ||
+    idLower.includes('deepseek-r1');
+
+  if (isReasoning) {
+    reviewerReasoningContainer.classList.remove('hidden');
+    const supportedLevels =
+      model?.supported_reasoning_efforts && model.supported_reasoning_efforts.length > 0
+        ? model.supported_reasoning_efforts
+        : ['low', 'medium', 'high'];
+
+    reviewerReasoningSelect.innerHTML = '';
+    supportedLevels.forEach((level) => {
+      const opt = document.createElement('option');
+      opt.value = level.toLowerCase();
+      opt.textContent = level.charAt(0).toUpperCase() + level.slice(1).toLowerCase();
+      reviewerReasoningSelect.appendChild(opt);
+    });
+
+    const defaultChoice = supportedLevels.includes('medium')
+      ? 'medium'
+      : supportedLevels[Math.floor(supportedLevels.length / 2)] || supportedLevels[0];
+
+    if (currentReviewerReasoningEffort && supportedLevels.includes(currentReviewerReasoningEffort)) {
+      reviewerReasoningSelect.value = currentReviewerReasoningEffort;
+    } else {
+      reviewerReasoningSelect.value = defaultChoice;
+      currentReviewerReasoningEffort = defaultChoice;
+    }
+  } else {
+    reviewerReasoningContainer.classList.add('hidden');
+  }
+}
+
+function openReviewerDropdown() {
+  if (!reviewerModelDropdown) return;
+  reviewerModelDropdown.classList.remove('hidden');
+  filterAndRenderReviewerModels(reviewerModelSearchInput ? reviewerModelSearchInput.value : '');
+}
+
+function closeReviewerDropdown() {
+  if (reviewerModelDropdown) {
+    reviewerModelDropdown.classList.add('hidden');
+  }
+}
+
+if (reviewerModelSearchInput) {
+  reviewerModelSearchInput.addEventListener('focus', openReviewerDropdown);
+  reviewerModelSearchInput.addEventListener('input', () => {
+    openReviewerDropdown();
+    filterAndRenderReviewerModels(reviewerModelSearchInput.value);
+  });
+}
+
 let currentSessions: Array<{ id: string; title: string; createdAt: number; updatedAt: number; messageCount: number }> = [];
 let activeSessionId = '';
 
@@ -392,6 +896,9 @@ if (sessionItemNew) {
 document.addEventListener('click', (e) => {
   if (!modelSearchInput.contains(e.target as Node) && !modelDropdown.contains(e.target as Node)) {
     closeDropdown();
+  }
+  if (reviewerModelSearchInput && reviewerModelDropdown && !reviewerModelSearchInput.contains(e.target as Node) && !reviewerModelDropdown.contains(e.target as Node)) {
+    closeReviewerDropdown();
   }
   if (sessionDropdown && newChatBtn && !newChatBtn.contains(e.target as Node) && !sessionDropdown.contains(e.target as Node)) {
     closeSessionDropdown();
@@ -623,6 +1130,19 @@ window.addEventListener('message', (event) => {
           }
         }
 
+        if (p.terminalOutputs) {
+          detailsHtml += `
+            <div class="context-detail-item">
+              <span>Recent Terminal Outputs</span>
+              <span>Captured</span>
+            </div>
+            <div class="context-detail-item context-detail-snippet">
+              <span style="display:block;margin-bottom:2px;font-size:10px;opacity:0.75;">Output Preview:</span>
+              <pre style="margin:0;padding:4px 6px;background:rgba(0,0,0,0.3);border-radius:4px;max-height:100px;overflow:auto;font-size:10px;font-family:monospace;white-space:pre-wrap;"><code>${escapeHtml(p.terminalOutputs)}</code></pre>
+            </div>
+          `;
+        }
+
         if (p.imageCount > 0) {
           detailsHtml += `<div class="context-detail-item"><span>Images Attached</span><span>${p.imageCount}</span></div>`;
         }
@@ -675,6 +1195,9 @@ window.addEventListener('message', (event) => {
     case 'MESSAGE_STREAM_START':
       activeAssistantMessageEl = document.createElement('div');
       activeAssistantMessageEl.className = 'message assistant';
+      if (msg.messageId) {
+        activeAssistantMessageEl.id = `msg-${msg.messageId}`;
+      }
 
       const streamHeader = document.createElement('div');
       streamHeader.className = 'message-header';
@@ -704,10 +1227,13 @@ window.addEventListener('message', (event) => {
 
     case 'MESSAGE_STREAM_DONE':
       if (activeAssistantContentEl) {
-        const fullText = activeAssistantContentEl.textContent || '';
+        const textToRender = msg.chatSummary || activeAssistantContentEl.textContent || '';
         activeAssistantContentEl.textContent = '';
-        renderFormattedContent(fullText, activeAssistantContentEl);
-        parseAndRenderActions(fullText, activeAssistantMessageEl);
+        renderFormattedContent(textToRender, activeAssistantContentEl);
+        if (activeAssistantMessageEl) {
+          activeAssistantMessageEl.dataset.rawContent = textToRender;
+          parseAndRenderActions(textToRender, activeAssistantMessageEl);
+        }
 
         // Add copy & clarify buttons to header now that content is complete
         if (activeAssistantMessageEl) {
@@ -726,7 +1252,7 @@ window.addEventListener('message', (event) => {
               <span>Clarify</span>
             `;
             quoteBtn.addEventListener('click', () => {
-              quoteAspectToInput(fullText);
+              quoteAspectToInput(textToRender);
             });
             headerActions.appendChild(quoteBtn);
 
@@ -741,7 +1267,7 @@ window.addEventListener('message', (event) => {
               <span>Copy</span>
             `;
             copyBtn.addEventListener('click', () => {
-              navigator.clipboard.writeText(fullText).then(() => {
+              navigator.clipboard.writeText(textToRender).then(() => {
                 const span = copyBtn.querySelector('span');
                 if (span) span.textContent = 'Copied!';
                 setTimeout(() => {
@@ -767,7 +1293,9 @@ window.addEventListener('message', (event) => {
       break;
 
     case 'EDIT_APPLIED': {
-      markEditResolved(msg.editId, 'applied', msg.checkpointId);
+      if (msg.success) {
+        markEditResolved(msg.editId, 'applied', msg.checkpointId);
+      }
       const card = document.getElementById(`edit-card-${msg.editId}`);
       if (card) {
         // Remove active action buttons (Preview, Apply, Reject) once a choice is made
@@ -776,13 +1304,20 @@ window.addEventListener('message', (event) => {
           actionsEl.innerHTML = '';
         }
 
-        const badge = document.createElement('div');
-        badge.id = `edit-status-${msg.editId}`;
+        let badge = document.getElementById(`edit-status-${msg.editId}`);
+        if (!badge) {
+          badge = document.createElement('div');
+          badge.id = `edit-status-${msg.editId}`;
+          badge.style.fontSize = '11px';
+          badge.style.padding = '6px 10px';
+          card.appendChild(badge);
+        }
         badge.style.color = msg.success ? '#7ee787' : '#d73a49';
-        badge.style.fontSize = '11px';
-        badge.style.padding = '6px 10px';
-        badge.textContent = msg.success ? '✓ Applied' : '✗ Failed to apply';
-        card.appendChild(badge);
+        badge.textContent = msg.success
+          ? '✓ Applied'
+          : (currentPermissions.applyEdit === 'deny'
+              ? '✗ Edit blocked — Code edits permission is set to Denied'
+              : '✗ Failed to apply');
 
         if (msg.success && msg.checkpointId) {
           // Tag the latest user message element with the checkpointId/affectedFiles
@@ -875,10 +1410,45 @@ window.addEventListener('message', (event) => {
 
 
     case 'USAGE_REPORT_DATA':
-      renderUsageReport(msg.summary, msg.records, msg.projects, msg.models);
+      renderUsageReport(msg.summary, msg.records, msg.projects, msg.models, msg.currentProject);
+      break;
+
+    case 'REVIEWER_VIEW_DATA':
+      openReviewerView(msg);
+      break;
+
+    case 'REVIEWER_ATTACH_ARTIFACT':
+      handleReviewerAttachArtifact(msg);
+      break;
+
+    case 'REVIEWER_STREAM_START':
+      handleReviewerStreamStart();
+      break;
+
+    case 'REVIEWER_STREAM_CHUNK':
+      handleReviewerStreamChunk(msg.chunk);
+      break;
+
+    case 'REVIEWER_STREAM_DONE':
+      handleReviewerStreamDone();
+      break;
+
+    case 'REVIEWER_STREAM_ERROR':
+      handleReviewerStreamError(msg.message, msg.partial, msg.canRetry);
+      break;
+
+    case 'REVIEWER_SESSIONS_LOADED':
+      renderReviewerSessionsList(msg.sessions || [], msg.activeSessionId || '');
+      break;
+
+    case 'SET_REVIEWER_BUSY':
+      handleSetReviewerBusy(msg.busy);
       break;
 
     case 'SETTINGS_DATA':
+      if (msg.permissions) {
+        currentPermissions = { ...msg.permissions };
+      }
       renderSettings(msg);
       break;
 
@@ -974,6 +1544,7 @@ function parseAndRenderActions(content: string, parentEl: HTMLDivElement | null,
   const fileActionRegex = /```(?:create_file|edit_file|file):([^\r\n]+)\r?\n([\s\S]*?)```/gi;
   let fileMatch;
   let editCount = 0;
+  const editProposals: { filePath: string; newContent: string; editId: string }[] = [];
   while ((fileMatch = fileActionRegex.exec(content)) !== null) {
     editCount++;
     let filePath = fileMatch[1].trim();
@@ -990,12 +1561,29 @@ function parseAndRenderActions(content: string, parentEl: HTMLDivElement | null,
     }
     const newContent = fileMatch[2];
     const editId = `${Date.now()}-${editCount}`;
+    editProposals.push({ filePath, newContent, editId });
+  }
 
+  if (editProposals.length > 0 && currentPermissions.applyEdit === 'deny') {
+    const notice = document.createElement('div');
+    notice.className = 'edit-denied-notice';
+    notice.style.margin = '8px 0';
+    notice.style.padding = '8px 12px';
+    notice.style.background = 'rgba(215, 58, 73, 0.15)';
+    notice.style.borderLeft = '3px solid #d73a49';
+    notice.style.borderRadius = '4px';
+    notice.style.fontSize = '12px';
+    notice.style.color = '#f85149';
+    notice.textContent = '⚠️ This edit was not applied — Code edits permission is currently set to Denied.';
+    parentEl.appendChild(notice);
+  }
+
+  for (const item of editProposals) {
     renderEditProposal(
-      editId,
+      item.editId,
       {
-        filePath,
-        newContent,
+        filePath: item.filePath,
+        newContent: item.newContent,
       },
       parentEl,
       isHistory
@@ -1052,14 +1640,30 @@ function renderTerminalRunAction(command: string, parentEl: HTMLElement) {
   const actions = document.createElement('div');
   actions.className = 'diff-actions';
 
-  const runBtn = document.createElement('button');
-  runBtn.className = 'btn';
-  runBtn.textContent = '▶ Run in Terminal';
-  runBtn.addEventListener('click', () => {
-    vscode.postMessage({ type: 'RUN_TERMINAL', command });
-  });
+  if (currentPermissions.runTerminalCommand === 'allow') {
+    const statusSpan = document.createElement('span');
+    statusSpan.style.fontSize = '11px';
+    statusSpan.style.color = '#7ee787';
+    statusSpan.style.padding = '4px 8px';
+    statusSpan.textContent = '▶ Executed automatically';
+    actions.appendChild(statusSpan);
+  } else if (currentPermissions.runTerminalCommand === 'deny') {
+    const statusSpan = document.createElement('span');
+    statusSpan.style.fontSize = '11px';
+    statusSpan.style.color = '#d73a49';
+    statusSpan.style.padding = '4px 8px';
+    statusSpan.textContent = '✗ Execution disabled by permissions';
+    actions.appendChild(statusSpan);
+  } else {
+    const runBtn = document.createElement('button');
+    runBtn.className = 'btn';
+    runBtn.textContent = '▶ Run in Terminal';
+    runBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'RUN_TERMINAL', command });
+    });
+    actions.appendChild(runBtn);
+  }
 
-  actions.appendChild(runBtn);
   card.appendChild(header);
   card.appendChild(actions);
   parentEl.appendChild(card);
@@ -1270,8 +1874,26 @@ function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: H
     badge.style.padding = '6px 10px';
     badge.textContent = '✓ Applied';
     card.appendChild(badge);
+  } else if (currentPermissions.applyEdit === 'allow') {
+    // Under Allow: Edit is auto-applied by host with zero manual interaction
+    const badge = document.createElement('div');
+    badge.id = `edit-status-${editId}`;
+    badge.style.color = '#7ee787';
+    badge.style.fontSize = '11px';
+    badge.style.padding = '6px 10px';
+    badge.textContent = '✓ Applied automatically';
+    card.appendChild(badge);
+  } else if (currentPermissions.applyEdit === 'deny') {
+    // Under Deny: Edit is blocked by permission settings
+    const badge = document.createElement('div');
+    badge.id = `edit-status-${editId}`;
+    badge.style.color = '#d73a49';
+    badge.style.fontSize = '11px';
+    badge.style.padding = '6px 10px';
+    badge.textContent = '✗ Edit blocked — Code edits permission is set to Denied';
+    card.appendChild(badge);
   } else {
-    // Unresolved proposal: track in pending edits bar if active turn
+    // Unresolved proposal (Ask mode): track in pending edits bar if active turn
     if (!isHistory) {
       pendingEditsMap.set(editId, {
         editId,
@@ -1281,9 +1903,6 @@ function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: H
       });
       updatePendingEditsBar();
     }
-
-    // Consolidated: Actions (Preview Diff, Apply, Reject) are now handled exclusively
-    // in the Persistent Pending-Edits bar sitting above the input bar.
   }
 
   if (parentEl) {
@@ -1345,10 +1964,8 @@ function updateCapabilitiesUI(
         reasoningEffortSelect.appendChild(opt);
       });
 
-      // Default to medium if supported, or the middle option, or first
-      const defaultChoice = supportedLevels.includes('medium')
-        ? 'medium'
-        : supportedLevels[Math.floor(supportedLevels.length / 2)] || supportedLevels[0];
+      // Default to low if supported, or medium, or first supported level
+      const defaultChoice = getDefaultReasoningEffort(supportedLevels);
 
       // Keep previously selected effort if still valid for this model; otherwise apply defaultChoice
       if (currentReasoningEffort && supportedLevels.includes(currentReasoningEffort)) {
@@ -1526,7 +2143,7 @@ function renderFormattedContent(rawText: string, container: HTMLElement, role?: 
   const actionVerb = role === 'user' ? 'pasted' : 'written';
 
   // Split content by fenced code blocks: ```lang\ncode\n```
-  const fenceRegex = /```([a-zA-Z0-9_\-+#]*)\r?\n([\s\S]*?)```/g;
+  const fenceRegex = /```([^\r\n]*)\r?\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let match;
 
@@ -1546,7 +2163,19 @@ function renderFormattedContent(rawText: string, container: HTMLElement, role?: 
 
   const remaining = cleanedText.slice(lastIndex);
   if (remaining) {
-    renderMarkdownBlocks(remaining, container);
+    // Check if remaining ends with an in-progress / unterminated code fence: ```lang\n[code...]
+    const openFenceMatch = remaining.match(/```([^\r\n]*)\r?\n([\s\S]*)$/);
+    if (openFenceMatch && openFenceMatch.index !== undefined) {
+      const preOpenFence = remaining.slice(0, openFenceMatch.index);
+      if (preOpenFence) {
+        renderMarkdownBlocks(preOpenFence, container);
+      }
+      const lang = (openFenceMatch[1] || 'text').trim();
+      const code = openFenceMatch[2];
+      renderCodeBlock(lang, code, container, document, { actionVerb });
+    } else {
+      renderMarkdownBlocks(remaining, container);
+    }
   }
 }
 
@@ -1579,6 +2208,94 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
+
+    // Check for artifact notice line
+    const planNoticeMatch = trimmed.match(/^📄\s*(?:Plan docs ready|Plan docs|Implementation plan ready|Plan ready)\s*(?:[—–-]\s*\[view\])?/i);
+    const walkthroughNoticeMatch = trimmed.match(/^📄\s*(?:Results docs ready|Results docs|Walkthrough result|Walkthrough ready|Result walkthrough)\s*(?:[—–-]\s*\[view\])?/i);
+    if (planNoticeMatch || walkthroughNoticeMatch) {
+      flushParagraph();
+      flushList();
+      const isPlan = !!planNoticeMatch;
+      const card = document.createElement('div');
+      card.className = 'chat-artifact-card';
+
+      const title = document.createElement('span');
+      title.className = 'chat-artifact-title';
+      title.innerHTML = `<span>📄</span><span>${isPlan ? 'Plan docs' : 'Results docs'}</span>`;
+
+      const actionsWrapper = document.createElement('div');
+      actionsWrapper.style.display = 'inline-flex';
+      actionsWrapper.style.gap = '6px';
+      actionsWrapper.style.alignItems = 'center';
+
+      const viewBtn = document.createElement('button');
+      viewBtn.className = 'chat-artifact-view-btn';
+      viewBtn.innerHTML = `
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+          <circle cx="12" cy="12" r="3"></circle>
+        </svg>
+        <span>View</span>
+      `;
+      viewBtn.addEventListener('click', () => {
+        const msgParent = container.closest('.message') as HTMLElement | null;
+        const msgId = msgParent && msgParent.id ? msgParent.id.replace('msg-', '') : undefined;
+        vscode.postMessage({
+          type: 'VIEW_ARTIFACT',
+          artifactType: isPlan ? 'plan' : 'walkthrough',
+          messageId: msgId,
+        });
+      });
+      actionsWrapper.appendChild(viewBtn);
+
+      // On plans, include "Proceed" action
+      if (isPlan) {
+        const proceedBtn = document.createElement('button');
+        proceedBtn.className = 'chat-artifact-proceed-btn';
+        proceedBtn.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"></polyline>
+          </svg>
+          <span>Proceed</span>
+        `;
+        proceedBtn.addEventListener('click', () => {
+          proceedBtn.disabled = true;
+          if (promptInput) {
+            promptInput.value = 'Proceed with the plan';
+            sendMessage();
+          }
+        });
+        actionsWrapper.appendChild(proceedBtn);
+      }
+
+      // If Reviewer Model is enabled for this workspace, add "Review" action
+      if (isReviewerEnabled) {
+        const reviewBtn = document.createElement('button');
+        reviewBtn.className = 'chat-artifact-review-btn';
+        reviewBtn.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <span>Review</span>
+        `;
+        reviewBtn.addEventListener('click', () => {
+          const msgParent = container.closest('.message') as HTMLElement | null;
+          const msgId = msgParent && msgParent.id ? msgParent.id.replace('msg-', '') : undefined;
+          vscode.postMessage({
+            type: 'START_REVIEW',
+            artifactType: isPlan ? 'plan' : 'walkthrough',
+            messageId: msgId,
+          });
+        });
+        actionsWrapper.appendChild(reviewBtn);
+      }
+
+      card.appendChild(title);
+      card.appendChild(actionsWrapper);
+      container.appendChild(card);
+      continue;
+    }
 
     // 1. Blank line
     if (!trimmed) {
@@ -1676,7 +2393,7 @@ function updateAllUndoButtonsAvailability() {
   });
 }
 
-function appendMessage(
+export function appendMessage(
   role: string,
   content: string,
   images?: Array<{ name: string; dataUrl: string }>,
@@ -1685,6 +2402,17 @@ function appendMessage(
   checkpointId?: string,
   affectedFiles?: string[]
 ) {
+  let displayContent = content;
+  if (role === 'user') {
+    if (content.includes('<!-- reviewer-feedback:start -->')) {
+      const stripped = content.replace(/<!-- reviewer-feedback:start -->[\s\S]*?<!-- reviewer-feedback:end -->\s*/g, '').trim();
+      displayContent = stripped || 'Please address the attached reviewer feedback.';
+    } else if (content.startsWith('[Reviewer Feedback]:')) {
+      const parts = content.split('\n\n');
+      displayContent = parts.slice(1).join('\n\n').trim() || 'Please address the attached reviewer feedback.';
+    }
+  }
+
   const msgEl = document.createElement('div');
   msgEl.className = `message ${role}`;
   msgEl.dataset.rawContent = content;
@@ -1731,7 +2459,7 @@ function appendMessage(
     <span>Copy</span>
   `;
   copyBtn.addEventListener('click', () => {
-    navigator.clipboard.writeText(content).then(() => {
+    navigator.clipboard.writeText(displayContent).then(() => {
       const span = copyBtn.querySelector('span');
       if (span) span.textContent = 'Copied!';
       setTimeout(() => {
@@ -1815,7 +2543,78 @@ function appendMessage(
     });
   }
 
-  renderFormattedContent(content, bodyEl, role);
+  if (role === 'user' && isLongUserMessage(displayContent)) {
+    const lines = displayContent.split(/\r?\n/);
+    const isReviewerFeedback = displayContent.toLowerCase().includes('reviewer');
+    const label = isReviewerFeedback
+      ? `Forwarded reviewer feedback — ${lines.length} lines`
+      : `Long message — ${lines.length} lines pasted`;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'code-block-wrapper';
+
+    const header = document.createElement('div');
+    header.className = 'code-block-header';
+
+    const langSpan = document.createElement('span');
+    langSpan.textContent = label;
+
+    const actionsContainer = document.createElement('div');
+    actionsContainer.className = 'code-block-actions';
+    actionsContainer.style.display = 'flex';
+    actionsContainer.style.gap = '8px';
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'code-block-copy-btn';
+    toggleBtn.textContent = 'Expand';
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'code-block-copy-btn';
+    copyBtn.textContent = 'Copy';
+    copyBtn.addEventListener('click', () => {
+      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+        navigator.clipboard.writeText(displayContent).then(() => {
+          copyBtn.textContent = 'Copied!';
+          setTimeout(() => {
+            copyBtn.textContent = 'Copy';
+          }, 2000);
+        });
+      }
+    });
+
+    actionsContainer.appendChild(toggleBtn);
+    actionsContainer.appendChild(copyBtn);
+
+    header.appendChild(langSpan);
+    header.appendChild(actionsContainer);
+    wrapper.appendChild(header);
+
+    const contentContainer = document.createElement('div');
+    contentContainer.className = 'user-message-collapse-body';
+
+    const previewText = getUserMessagePreviewText(displayContent);
+    let isCollapsed = true;
+
+    // Initially render collapsed preview
+    renderFormattedContent(previewText, contentContainer, role);
+
+    toggleBtn.addEventListener('click', () => {
+      isCollapsed = !isCollapsed;
+      contentContainer.innerHTML = '';
+      if (isCollapsed) {
+        toggleBtn.textContent = 'Expand';
+        renderFormattedContent(previewText, contentContainer, role);
+      } else {
+        toggleBtn.textContent = 'Collapse';
+        renderFormattedContent(displayContent, contentContainer, role);
+      }
+    });
+
+    wrapper.appendChild(contentContainer);
+    bodyEl.appendChild(wrapper);
+  } else {
+    renderFormattedContent(displayContent, bodyEl, role);
+  }
 
   msgEl.appendChild(headerEl);
   msgEl.appendChild(bodyEl);
@@ -1838,21 +2637,73 @@ saveKeyBtn.addEventListener('click', () => {
   }
 });
 
-function sendMessage() {
-  let text = promptInput.value.trim();
-  const currentImages: Array<{ name: string; dataUrl: string }> = [];
+mainChatInputController = createChatInputController({
+  textarea: promptInput,
+  inputBoxWrapper,
+  attachmentBar: attachmentPreviewBar,
+  dropZone: viewChat,
+  fileInput: imageFileInput,
+  uploadBtn: uploadImgBtn,
+  docFileInput,
+  uploadDocBtn: attachFileBtn,
+  onSend: sendMessage,
+});
 
-  attachments.forEach(att => {
+function sendMessage() {
+  const userTypedText = mainChatInputController.getValue().trim();
+  let promptToSend = userTypedText;
+  const currentImages: Array<{ name: string; dataUrl: string }> = [];
+  const quoteAttachments: string[] = [];
+  const reviewerAttachments: string[] = [];
+
+  mainChatInputController.getAttachments().forEach((att) => {
     if (att.isImage) {
       currentImages.push({ name: att.name, dataUrl: att.data });
+    } else if (att.isQuote) {
+      quoteAttachments.push(att.data);
+    } else if (att.isReviewerFeedback) {
+      reviewerAttachments.push(att.data);
     } else {
       // Append text file content to message text
       const formatted = `\n\`\`\`${att.name}\n${att.data}\n\`\`\`\n`;
-      text = text ? text.trimEnd() + formatted : formatted.trimStart();
+      promptToSend = promptToSend ? promptToSend.trimEnd() + formatted : formatted.trimStart();
     }
   });
 
-  if ((!text && currentImages.length === 0) || sendBtn.disabled) return;
+  if (quoteAttachments.length > 0) {
+    const quotedBlocks = quoteAttachments
+      .map((quote) =>
+        quote
+          .split('\n')
+          .map((line) => `> ${line}`)
+          .join('\n')
+      )
+      .join('\n\n');
+
+    if (promptToSend) {
+      promptToSend = `${quotedBlocks}\n\n${promptToSend}`;
+    } else {
+      const fallbackQuery =
+        quoteAttachments.length > 1
+          ? 'Can you clarify these points?'
+          : 'Can you clarify this?';
+      promptToSend = `${quotedBlocks}\n\n${fallbackQuery}`;
+    }
+  }
+
+  if (reviewerAttachments.length > 0) {
+    const feedbackBlock = reviewerAttachments
+      .map((fb) => `<!-- reviewer-feedback:start -->\n[Reviewer Feedback]:\n${fb}\n<!-- reviewer-feedback:end -->`)
+      .join('\n\n');
+
+    if (promptToSend) {
+      promptToSend = `${feedbackBlock}\n\n${promptToSend}`;
+    } else {
+      promptToSend = `${feedbackBlock}\n\nPlease address the attached reviewer feedback.`;
+    }
+  }
+
+  if ((!promptToSend && currentImages.length === 0) || sendBtn.disabled) return;
 
   // Generate a client-side message ID that the host will reuse when storing the message,
   // so the undo button ID written here matches the ID the host will use to tagTurnCheckpoint.
@@ -1865,20 +2716,23 @@ function sendMessage() {
       : undefined;
 
   lastSentMessage = {
-    content: text,
+    content: promptToSend,
     modelId: currentModelId,
     images: currentImages.length > 0 ? [...currentImages] : undefined,
     reasoningEffort: effortToSend,
   };
 
-  appendMessage('user', text, currentImages, false, userMessageId);
-  clearAttachments();
-  promptInput.value = '';
-  promptInput.style.height = '24px';
+  // The reviewer attachment is NOT rendered in the chat message bubble
+  const displayContent = userTypedText || (reviewerAttachments.length > 0 ? 'Please address the attached reviewer feedback.' : promptToSend);
+
+  appendMessage('user', displayContent, currentImages, false, userMessageId);
+  mainChatInputController.clearAttachments();
+  mainChatInputController.setValue('');
+  mainChatInputController.resetHeight();
   vscode.postMessage({
     type: 'SEND_MESSAGE',
     messageId: userMessageId,
-    content: text,
+    content: promptToSend,
     modelId: currentModelId,
     images: currentImages,
     reasoningEffort: effortToSend,
@@ -1891,102 +2745,6 @@ if (stopBtn) {
     vscode.postMessage({ type: 'STOP_STREAM' });
   });
 }
-
-// Attachment events: File Picker
-if (uploadImgBtn && imageFileInput) {
-  uploadImgBtn.addEventListener('click', (e) => {
-    e.preventDefault();
-    imageFileInput.click();
-  });
-
-  imageFileInput.addEventListener('change', () => {
-    const file = imageFileInput.files?.[0];
-    if (file) {
-      processImageFile(file);
-    }
-  });
-}
-
-// Attachment events: Clipboard Paste
-window.addEventListener('paste', (e: ClipboardEvent) => {
-  const items = e.clipboardData?.items;
-  if (!items) return;
-
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    if (item.kind === 'file') {
-      const file = item.getAsFile();
-      if (file) {
-        if (item.type.startsWith('image/')) {
-          processImageFile(file);
-        } else {
-          processTextFile(file);
-        }
-      }
-    }
-  }
-});
-
-// Attachment events: Drag and Drop
-['dragenter', 'dragover'].forEach((eventName) => {
-  window.addEventListener(eventName, (event) => {
-    const e = event as DragEvent;
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.dataTransfer) {
-      e.dataTransfer.dropEffect = 'copy';
-    }
-    if (inputBoxWrapper) {
-      inputBoxWrapper.classList.add('drag-over');
-    }
-  }, true);
-});
-
-['dragleave', 'dragend'].forEach((eventName) => {
-  window.addEventListener(eventName, (event) => {
-    const e = event as DragEvent;
-    e.preventDefault();
-    e.stopPropagation();
-    // Remove styling if leaving the document area
-    if (!e.relatedTarget || e.relatedTarget === document.documentElement || e.relatedTarget === document.body) {
-      if (inputBoxWrapper) {
-        inputBoxWrapper.classList.remove('drag-over');
-      }
-    }
-  }, true);
-});
-
-window.addEventListener('drop', (e: DragEvent) => {
-  e.preventDefault();
-  e.stopPropagation();
-  if (inputBoxWrapper) {
-    inputBoxWrapper.classList.remove('drag-over');
-  }
-
-  const files = e.dataTransfer?.files;
-  if (files && files.length > 0) {
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (file.type.startsWith('image/')) {
-        processImageFile(file);
-      } else {
-        processTextFile(file);
-      }
-    }
-  }
-}, true);
-
-promptInput.addEventListener('input', () => {
-  promptInput.style.height = 'auto';
-  promptInput.style.height = `${Math.min(promptInput.scrollHeight, 120)}px`;
-});
-
-promptInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
-});
 
 const contextHistoryBtn = document.getElementById('context-history-btn') as HTMLButtonElement;
 if (contextHistoryBtn) {
@@ -2016,26 +2774,21 @@ function quoteAspectToInput(aspectText: string) {
   const trimmed = aspectText.trim();
   if (!trimmed) return;
 
-  // Format as blockquote with markdown syntax
-  const quoted = trimmed
-    .split('\n')
-    .map((line) => `> ${line}`)
-    .join('\n');
+  const quoteCount = mainChatInputController.getAttachments().filter((a) => a.isQuote).length;
+  const singleLine = trimmed.replace(/\s+/g, ' ');
+  const snippet = singleLine.length > 25 ? `${singleLine.slice(0, 25)}...` : singleLine;
+  const displayName = `Quote ${quoteCount + 1}: "${snippet}"`;
 
-  const placeholderPrompt = 'Can you clarify: ';
-  const currentVal = promptInput.value.trim();
+  mainChatInputController.addAttachment(
+    displayName,
+    trimmed,
+    false,
+    false,
+    undefined,
+    true
+  );
 
-  promptInput.value = currentVal
-    ? `${currentVal}\n\n${quoted}\n\n${placeholderPrompt}`
-    : `${quoted}\n\n${placeholderPrompt}`;
-
-  // Automatically adjust input height and focus
-  promptInput.style.height = 'auto';
-  promptInput.style.height = `${Math.min(promptInput.scrollHeight, 120)}px`;
   promptInput.focus();
-
-  // Position cursor at the very end
-  promptInput.setSelectionRange(promptInput.value.length, promptInput.value.length);
 }
 
 // Floating Selection Toolbar for Assistant Output
@@ -2069,6 +2822,11 @@ floatingQuoteBtn.addEventListener('click', () => {
 });
 
 document.addEventListener('selectionchange', () => {
+  if (viewReviewer && !viewReviewer.classList.contains('hidden')) {
+    hideFloatingQuoteBtn();
+    return;
+  }
+
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed || !selection.rangeCount) {
     hideFloatingQuoteBtn();
@@ -2081,14 +2839,14 @@ document.addEventListener('selectionchange', () => {
     return;
   }
 
-  // Ensure the selection originated inside an assistant message
+  // Ensure the selection originated inside an assistant message in main messages container
   const anchorNode = selection.anchorNode;
   const focusNode = selection.focusNode;
   const anchorEl = (anchorNode instanceof HTMLElement ? anchorNode : anchorNode?.parentElement);
   const focusEl = (focusNode instanceof HTMLElement ? focusNode : focusNode?.parentElement);
 
   const assistantMsg = anchorEl?.closest('.message.assistant') || focusEl?.closest('.message.assistant');
-  if (!assistantMsg) {
+  if (!assistantMsg || !messagesContainer || !messagesContainer.contains(assistantMsg)) {
     hideFloatingQuoteBtn();
     return;
   }
@@ -2190,46 +2948,87 @@ if (usageBackBtn) {
   usageBackBtn.addEventListener('click', () => {
     viewUsage.classList.add('hidden');
     viewSettings.classList.remove('hidden');
+    const settingsBody = document.getElementById('settings-scroll-body');
+    if (settingsBody) settingsBody.scrollTop = 0;
   });
 }
 
 let cachedUsageRecords: any[] = [];
+let visibleTableLimit = 100;
 
 function renderUsageReport(
   summary: { today: number; thisWeek: number; thisMonth: number; total: number },
   records: any[],
   projects: string[],
-  models: string[]
+  models: string[],
+  currentProject?: string
 ) {
   cachedUsageRecords = records || [];
+  visibleTableLimit = 100;
 
-  // 1. Update spend summary cards
-  spendTodayEl.textContent = formatCurrency(summary.today);
-  spendWeekEl.textContent = formatCurrency(summary.thisWeek);
-  spendMonthEl.textContent = formatCurrency(summary.thisMonth);
-
-  // 2. Populate filter dropdowns
-  const currentProject = filterProject.value;
+  // 1. Populate filter dropdowns
+  const previousSelectedProject = filterProject.value;
   filterProject.innerHTML = '<option value="all">All Projects</option>';
+
+  let targetProjectToSelect = previousSelectedProject;
+  if (!targetProjectToSelect || targetProjectToSelect === '' || targetProjectToSelect === 'all') {
+    if (currentProject && projects.includes(currentProject)) {
+      targetProjectToSelect = currentProject;
+    } else {
+      targetProjectToSelect = 'all';
+    }
+  }
+
   projects.forEach((p) => {
     const opt = document.createElement('option');
     opt.value = p;
     opt.textContent = p;
-    if (p === currentProject) opt.selected = true;
+    if (p === targetProjectToSelect) opt.selected = true;
     filterProject.appendChild(opt);
   });
 
-  const currentModel = filterModel.value;
+  if (targetProjectToSelect === 'all') {
+    filterProject.value = 'all';
+  } else if (projects.includes(targetProjectToSelect)) {
+    filterProject.value = targetProjectToSelect;
+  }
+
+  // 2. Populate model filter dropdown based on selected project
+  updateModelFilterOptions(filterProject.value);
+
+  filterAndRenderTable();
+}
+
+function updateModelFilterOptions(selectedProject: string) {
+  const currentSelectedModel = filterModel.value;
+
+  // Filter records by selected project to discover which models were used
+  const relevantRecords = selectedProject === 'all'
+    ? cachedUsageRecords
+    : cachedUsageRecords.filter((r) => r.project === selectedProject);
+
+  const modelSet = new Set<string>();
+  for (const r of relevantRecords) {
+    if (r.model) {
+      modelSet.add(r.model);
+    }
+  }
+  const distinctModels = Array.from(modelSet).sort();
+
   filterModel.innerHTML = '<option value="all">All Models</option>';
-  models.forEach((m) => {
+  distinctModels.forEach((m) => {
     const opt = document.createElement('option');
     opt.value = m;
     opt.textContent = m;
-    if (m === currentModel) opt.selected = true;
     filterModel.appendChild(opt);
   });
 
-  filterAndRenderTable();
+  // Preserve previous selection if it is available for this project, otherwise reset to 'all'
+  if (currentSelectedModel && currentSelectedModel !== 'all' && distinctModels.includes(currentSelectedModel)) {
+    filterModel.value = currentSelectedModel;
+  } else {
+    filterModel.value = 'all';
+  }
 }
 
 function filterAndRenderTable() {
@@ -2241,6 +3040,38 @@ function filterAndRenderTable() {
     const matchMod = selectedMod === 'all' || r.model === selectedMod;
     return matchProj && matchMod;
   });
+
+  // Dynamically calculate spend totals for the filtered selection
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const day = now.getDay();
+  const diffToMonday = now.getDate() - day + (day === 0 ? -6 : 1);
+  const startOfWeek = new Date(now.getFullYear(), now.getMonth(), diffToMonday).getTime();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+
+  let todayCost = 0;
+  let weekCost = 0;
+  let monthCost = 0;
+  let totalCost = 0;
+
+  for (const r of filtered) {
+    const cost = r.cost || 0;
+    totalCost += cost;
+    if (r.timestamp >= startOfToday) {
+      todayCost += cost;
+    }
+    if (r.timestamp >= startOfWeek) {
+      weekCost += cost;
+    }
+    if (r.timestamp >= startOfMonth) {
+      monthCost += cost;
+    }
+  }
+
+  if (spendTodayEl) spendTodayEl.textContent = formatCurrency(todayCost);
+  if (spendWeekEl) spendWeekEl.textContent = formatCurrency(weekCost);
+  if (spendMonthEl) spendMonthEl.textContent = formatCurrency(monthCost);
+  if (spendTotalEl) spendTotalEl.textContent = formatCurrency(totalCost);
 
   auditTableBody.innerHTML = '';
 
@@ -2254,7 +3085,9 @@ function filterAndRenderTable() {
   exportCsvBtn.textContent = `📥 Export CSV (${filtered.length})`;
   exportCsvBtn.disabled = false;
 
-  filtered.forEach((r) => {
+  const recordsToRender = filtered.slice(0, visibleTableLimit);
+
+  recordsToRender.forEach((r) => {
     const tr = document.createElement('tr');
     const timeStr = new Date(r.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -2267,6 +3100,21 @@ function filterAndRenderTable() {
     if (r.type === 'terminal_command') {
       typePill = '<span class="type-pill terminal">💻 Terminal</span>';
       target = escapeHtml(r.command || '');
+      inputTokens = '0';
+      outputTokens = '0';
+      cost = '$0.00';
+    } else if (r.type === 'reviewer') {
+      typePill = '<span class="type-pill reviewer">🔍 Reviewer</span>';
+      target = escapeHtml(r.model || 'unknown');
+      inputTokens = `${(r.promptTokens || 0).toLocaleString()}`;
+      outputTokens = `${(r.completionTokens || 0).toLocaleString()}`;
+      cost = formatCurrency(r.cost || 0);
+    } else if (r.type === 'summarization') {
+      typePill = '<span class="type-pill chat">📝 Summary</span>';
+      target = escapeHtml(r.model || 'unknown');
+      inputTokens = `${(r.promptTokens || 0).toLocaleString()}`;
+      outputTokens = `${(r.completionTokens || 0).toLocaleString()}`;
+      cost = formatCurrency(r.cost || 0);
     } else {
       typePill = '<span class="type-pill chat">💬 Chat</span>';
       target = escapeHtml(r.model || 'unknown');
@@ -2285,10 +3133,39 @@ function filterAndRenderTable() {
     `;
     auditTableBody.appendChild(tr);
   });
+
+  if (filtered.length > visibleTableLimit) {
+    const moreTr = document.createElement('tr');
+    const remaining = filtered.length - visibleTableLimit;
+    moreTr.innerHTML = `
+      <td colspan="6" style="text-align:center; padding:10px;">
+        <button id="load-more-records-btn" class="btn secondary" style="font-size:11px; padding:3px 10px;">
+          Show more (${remaining} remaining)
+        </button>
+      </td>
+    `;
+    auditTableBody.appendChild(moreTr);
+
+    const loadMoreBtn = document.getElementById('load-more-records-btn');
+    if (loadMoreBtn) {
+      loadMoreBtn.addEventListener('click', () => {
+        visibleTableLimit += 100;
+        filterAndRenderTable();
+      });
+    }
+  }
 }
 
-filterProject.addEventListener('change', filterAndRenderTable);
-filterModel.addEventListener('change', filterAndRenderTable);
+filterProject.addEventListener('change', () => {
+  visibleTableLimit = 100;
+  updateModelFilterOptions(filterProject.value);
+  filterAndRenderTable();
+});
+
+filterModel.addEventListener('change', () => {
+  visibleTableLimit = 100;
+  filterAndRenderTable();
+});
 
 exportCsvBtn.addEventListener('click', () => {
   const selectedProj = filterProject.value;
@@ -2316,6 +3193,8 @@ function openSettingsView() {
   viewChat.classList.add('hidden');
   viewUsage.classList.add('hidden');
   viewSettings.classList.remove('hidden');
+  const settingsBody = document.getElementById('settings-scroll-body');
+  if (settingsBody) settingsBody.scrollTop = 0;
   vscode.postMessage({ type: 'GET_SETTINGS' });
 }
 
@@ -2337,6 +3216,8 @@ if (settingsViewUsageBtn) {
     viewSettings.classList.add('hidden');
     viewChat.classList.add('hidden');
     viewUsage.classList.remove('hidden');
+    const usageBody = document.getElementById('usage-scroll-body');
+    if (usageBody) usageBody.scrollTop = 0;
     vscode.postMessage({ type: 'GET_USAGE_REPORT' });
   });
 }
@@ -2350,51 +3231,6 @@ if (settingsUpdateKeyBtn) {
 if (settingsClearHistoryBtn) {
   settingsClearHistoryBtn.addEventListener('click', () => {
     vscode.postMessage({ type: 'TRIGGER_CLEAR_HISTORY' });
-  });
-}
-
-function updatePositionGuide(pos: 'left' | 'right') {
-  if (!guideTitleText || !guideBodyText) return;
-  if (pos === 'right') {
-    guideTitleText.textContent = '👉 How to move Chat to the Right:';
-    guideBodyText.innerHTML = `
-      <div>1. Right-click the <strong>OpenRouter (✨)</strong> icon or "Chat" header.</div>
-      <div>2. Click <strong>"Move to Secondary Side Bar"</strong>.</div>
-      <div style="margin-top: 4px; opacity: 0.8;">(Or simply drag &amp; drop the ✨ icon to the right side bar).</div>
-    `;
-  } else {
-    guideTitleText.textContent = '👈 How to move Chat to the Left:';
-    guideBodyText.innerHTML = `
-      <div>1. Right-click the <strong>OpenRouter (✨)</strong> icon in the right side bar.</div>
-      <div>2. Click <strong>"Reset Location"</strong>.</div>
-      <div style="margin-top: 4px; opacity: 0.8;">(Or drag &amp; drop the ✨ icon back to the left Activity Bar).</div>
-    `;
-  }
-  if (positionGuideBox) {
-    positionGuideBox.classList.remove('hidden');
-  }
-}
-
-if (guideCloseBtn && positionGuideBox) {
-  guideCloseBtn.addEventListener('click', () => {
-    positionGuideBox.classList.add('hidden');
-  });
-}
-
-if (posLeftBtn && posRightBtn) {
-  posLeftBtn.addEventListener('click', () => {
-    updatePositionGuide('left');
-    vscode.postMessage({ type: 'SET_PANEL_POSITION', position: 'left' });
-  });
-  posRightBtn.addEventListener('click', () => {
-    updatePositionGuide('right');
-    vscode.postMessage({ type: 'SET_PANEL_POSITION', position: 'right' });
-  });
-}
-
-if (settingsDefaultModel) {
-  settingsDefaultModel.addEventListener('change', () => {
-    vscode.postMessage({ type: 'SET_DEFAULT_MODEL', modelId: settingsDefaultModel.value });
   });
 }
 
@@ -2474,33 +3310,6 @@ function renderSettings(data: any) {
     settingsMaskedKey.textContent = data.apiKeyMasked || 'Not set';
   }
 
-  // Panel position toggle
-  if (posLeftBtn && posRightBtn) {
-    const pos = data.panelPosition === 'right' ? 'right' : 'left';
-    if (pos === 'right') {
-      posRightBtn.classList.add('active');
-      posLeftBtn.classList.remove('active');
-    } else {
-      posLeftBtn.classList.add('active');
-      posRightBtn.classList.remove('active');
-    }
-    // Keep instructions box hidden by default on render; only show when user clicks a button
-  }
-
-  // Default model options
-  if (settingsDefaultModel && data.models) {
-    settingsDefaultModel.innerHTML = '';
-    data.models.forEach((m: any) => {
-      const opt = document.createElement('option');
-      opt.value = m.id;
-      opt.textContent = m.name || m.id;
-      if (m.id === data.defaultModel) {
-        opt.selected = true;
-      }
-      settingsDefaultModel.appendChild(opt);
-    });
-  }
-
   // Update permission pills
   if (data.permissions) {
     document.querySelectorAll('.permission-row').forEach((row) => {
@@ -2534,6 +3343,1108 @@ function renderSettings(data: any) {
   if (settingsRedactionMode && data.redactionMode) {
     settingsRedactionMode.value = data.redactionMode;
   }
+
+  // Phase 10: Reviewer Model Settings (Per-Workspace)
+  isReviewerEnabled = !!data.reviewerEnabled;
+  updateReviewerToggleBtnVisibility(isReviewerEnabled);
+  if (chkReviewerEnabled) {
+    chkReviewerEnabled.checked = isReviewerEnabled;
+  }
+
+  if (reviewerConfigContainer) {
+    if (data.reviewerEnabled) {
+      reviewerConfigContainer.classList.remove('hidden');
+    } else {
+      reviewerConfigContainer.classList.add('hidden');
+    }
+  }
+
+  currentReviewerModelId = data.reviewerModel || '';
+  if (reviewerModelSearchInput) {
+    const foundModel = loadedModels.find((m) => m.id === currentReviewerModelId);
+    reviewerModelSearchInput.value = foundModel ? (foundModel.name || foundModel.id) : currentReviewerModelId;
+  }
+
+  if (reviewerModelWarning) {
+    if (data.reviewerEnabled && !currentReviewerModelId) {
+      reviewerModelWarning.classList.remove('hidden');
+    } else {
+      reviewerModelWarning.classList.add('hidden');
+    }
+  }
+
+  currentReviewerReasoningEffort = data.reviewerReasoningEffort || 'medium';
+  updateReviewerReasoningControl(currentReviewerModelId);
+
+  if (reviewerSystemPrompt) {
+    reviewerSystemPrompt.value = data.reviewerSystemPrompt || '';
+  }
+}
+
+// Phase 10: Reviewer Settings Event Listeners
+if (chkReviewerEnabled) {
+  chkReviewerEnabled.addEventListener('change', () => {
+    const enabled = chkReviewerEnabled.checked;
+    isReviewerEnabled = enabled;
+    updateReviewerToggleBtnVisibility(enabled);
+    if (reviewerConfigContainer) {
+      if (enabled) {
+        reviewerConfigContainer.classList.remove('hidden');
+      } else {
+        reviewerConfigContainer.classList.add('hidden');
+      }
+    }
+    if (enabled && !currentReviewerModelId && reviewerModelWarning) {
+      reviewerModelWarning.classList.remove('hidden');
+    } else if (reviewerModelWarning) {
+      reviewerModelWarning.classList.add('hidden');
+    }
+
+    vscode.postMessage({
+      type: 'SET_REVIEWER_SETTING',
+      key: 'enabled',
+      value: enabled,
+    });
+  });
+}
+
+if (reviewerReasoningSelect) {
+  reviewerReasoningSelect.addEventListener('change', () => {
+    currentReviewerReasoningEffort = reviewerReasoningSelect.value;
+    vscode.postMessage({
+      type: 'SET_REVIEWER_SETTING',
+      key: 'reasoningEffort',
+      value: reviewerReasoningSelect.value,
+    });
+  });
+}
+
+if (reviewerSystemPrompt) {
+  reviewerSystemPrompt.addEventListener('input', () => {
+    vscode.postMessage({
+      type: 'SET_REVIEWER_SETTING',
+      key: 'systemPrompt',
+      value: reviewerSystemPrompt.value,
+    });
+  });
+}
+
+if (resetReviewerPromptBtn) {
+  resetReviewerPromptBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'RESET_REVIEWER_PROMPT' });
+  });
+}
+
+// Dedicated Reviewer View Logic (PRD Phase 11)
+function openReviewerView(data: {
+  artifactType: 'plan' | 'walkthrough' | 'standalone';
+  artifactContent: string;
+  artifactUri?: string;
+  messageId?: string;
+  reviewerModel: string;
+  reviewerReasoningEffort: string;
+  history: Array<{ role: 'user' | 'assistant'; content: string }>;
+  activeSessionId?: string;
+}) {
+  currentReviewerArtifact = {
+    type: data.artifactType,
+    content: data.artifactContent,
+    uri: data.artifactUri,
+    messageId: data.messageId,
+  };
+
+  // View navigation: switch to dedicated reviewer view
+  viewChat.classList.add('hidden');
+  viewSettings.classList.add('hidden');
+  viewUsage.classList.add('hidden');
+  viewReviewer.classList.remove('hidden');
+
+  activeReviewerSessionId = data.activeSessionId || '';
+  activeReviewerModelId = data.reviewerModel || currentReviewerModelId || '';
+  activeReviewerReasoningEffort = data.reviewerReasoningEffort || currentReviewerReasoningEffort || 'medium';
+
+  // In-panel model combobox display
+  if (reviewerPanelModelInput) {
+    const foundModel = loadedModels.find((m) => m.id === activeReviewerModelId);
+    reviewerPanelModelInput.value = foundModel ? (foundModel.name || foundModel.id) : activeReviewerModelId;
+  }
+  updateReviewerPanelReasoningControl(activeReviewerModelId);
+
+  // Setup Artifact preview or hide if standalone
+  if (data.artifactType === 'standalone' || !data.artifactContent) {
+    if (reviewerArtifactSection) reviewerArtifactSection.classList.add('hidden');
+  } else {
+    if (reviewerArtifactSection) reviewerArtifactSection.classList.remove('hidden');
+    const isPlan = data.artifactType === 'plan';
+    if (reviewerArtifactLabel) {
+      reviewerArtifactLabel.textContent = isPlan ? 'Plan docs' : 'Results docs';
+    }
+    if (reviewerArtifactPreviewBody) {
+      reviewerArtifactPreviewBody.textContent = data.artifactContent;
+    }
+  }
+
+  // Render messages
+  reviewerMessages.innerHTML = '';
+  reviewerChatInputController.clearAttachments();
+  reviewerChatInputController.setValue('');
+  data.history.forEach((m) => {
+    appendReviewerMessage(m.role as 'user' | 'assistant', m.content);
+  });
+
+  updateReviewerTokenMeter();
+}
+
+function handleReviewerAttachArtifact(data: {
+  artifactType: 'plan' | 'walkthrough';
+  artifactContent: string;
+  artifactName?: string;
+  artifactUri?: string;
+  messageId?: string;
+}) {
+  // Ensure reviewer view is open
+  viewChat.classList.add('hidden');
+  viewSettings.classList.add('hidden');
+  viewUsage.classList.add('hidden');
+  viewReviewer.classList.remove('hidden');
+
+  currentReviewerArtifact = {
+    type: data.artifactType,
+    content: data.artifactContent,
+    uri: data.artifactUri,
+    messageId: data.messageId,
+  };
+
+  if (reviewerArtifactSection) reviewerArtifactSection.classList.remove('hidden');
+  const isPlan = data.artifactType === 'plan';
+  if (reviewerArtifactLabel) {
+    reviewerArtifactLabel.textContent = isPlan ? 'Plan docs' : 'Results docs';
+  }
+  if (reviewerArtifactPreviewBody) {
+    reviewerArtifactPreviewBody.textContent = data.artifactContent;
+  }
+
+  const chipName = data.artifactName || (isPlan ? 'Plan docs' : 'Results docs');
+  if (reviewerChatInputController) {
+    // If an artifact attachment is already present, clear previous artifact chip to prevent duplicate artifact context
+    const currentAtts = reviewerChatInputController.getAttachments();
+    if (currentAtts.some((a) => a.isArtifact)) {
+      reviewerChatInputController.clearAttachments();
+      currentAtts.filter((a) => !a.isArtifact).forEach((a) => {
+        reviewerChatInputController.addAttachment(a.name, a.data, a.isImage);
+      });
+    }
+    reviewerChatInputController.addAttachment(chipName, data.artifactContent, false, true, data.artifactType);
+  }
+
+  if (reviewerPromptInput) {
+    reviewerPromptInput.focus();
+  }
+}
+
+function updateReviewerTokenMeter() {
+  if (!reviewerTokenMeter) return;
+  const currentModel = loadedModels.find((m) => m.id === activeReviewerModelId);
+  const maxContext = currentModel?.context_length;
+
+  const totalChars = (reviewerMessages.textContent || '').length;
+  const tokens = Math.round(totalChars / 4);
+
+  if (maxContext && maxContext > 0) {
+    const pct = ((tokens / maxContext) * 100).toFixed(1);
+    const maxFormatted =
+      maxContext >= 1_000_000
+        ? `${(maxContext / 1_000_000).toFixed(1)}M`
+        : maxContext >= 1_000
+        ? `${Math.round(maxContext / 1_000)}k`
+        : `${maxContext}`;
+
+    reviewerTokenMeter.textContent = `${tokens.toLocaleString()} / ${maxFormatted} (${pct}%)`;
+    const ratio = tokens / maxContext;
+    if (ratio > 0.9) {
+      reviewerTokenMeter.style.color = '#f85149';
+      reviewerTokenMeter.title = 'Reviewer context limit almost reached (>90%)';
+    } else if (ratio > 0.75) {
+      reviewerTokenMeter.style.color = '#d29922';
+      reviewerTokenMeter.title = 'Approaching reviewer context limit (>75%)';
+    } else {
+      reviewerTokenMeter.style.color = '';
+      reviewerTokenMeter.title = 'Reviewer conversation tokens / model max context';
+    }
+  } else {
+    reviewerTokenMeter.textContent = `${tokens.toLocaleString()} tokens`;
+    reviewerTokenMeter.style.color = '';
+  }
+}
+
+let reviewerRenderRafId: number | null = null;
+let reviewerRenderTimeoutId: any = null;
+let reviewerLastRenderTime = 0;
+const REVIEWER_RENDER_THROTTLE_MS = 60;
+
+function flushReviewerStreamRender() {
+  if (reviewerRenderRafId !== null) {
+    cancelAnimationFrame(reviewerRenderRafId);
+    reviewerRenderRafId = null;
+  }
+  if (reviewerRenderTimeoutId !== null) {
+    clearTimeout(reviewerRenderTimeoutId);
+    reviewerRenderTimeoutId = null;
+  }
+  if (activeReviewerAssistantContentEl) {
+    activeReviewerAssistantContentEl.innerHTML = '';
+    renderFormattedContent(accumulatedReviewerStream, activeReviewerAssistantContentEl, 'assistant');
+    reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+    reviewerLastRenderTime = Date.now();
+  }
+}
+
+function scheduleReviewerStreamRender() {
+  const now = Date.now();
+  const elapsed = now - reviewerLastRenderTime;
+
+  if (elapsed >= REVIEWER_RENDER_THROTTLE_MS) {
+    if (reviewerRenderRafId !== null) {
+      cancelAnimationFrame(reviewerRenderRafId);
+    }
+    reviewerRenderRafId = requestAnimationFrame(() => {
+      reviewerRenderRafId = null;
+      if (activeReviewerAssistantContentEl) {
+        activeReviewerAssistantContentEl.innerHTML = '';
+        renderFormattedContent(accumulatedReviewerStream, activeReviewerAssistantContentEl, 'assistant');
+        reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+        reviewerLastRenderTime = Date.now();
+      }
+    });
+  } else {
+    if (reviewerRenderTimeoutId === null) {
+      reviewerRenderTimeoutId = setTimeout(() => {
+        reviewerRenderTimeoutId = null;
+        scheduleReviewerStreamRender();
+      }, REVIEWER_RENDER_THROTTLE_MS - elapsed);
+    }
+  }
+}
+
+function quoteAspectToReviewerInput(aspectText: string) {
+  const trimmed = aspectText.trim();
+  if (!trimmed) return;
+
+  const quoteCount = reviewerChatInputController.getAttachments().filter((a) => a.isQuote).length;
+  const singleLine = trimmed.replace(/\s+/g, ' ');
+  const snippet = singleLine.length > 25 ? `${singleLine.slice(0, 25)}...` : singleLine;
+  const displayName = `Quote ${quoteCount + 1}: "${snippet}"`;
+
+  reviewerChatInputController.addAttachment(
+    displayName,
+    trimmed,
+    false,
+    false,
+    undefined,
+    true
+  );
+
+  reviewerPromptInput.focus();
+}
+
+function appendReviewerMessage(role: 'user' | 'assistant', content: string, isIncomplete = false): HTMLElement {
+  const msgEl = document.createElement('div');
+  msgEl.className = `message ${role}`;
+  msgEl.dataset.rawContent = content;
+
+  const headerEl = document.createElement('div');
+  headerEl.className = 'message-header';
+
+  const roleTag = document.createElement('div');
+  roleTag.className = 'role-tag';
+  roleTag.textContent = role === 'user' ? 'You' : 'Reviewer';
+  headerEl.appendChild(roleTag);
+
+  const headerActions = document.createElement('div');
+  headerActions.className = 'message-header-actions';
+
+  if (role === 'assistant') {
+    const quoteBtn = document.createElement('button');
+    quoteBtn.className = 'msg-quote-btn';
+    quoteBtn.title = 'Quote / Ask for clarification';
+    quoteBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+      </svg>
+      <span>Clarify</span>
+    `;
+    quoteBtn.addEventListener('click', () => {
+      const parentMsg = quoteBtn.closest('.message') as HTMLElement | null;
+      const textToQuote = parentMsg?.dataset.rawContent ?? content;
+      quoteAspectToReviewerInput(textToQuote);
+    });
+    headerActions.appendChild(quoteBtn);
+  }
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'msg-copy-btn';
+  copyBtn.title = 'Copy message';
+  copyBtn.innerHTML = `
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+    </svg>
+    <span>Copy</span>
+  `;
+  copyBtn.addEventListener('click', () => {
+    const parentMsg = copyBtn.closest('.message') as HTMLElement | null;
+    const textToCopy = parentMsg?.dataset.rawContent ?? content;
+    navigator.clipboard.writeText(textToCopy).then(() => {
+      const span = copyBtn.querySelector('span');
+      if (span) span.textContent = 'Copied!';
+      setTimeout(() => {
+        if (span) span.textContent = 'Copy';
+      }, 1800);
+    });
+  });
+  headerActions.appendChild(copyBtn);
+  headerEl.appendChild(headerActions);
+  msgEl.appendChild(headerEl);
+
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'message-body';
+  renderFormattedContent(content, bodyEl, role);
+  msgEl.appendChild(bodyEl);
+
+  // If assistant message, provide message-level "Send to Main Model" action
+  if (role === 'assistant') {
+    const actionsRow = document.createElement('div');
+    actionsRow.className = 'reviewer-msg-actions';
+
+    const sendToMainBtn = document.createElement('button');
+    sendToMainBtn.className = 'btn-send-to-main';
+    sendToMainBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 10 4 15 9 20"></polyline>
+        <path d="M20 4v7a4 4 0 0 1-4 4H4"></path>
+      </svg>
+      <span>Send to Main Model</span>
+    `;
+
+    if (isIncomplete) {
+      sendToMainBtn.title = 'Send partial response to main chat (will flag that response was interrupted)';
+      sendToMainBtn.addEventListener('click', () => {
+        sendFeedbackToMainChat(`[Note: Reviewer response was interrupted/incomplete]\n\n${content}`);
+      });
+    } else {
+      sendToMainBtn.title = 'Send this entire reviewer message to the main chat input';
+      sendToMainBtn.addEventListener('click', () => {
+        sendFeedbackToMainChat(content);
+      });
+    }
+
+    actionsRow.appendChild(sendToMainBtn);
+    msgEl.appendChild(actionsRow);
+  }
+
+  reviewerMessages.appendChild(msgEl);
+  reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+  updateReviewerTokenMeter();
+  return msgEl;
+}
+
+function handleReviewerStreamStart() {
+  accumulatedReviewerStream = '';
+  // Defer creating activeReviewerAssistantEl until first chunk arrives (to avoid blank shell on immediate failure)
+  activeReviewerAssistantEl = null;
+  activeReviewerAssistantContentEl = null;
+  if (reviewerStatusText) reviewerStatusText.textContent = 'Reviewer thinking...';
+}
+
+let accumulatedReviewerStream = '';
+function handleReviewerStreamChunk(chunk: string) {
+  if (!activeReviewerAssistantEl) {
+    // First chunk arrived: create the assistant bubble
+    activeReviewerAssistantEl = document.createElement('div');
+    activeReviewerAssistantEl.className = 'message assistant';
+    activeReviewerAssistantEl.dataset.rawContent = accumulatedReviewerStream;
+
+    const headerEl = document.createElement('div');
+    headerEl.className = 'message-header';
+
+    const roleTag = document.createElement('div');
+    roleTag.className = 'role-tag';
+    roleTag.textContent = 'Reviewer';
+    headerEl.appendChild(roleTag);
+
+    const headerActions = document.createElement('div');
+    headerActions.className = 'message-header-actions';
+
+    const quoteBtn = document.createElement('button');
+    quoteBtn.className = 'msg-quote-btn';
+    quoteBtn.title = 'Quote / Ask for clarification';
+    quoteBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+      </svg>
+      <span>Clarify</span>
+    `;
+    quoteBtn.addEventListener('click', () => {
+      const parentMsg = quoteBtn.closest('.message') as HTMLElement | null;
+      const textToQuote = parentMsg?.dataset.rawContent ?? accumulatedReviewerStream;
+      quoteAspectToReviewerInput(textToQuote);
+    });
+    headerActions.appendChild(quoteBtn);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-copy-btn';
+    copyBtn.title = 'Copy message';
+    copyBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+      <span>Copy</span>
+    `;
+    copyBtn.addEventListener('click', () => {
+      const parentMsg = copyBtn.closest('.message') as HTMLElement | null;
+      const textToCopy = parentMsg?.dataset.rawContent ?? accumulatedReviewerStream;
+      navigator.clipboard.writeText(textToCopy).then(() => {
+        const span = copyBtn.querySelector('span');
+        if (span) span.textContent = 'Copied!';
+        setTimeout(() => {
+          if (span) span.textContent = 'Copy';
+        }, 1800);
+      });
+    });
+    headerActions.appendChild(copyBtn);
+    headerEl.appendChild(headerActions);
+    activeReviewerAssistantEl.appendChild(headerEl);
+
+    activeReviewerAssistantContentEl = document.createElement('div');
+    activeReviewerAssistantContentEl.className = 'message-body';
+    activeReviewerAssistantEl.appendChild(activeReviewerAssistantContentEl);
+
+    reviewerMessages.appendChild(activeReviewerAssistantEl);
+  }
+
+  accumulatedReviewerStream += chunk;
+  if (activeReviewerAssistantEl) {
+    activeReviewerAssistantEl.dataset.rawContent = accumulatedReviewerStream;
+  }
+  scheduleReviewerStreamRender();
+  updateReviewerTokenMeter();
+}
+
+// Case 2: Full Stream Completed Successfully
+function handleReviewerStreamDone() {
+  flushReviewerStreamRender();
+
+  const finalContent = accumulatedReviewerStream;
+  if (activeReviewerAssistantEl) {
+    activeReviewerAssistantEl.dataset.rawContent = finalContent;
+  }
+
+  if (activeReviewerAssistantEl && finalContent.trim().length > 0) {
+    const actionsRow = document.createElement('div');
+    actionsRow.className = 'reviewer-msg-actions';
+
+    const sendToMainBtn = document.createElement('button');
+    sendToMainBtn.className = 'btn-send-to-main';
+    sendToMainBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 10 4 15 9 20"></polyline>
+        <path d="M20 4v7a4 4 0 0 1-4 4H4"></path>
+      </svg>
+      <span>Send to Main Model</span>
+    `;
+    sendToMainBtn.addEventListener('click', () => {
+      sendFeedbackToMainChat(finalContent);
+    });
+
+    actionsRow.appendChild(sendToMainBtn);
+    activeReviewerAssistantEl.appendChild(actionsRow);
+  }
+
+  accumulatedReviewerStream = '';
+  activeReviewerAssistantEl = null;
+  activeReviewerAssistantContentEl = null;
+  if (reviewerStatusText) reviewerStatusText.textContent = 'Ready';
+  updateReviewerTokenMeter();
+}
+
+// Case 1 & Case 3: Reviewer Stream Error Handling
+function handleReviewerStreamError(errMsg: string, isPartial: boolean, canRetry = true) {
+  if (reviewerStatusText) reviewerStatusText.textContent = `Reviewer Error: ${errMsg}`;
+
+  if (isPartial && activeReviewerAssistantEl) {
+    // Case 3: Partial stream received, then interrupted
+    flushReviewerStreamRender();
+    const partialAssistantEl = activeReviewerAssistantEl;
+    const partialText = accumulatedReviewerStream;
+    partialAssistantEl.dataset.rawContent = partialText;
+
+    const interruptedBadge = document.createElement('div');
+    interruptedBadge.className = 'stream-error-card';
+    interruptedBadge.style.marginTop = '8px';
+    interruptedBadge.innerHTML = `
+      <div class="stream-error-header" style="color:#e3b341;">
+        <span>⚠️</span>
+        <span>Response interrupted — incomplete</span>
+      </div>
+      <div class="stream-error-msg">${escapeHtml(errMsg)}</div>
+    `;
+
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'stream-error-actions';
+    actionsDiv.style.display = 'flex';
+    actionsDiv.style.gap = '8px';
+    actionsDiv.style.marginTop = '6px';
+
+    if (canRetry) {
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'btn-retry';
+      retryBtn.textContent = '↻ Retry';
+      retryBtn.addEventListener('click', () => {
+        // Cleanly replace partial message on retry
+        if (partialAssistantEl.parentNode) {
+          partialAssistantEl.remove();
+        }
+        vscode.postMessage({ type: 'RETRY_REVIEWER_MESSAGE' });
+      });
+      actionsDiv.appendChild(retryBtn);
+    }
+
+    const sendPartialBtn = document.createElement('button');
+    sendPartialBtn.className = 'btn-send-to-main';
+    sendPartialBtn.textContent = 'Send Partial to Main Model';
+    sendPartialBtn.addEventListener('click', () => {
+      sendFeedbackToMainChat(`[Note: Reviewer response was interrupted/incomplete]\n\n${partialAssistantEl.dataset.rawContent || partialText}`);
+    });
+    actionsDiv.appendChild(sendPartialBtn);
+
+    interruptedBadge.appendChild(actionsDiv);
+    partialAssistantEl.appendChild(interruptedBadge);
+  } else {
+    // Case 1: Zero chunks received, clean error card with retry
+    if (activeReviewerAssistantEl?.parentNode) {
+      activeReviewerAssistantEl.remove();
+    }
+    activeReviewerAssistantEl = null;
+
+    const errorCard = document.createElement('div');
+    errorCard.className = 'stream-error-card';
+    errorCard.innerHTML = `
+      <div class="stream-error-header">
+        <span>⚠️</span>
+        <span>Reviewer Request Issue</span>
+      </div>
+      <div class="stream-error-msg">${escapeHtml(errMsg)}</div>
+    `;
+
+    if (canRetry) {
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'stream-error-actions';
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'btn-retry';
+      retryBtn.textContent = '↻ Retry';
+      retryBtn.addEventListener('click', () => {
+        errorCard.remove();
+        vscode.postMessage({ type: 'RETRY_REVIEWER_MESSAGE' });
+      });
+      actionsDiv.appendChild(retryBtn);
+      errorCard.appendChild(actionsDiv);
+    }
+
+    reviewerMessages.appendChild(errorCard);
+  }
+
+  reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+  accumulatedReviewerStream = '';
+  activeReviewerAssistantEl = null;
+  activeReviewerAssistantContentEl = null;
+}
+
+function handleSetReviewerBusy(busy: boolean) {
+  if (busy) {
+    reviewerSendBtn.classList.add('hidden');
+    reviewerStopBtn.classList.remove('hidden');
+    reviewerChatInputController.setEnabled(false);
+  } else {
+    reviewerStopBtn.classList.add('hidden');
+    reviewerSendBtn.classList.remove('hidden');
+    reviewerChatInputController.setEnabled(true);
+  }
+}
+
+function sendFeedbackToMainChat(text: string) {
+  // Return to main chat view
+  viewReviewer.classList.add('hidden');
+  viewChat.classList.remove('hidden');
+
+  const cleanText = text.trim();
+  if (!cleanText) return;
+
+  // Check if this reviewer feedback is already attached to main chat input
+  const currentAtts = mainChatInputController.getAttachments();
+  const alreadyAttached = currentAtts.some((a) => a.isReviewerFeedback && a.data === cleanText);
+
+  if (!alreadyAttached) {
+    const singleLine = cleanText.replace(/\s+/g, ' ');
+    const snippet = singleLine.length > 28 ? `${singleLine.slice(0, 28)}...` : singleLine;
+    const chipName = `Reviewer Feedback: "${snippet}"`;
+
+    mainChatInputController.addAttachment(
+      chipName,
+      cleanText,
+      false, // isImage
+      false, // isArtifact
+      undefined, // artifactType
+      false, // isQuote
+      true // isReviewerFeedback
+    );
+  }
+
+  // Focus prompt input for typing without overwriting the body
+  if (promptInput) {
+    mainChatInputController.focus();
+  }
+}
+
+// Direct Reviewer Toggle Button
+if (reviewerToggleBtn) {
+  reviewerToggleBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'OPEN_DIRECT_REVIEWER' });
+  });
+}
+
+// Back navigation from Reviewer View to Main Chat
+if (reviewerBackBtn) {
+  reviewerBackBtn.addEventListener('click', () => {
+    viewReviewer.classList.add('hidden');
+    viewChat.classList.remove('hidden');
+  });
+}
+
+// Open artifact in VS Code editor tab for line-specific commenting (Native Comments API)
+if (reviewerOpenTabBtn) {
+  reviewerOpenTabBtn.addEventListener('click', () => {
+    if (currentReviewerArtifact) {
+      vscode.postMessage({
+        type: 'VIEW_ARTIFACT',
+        artifactType: currentReviewerArtifact.type,
+        messageId: currentReviewerArtifact.messageId,
+        content: currentReviewerArtifact.content,
+      });
+    }
+  });
+}
+
+// Toggle collapse/expand on artifact preview body
+if (reviewerToggleArtifactBtn) {
+  reviewerToggleArtifactBtn.addEventListener('click', () => {
+    if (reviewerArtifactPreviewBody.classList.contains('hidden')) {
+      reviewerArtifactPreviewBody.classList.remove('hidden');
+      reviewerToggleArtifactBtn.textContent = 'Collapse';
+    } else {
+      reviewerArtifactPreviewBody.classList.add('hidden');
+      reviewerToggleArtifactBtn.textContent = 'Expand';
+    }
+  });
+}
+
+// Reviewer Input Controller Instance
+reviewerChatInputController = createChatInputController({
+  textarea: reviewerPromptInput,
+  inputBoxWrapper: reviewerInputBoxWrapper,
+  attachmentBar: reviewerAttachmentPreviewBar,
+  dropZone: viewReviewer,
+  fileInput: reviewerImageFileInput,
+  uploadBtn: reviewerUploadImgBtn,
+  docFileInput: reviewerDocFileInput,
+  uploadDocBtn: reviewerAttachFileBtn,
+  onSend: sendReviewerMessage,
+});
+
+// Send message to reviewer
+function sendReviewerMessage() {
+  let text = reviewerChatInputController.getValue().trim();
+  const currentImages: Array<{ name: string; dataUrl: string }> = [];
+  let attachedArtifact: { content: string; type: 'plan' | 'walkthrough' } | undefined;
+  const quoteAttachments: string[] = [];
+
+  reviewerChatInputController.getAttachments().forEach((att) => {
+    if (att.isImage) {
+      currentImages.push({ name: att.name, dataUrl: att.data });
+    } else if (att.isArtifact) {
+      attachedArtifact = { content: att.data, type: att.artifactType || 'plan' };
+    } else if (att.isQuote) {
+      quoteAttachments.push(att.data);
+    } else {
+      const formatted = `\n\`\`\`${att.name}\n${att.data}\n\`\`\`\n`;
+      text = text ? text.trimEnd() + formatted : formatted.trimStart();
+    }
+  });
+
+  if (quoteAttachments.length > 0) {
+    const quotedBlocks = quoteAttachments
+      .map((quote) =>
+        quote
+          .split('\n')
+          .map((line) => `> ${line}`)
+          .join('\n')
+      )
+      .join('\n\n');
+
+    if (text) {
+      text = `${quotedBlocks}\n\n${text}`;
+    } else {
+      const fallbackQuery =
+        quoteAttachments.length > 1
+          ? 'Can you clarify these points?'
+          : 'Can you clarify this?';
+      text = `${quotedBlocks}\n\n${fallbackQuery}`;
+    }
+  }
+
+  if ((!text && currentImages.length === 0 && !attachedArtifact) || reviewerSendBtn.disabled) return;
+
+  const defaultPrompt = attachedArtifact
+    ? (attachedArtifact.type === 'walkthrough' ? 'Please review these Results docs.' : 'Please review these Plan docs.')
+    : '';
+  const userVisibleText = text || defaultPrompt || 'Please review';
+
+  appendReviewerMessage('user', userVisibleText);
+  reviewerChatInputController.clearAttachments();
+  reviewerChatInputController.setValue('');
+  reviewerChatInputController.resetHeight();
+
+  const effortToSend =
+    reviewerPanelReasoningContainer && !reviewerPanelReasoningContainer.classList.contains('hidden') && reviewerPanelReasoningSelect
+      ? reviewerPanelReasoningSelect.value
+      : undefined;
+
+  vscode.postMessage({
+    type: 'SEND_REVIEWER_MESSAGE',
+    content: userVisibleText,
+    modelId: activeReviewerModelId,
+    reasoningEffort: effortToSend,
+    artifactContent: attachedArtifact?.content,
+    artifactType: attachedArtifact?.type,
+  });
+}
+
+if (reviewerSendBtn) {
+  reviewerSendBtn.addEventListener('click', sendReviewerMessage);
+}
+
+if (reviewerStopBtn) {
+  reviewerStopBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'STOP_REVIEWER_STREAM' });
+  });
+}
+
+// In-Panel Reviewer Model Selector Dropdown logic
+function updateReviewerPanelReasoningControl(modelId: string) {
+  if (!reviewerPanelReasoningContainer || !reviewerPanelReasoningSelect) return;
+  const model = loadedModels.find((m) => m.id === modelId);
+  const idLower = (modelId || '').toLowerCase();
+  const isReasoning =
+    model?.supports_reasoning_effort === true ||
+    idLower.includes('/o1') ||
+    idLower.includes('/o3') ||
+    idLower.includes('o1-') ||
+    idLower.includes('o3-') ||
+    idLower.includes('reasoning') ||
+    idLower.includes('deepseek-r1');
+
+  if (isReasoning) {
+    reviewerPanelReasoningContainer.classList.remove('hidden');
+    const supportedLevels =
+      model?.supported_reasoning_efforts && model.supported_reasoning_efforts.length > 0
+        ? model.supported_reasoning_efforts
+        : ['low', 'medium', 'high'];
+
+    reviewerPanelReasoningSelect.innerHTML = '';
+    supportedLevels.forEach((level) => {
+      const opt = document.createElement('option');
+      opt.value = level.toLowerCase();
+      opt.textContent = level.charAt(0).toUpperCase() + level.slice(1).toLowerCase();
+      reviewerPanelReasoningSelect.appendChild(opt);
+    });
+
+    const defaultChoice = supportedLevels.includes('medium')
+      ? 'medium'
+      : supportedLevels[0];
+    reviewerPanelReasoningSelect.value = activeReviewerReasoningEffort || defaultChoice;
+  } else {
+    reviewerPanelReasoningContainer.classList.add('hidden');
+  }
+}
+
+function filterAndRenderReviewerPanelModels(query: string) {
+  if (!reviewerPanelModelDropdown) return;
+  reviewerPanelModelDropdown.innerHTML = '';
+
+  const q = query.toLowerCase().trim();
+  const filtered = loadedModels.filter((m) => {
+    const matchName = m.name?.toLowerCase().includes(q);
+    const matchId = m.id.toLowerCase().includes(q);
+    return matchName || matchId;
+  });
+
+  if (filtered.length === 0) {
+    const item = document.createElement('div');
+    item.className = 'combobox-item';
+    item.textContent = 'No models found';
+    reviewerPanelModelDropdown.appendChild(item);
+    return;
+  }
+
+  filtered.slice(0, 40).forEach((m) => {
+    const item = document.createElement('div');
+    item.className = `combobox-item ${m.id === activeReviewerModelId ? 'selected' : ''}`;
+    item.textContent = m.name || m.id;
+    item.addEventListener('click', () => {
+      activeReviewerModelId = m.id;
+      if (reviewerPanelModelInput) reviewerPanelModelInput.value = m.name || m.id;
+      reviewerPanelModelDropdown.classList.add('hidden');
+      updateReviewerPanelReasoningControl(m.id);
+      updateReviewerTokenMeter();
+
+      // Drop-with-notice for reviewer model switch
+      if (reviewerCapabilityNoticeBanner && reviewerCapabilityNoticeText) {
+        if (!m.supports_vision) {
+          reviewerCapabilityNoticeText.textContent = `Note: Vision not supported by ${m.name || m.id}.`;
+          reviewerCapabilityNoticeBanner.classList.remove('hidden');
+        } else {
+          reviewerCapabilityNoticeBanner.classList.add('hidden');
+        }
+      }
+    });
+    reviewerPanelModelDropdown.appendChild(item);
+  });
+}
+
+if (reviewerPanelModelInput) {
+  reviewerPanelModelInput.addEventListener('focus', () => {
+    reviewerPanelModelDropdown.classList.remove('hidden');
+    filterAndRenderReviewerPanelModels(reviewerPanelModelInput.value);
+  });
+  reviewerPanelModelInput.addEventListener('input', () => {
+    reviewerPanelModelDropdown.classList.remove('hidden');
+    filterAndRenderReviewerPanelModels(reviewerPanelModelInput.value);
+  });
+}
+
+if (reviewerCapabilityNoticeClose && reviewerCapabilityNoticeBanner) {
+  reviewerCapabilityNoticeClose.addEventListener('click', () => {
+    reviewerCapabilityNoticeBanner.classList.add('hidden');
+  });
+}
+
+// Reviewer Sessions Management UI
+if (reviewerNewChatBtn && reviewerSessionDropdown) {
+  reviewerNewChatBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    reviewerSessionDropdown.classList.toggle('hidden');
+    if (!reviewerSessionDropdown.classList.contains('hidden')) {
+      vscode.postMessage({ type: 'GET_REVIEWER_SESSIONS' });
+    }
+  });
+}
+
+if (reviewerSessionItemNew) {
+  reviewerSessionItemNew.addEventListener('click', () => {
+    reviewerSessionDropdown.classList.add('hidden');
+    reviewerChatInputController.clearAttachments();
+    reviewerChatInputController.setValue('');
+    vscode.postMessage({ type: 'NEW_REVIEWER_SESSION' });
+  });
+}
+
+if (reviewerResetContextBtn) {
+  reviewerResetContextBtn.addEventListener('click', () => {
+    reviewerChatInputController.clearAttachments();
+    reviewerChatInputController.setValue('');
+    vscode.postMessage({ type: 'RESET_REVIEWER_CONTEXT' });
+  });
+}
+
+function renderReviewerSessionsList(
+  sessions: Array<{ id: string; title: string; createdAt: number; updatedAt: number; messageCount: number }>,
+  currentActiveId: string
+) {
+  if (!reviewerSessionHistoryList) return;
+  reviewerSessionHistoryList.innerHTML = '';
+
+  if (sessions.length === 0) {
+    const emptyEl = document.createElement('div');
+    emptyEl.className = 'session-history-empty';
+    emptyEl.textContent = 'No previous review sessions';
+    reviewerSessionHistoryList.appendChild(emptyEl);
+    return;
+  }
+
+  sessions.forEach((s) => {
+    const item = document.createElement('div');
+    item.className = `session-history-item ${s.id === currentActiveId ? 'active' : ''}`;
+
+    const info = document.createElement('div');
+    info.className = 'session-history-info';
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'session-history-title-text';
+    titleSpan.textContent = s.title;
+    titleSpan.title = s.title;
+    info.appendChild(titleSpan);
+
+    item.addEventListener('click', () => {
+      reviewerSessionDropdown.classList.add('hidden');
+      if (s.id !== currentActiveId) {
+        vscode.postMessage({ type: 'SWITCH_REVIEWER_SESSION', sessionId: s.id });
+      }
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'session-history-actions';
+
+    const renameBtn = document.createElement('button');
+    renameBtn.className = 'session-history-action-btn session-history-rename-btn';
+    renameBtn.title = 'Rename review session';
+    renameBtn.textContent = '✏️';
+
+    let isEditing = false;
+    renameBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (isEditing) return;
+      isEditing = true;
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'session-history-rename-input';
+      input.value = s.title;
+
+      const commitRename = () => {
+        if (!isEditing) return;
+        isEditing = false;
+        const newTitle = input.value.trim();
+        if (newTitle && newTitle !== s.title) {
+          vscode.postMessage({ type: 'RENAME_REVIEWER_SESSION', sessionId: s.id, newTitle });
+          titleSpan.textContent = newTitle;
+          titleSpan.title = newTitle;
+        }
+        if (input.parentNode) {
+          info.replaceChild(titleSpan, input);
+        }
+      };
+
+      input.addEventListener('click', (ev) => ev.stopPropagation());
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          commitRename();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          isEditing = false;
+          if (input.parentNode) {
+            info.replaceChild(titleSpan, input);
+          }
+        }
+      });
+      input.addEventListener('blur', () => {
+        commitRename();
+      });
+
+      info.replaceChild(input, titleSpan);
+      input.focus();
+      input.select();
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'session-history-action-btn session-history-delete-btn';
+    delBtn.title = 'Delete review session';
+    delBtn.textContent = '🗑️';
+    delBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'DELETE_REVIEWER_SESSION', sessionId: s.id });
+    });
+
+    actions.appendChild(renameBtn);
+    actions.appendChild(delBtn);
+
+    item.appendChild(info);
+    item.appendChild(actions);
+    reviewerSessionHistoryList.appendChild(item);
+  });
+}
+
+// Text selection handling in reviewer conversation for selective feedback return or clarification
+document.addEventListener('selectionchange', () => {
+  if (viewReviewer.classList.contains('hidden')) {
+    reviewerSelectionToolbar.classList.add('hidden');
+    return;
+  }
+
+  const selection = window.getSelection();
+  const selectedText = selection?.toString().trim();
+
+  if (!selectedText || !selection?.anchorNode) {
+    reviewerSelectionToolbar.classList.add('hidden');
+    return;
+  }
+
+  // Ensure selection originated inside an assistant message in reviewerMessages
+  const anchorNode = selection.anchorNode;
+  const focusNode = selection.focusNode;
+  const anchorEl = (anchorNode instanceof HTMLElement ? anchorNode : anchorNode?.parentElement);
+  const focusEl = (focusNode instanceof HTMLElement ? focusNode : focusNode?.parentElement);
+
+  const assistantMsg = anchorEl?.closest('.message.assistant') || focusEl?.closest('.message.assistant');
+
+  if (assistantMsg && reviewerMessages.contains(assistantMsg)) {
+    currentSelectedReviewerText = selectedText;
+    reviewerSelectionToolbar.classList.remove('hidden');
+  } else {
+    reviewerSelectionToolbar.classList.add('hidden');
+  }
+});
+
+if (reviewerClarifySelectionBtn) {
+  reviewerClarifySelectionBtn.addEventListener('click', () => {
+    if (currentSelectedReviewerText) {
+      quoteAspectToReviewerInput(currentSelectedReviewerText);
+      reviewerSelectionToolbar.classList.add('hidden');
+      window.getSelection()?.removeAllRanges();
+    }
+  });
+}
+
+if (reviewerSendSelectionBtn) {
+  reviewerSendSelectionBtn.addEventListener('click', () => {
+    if (currentSelectedReviewerText) {
+      sendFeedbackToMainChat(currentSelectedReviewerText);
+      reviewerSelectionToolbar.classList.add('hidden');
+      window.getSelection()?.removeAllRanges();
+    }
+  });
+}
+
+// Close comboboxes when clicking outside
+document.addEventListener('click', (e) => {
+  const target = e.target as HTMLElement;
+  if (reviewerPanelModelDropdown && !target.closest('.combobox-container')) {
+    reviewerPanelModelDropdown.classList.add('hidden');
+  }
+  if (reviewerSessionDropdown && !target.closest('.session-dropdown-container')) {
+    reviewerSessionDropdown.classList.add('hidden');
+  }
+});
+
+// Prevent default dragover and drop at window level so Electron webview doesn't reject drops or navigate
+if (typeof window !== 'undefined') {
+  window.addEventListener('dragover', (e) => {
+    e.preventDefault();
+  });
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+  });
 }
 
 vscode.postMessage({ type: 'READY' });
+

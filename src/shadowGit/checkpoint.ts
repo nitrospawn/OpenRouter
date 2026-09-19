@@ -1,6 +1,7 @@
 import { ShadowRepo } from './shadowRepo';
 import { GitignoreRespect } from './gitignoreRespect';
 import * as path from 'path';
+import * as fs from 'fs';
 
 export interface CheckpointInfo {
   checkpointId: string;
@@ -39,8 +40,20 @@ export class CheckpointManager {
     }
 
     try {
-      // Stage only the affected files
-      await this.shadowRepo.runGit(['add', '--', ...validFiles]);
+      // Stage the affected files.
+      // If batch add fails (e.g. one or more files in validFiles are new files being created that
+      // do not exist on disk yet), stage existing files individually so new files don't abort checkpointing.
+      try {
+        await this.shadowRepo.runGit(['add', '--', ...validFiles]);
+      } catch {
+        for (const rel of validFiles) {
+          try {
+            await this.shadowRepo.runGit(['add', '--', rel]);
+          } catch {
+            // Non-existent file on disk (brand new file to be created) — safe to skip pre-staging
+          }
+        }
+      }
 
       // Commit changes to create the checkpoint
       const commitMsg = `checkpoint: ${description} [${validFiles.join(', ')}]`;

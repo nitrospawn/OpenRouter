@@ -36,7 +36,7 @@
 
 ### 3.2 Main Panel (Webview)
 - Lives in a VS Code **View Container** — user chooses left (Activity Bar / Primary Sidebar) or right (Secondary Sidebar) via a setting or a drag-and-drop (VS Code natively supports dragging any view between sidebars — the extension should register in a way that doesn't fight this).
-- Setting: `openrouterCopilot.panelPosition`: `"left" | "right"`, applied via `workbench.view` placement on activation, but user's manual drag always wins (don't force-reset it).
+- Setting: `openrouterCopilot.panelPosition`: `"left" | "right"`, applied via `workbench.view` placement on activation, but user's manual drag always wins (don't force-reset it). Note: To keep the in-panel Settings view streamlined and uncluttered, manual panel position segmented buttons and duplicate default model dropdowns are excluded from the settings UI (relying on native VS Code view dragging and the main chat header combobox).
 - **Resizable width:** since the panel lives in a native VS Code View Container, it inherits VS Code's built-in drag-to-resize behavior on the sidebar border for free — no custom resize logic needed. Requirement: the webview's internal layout must use fluid/percentage-based sizing (not fixed pixel widths) so content reflows correctly as the user drags the panel narrower or wider, rather than clipping or overflowing.
 - Layout top to bottom:
   1. **Header bar** — model selector dropdown (searchable), reasoning-effort dropdown (conditionally visible, positioned strictly between model selector and "+" new chat button; order: model selector → reasoning-effort dropdown → "+" button → gear icon), capability icon badges (image icon / mic icon) shown live for the selected model, settings gear.
@@ -49,10 +49,11 @@ A compact reasoning-effort dropdown positioned in the header row directly BETWEE
 - **Layout & Sizing:** The model selector combobox is narrowed to make room for this new control without pushing the gear icon further right and without adding a second header row.
 - **Conditional Visibility:** Following the same pattern as capability badges (§3.3), this control is only rendered when the currently selected model supports a reasoning-effort parameter (`supportsReasoningEffort`). When unsupported, the dropdown is completely absent from the DOM / display and the "+" button sits directly adjacent to the model selector combobox.
 - **Supported Levels Subset:** If a model supports fewer than three effort levels, only the levels it actually supports are rendered in the dropdown (e.g., if a model only supports `low` and `medium`, `high` is omitted). Supported levels default to `['low', 'medium', 'high']` for reasoning models.
-- **Default Value:** Defaults to a sensible middle tier (`medium`) if the user has not explicitly changed it (avoiding defaulting to the most expensive or least capable tier).
+- **Default Value (Low-by-Default Baseline):** For models with reasoning capacity (`supportsReasoningEffort`), the selector automatically defaults to **`low`** (via `getDefaultReasoningEffort()`), prioritizing rapid response times and cost efficiency. If `low` is unavailable for a model, it falls back to `medium` or the first supported tier.
+- **Session Startup & Reopen Reset:** On each startup, panel reopen, or extension reload, the selector cleanly re-initializes to **`low`** for reasoning models, irrespective of any previous session selection. This provides an intentional cost/latency safeguard against forgotten "High" effort settings.
 - **Dynamic State & Model Switching:**
-  - Changes to the reasoning effort level take effect immediately on the next request sent.
-  - If the user switches to a model that does not support reasoning effort, any previously selected effort level is cleared and ignored so it is never passed to an incompatible model.
+  - Mid-session changes to the reasoning effort level take effect immediately on the next request sent and persist for the remainder of that active session.
+  - If the user switches to a model that does not support reasoning effort, the dropdown container is completely hidden, and the active effort is cleared to `undefined` so `reasoning_effort` is never transmitted to unsupported models. Switching back to a reasoning model re-initializes to `low`.
 - **Provider Rejection & Fallback:** If a provider rejects a chat completion request due to an unsupported or invalid reasoning effort parameter (e.g., HTTP 400 error indicating unsupported parameter), the client automatically retries the request once without the `reasoning_effort` parameter and surfaces a clear inline notice/notification: *"This model doesn't support the selected reasoning effort level — retrying without it"*.
 - **Usage & Audit Logging:** The active effort level is explicitly appended to the logged model name in the Usage Report (§3.5), formatted as `Model Name (Level)` (e.g. `openai/o3-mini (High)` vs `openai/o3-mini (Low)`), ensuring cost and token differences across reasoning tiers are fully visible and explainable.
 
@@ -107,20 +108,27 @@ Beyond model switching, a single long-running conversation with one model also n
   - Auto-extracted pinning (the AI inferring what's important without being told) is explicitly out of scope for v1 — manual pinning only, to keep behavior predictable and cost bounded.
 
 ### 3.5 Usage Report View
-- Separate view (own icon in the same view container, or a tab within the panel).
-- Table: timestamp, model (including reasoning effort level if applicable, e.g. "Model X (High)"), prompt tokens, completion tokens, cost, workspace/project.
-- Filters: date range, model, project.
-- Aggregate summary card at top: total spend this session / this week / this month.
-- Export to CSV button.
-- Data stored locally (SQLite via `sql.js` or a flat JSON log — see §5.3).
-
-**Layout (agreed mockup):** back button + title + export icon in the header; three summary cards (today / this week / this month spend) in a row below; a filter strip (model, date range, project) above the log; a scrollable table listing every logged event — both AI chat calls (time, model with reasoning effort annotation, tokens, cost) and terminal command audit entries (§4.3/§5.3) in the same log, with commands shown using a terminal icon and no token/cost values since they aren't billed by OpenRouter directly.
-
-**Per-project filtering:** "project" is derived from the VS Code workspace the request happened in — either the workspace folder's name/path (single-root workspace) or, for multi-root workspaces, the specific root folder that was active when the call was made. Every logged row (chat calls and terminal commands alike) is tagged with this project identifier at write-time, not computed after the fact. The project filter dropdown is populated dynamically from the distinct project values already present in the local log — no separate project list needs to be maintained. This lets a user working across multiple client projects (e.g. separate repos for different clients) see spend broken down per project, which matters for anyone billing or budgeting per engagement rather than just tracking total spend.
-
-**Export respects active filters:** the Export to CSV button exports only the rows currently visible under the active filters (model / date range / project) — not the entire log unconditionally. If the user has filtered to one project, "Export" gives them a CSV of just that project's usage, not everything. A small label near the button (e.g. "Export 24 rows — Client X, last 7 days") should make it clear what scope is about to be exported.
-
-**Clear history — single entry point, staged flow:** Settings has one "Clear history" button, not two separate ones. Clicking it opens a **category selection step first** — "What would you like to clear? Chat history / Usage data" — rather than immediately confirming a deletion. Once the user picks one, a second, final confirmation step follows, scoped to that specific category (e.g. picking "Chat history" shows "This will permanently delete N chat conversations. This cannot be undone." with a "Yes, delete" button; picking "Usage data" shows the equivalent for M logged usage/cost records). Only the category the user explicitly selected is affected — the other remains untouched. This is a three-step flow overall: Clear history → choose category → confirm deletion.
+- Separate full view (`#view-usage`) within the webview container, navigated to via Settings or direct commands, featuring a pinned header strip (`.settings-header-strip`) with back navigation (`‹ Settings`), view title ("Usage Report"), and a dynamic export button (`📥 Export CSV (N)`).
+- **Summary Spend Metric Cards (4-Card Responsive Grid):**
+  - Displays four summary spend cards in a responsive grid (`repeat(4, 1fr)` with `@media (max-width: 360px)` 2x2 wrapping):
+    1. **Today Spend** (`#spend-today`): Total spend incurred today.
+    2. **This Week Spend** (`#spend-week`): Total spend incurred during the current week.
+    3. **This Month Spend** (`#spend-month`): Total spend incurred during the current calendar month.
+    4. **Total Cost** (`#spend-total`): Cumulative lifetime spend across all recorded history.
+  - **Dynamic / Reactive Filtering:** All four summary cards dynamically recalculate in real-time based on the active `#filter-project` and `#filter-model` selections. Filtering to a specific client project or model immediately recalculates Today, This Week, This Month, and Total Cost for that specific subset, providing accurate multi-dimensional financial visibility.
+- **Filter Controls & Workspace Context:**
+  - **Auto-Selected Workspace Default:** On opening the Usage Report, `#filter-project` automatically pre-selects the currently active VS Code workspace project folder (while retaining "All Projects" as an option).
+  - **Cascading / Dependent Model Filter:** Selecting a project in `#filter-project` dynamically updates `#filter-model` to list only the models that were actually used within that selected project (plus "All Models"), preventing empty zero-match combinations.
+  - **Dynamic Population:** The project filter dropdown is populated dynamically from distinct project values present in the local log — no manual project list is required.
+- **Audit Table & Pagination:**
+  - Scrollable audit log table listing every logged event — both AI chat calls (timestamp, model annotated with reasoning effort tier, e.g. `Model (High)`, prompt tokens, completion tokens, cost, workspace project) and terminal command audit entries (§4.3/§5.3).
+  - **Table Pagination:** Renders the first 100 matching entries initially with a smooth "Show more" button for fast DOM performance on large datasets.
+  - **Terminal Command Audit Integrity:** Confirmed terminal command executions log into `UsageStore` alongside AI requests with `cost: 0`, `promptTokens: 0`, `completionTokens: 0`, `totalTokens: 0`, and the active workspace project name, maintaining a unified audit trail with zero token distortion.
+- **Export to CSV with Live Count:**
+  - The Export CSV button dynamically indicates the full filtered count (e.g. `📥 Export CSV (42)`), exporting all matching records across the full dataset regardless of visible table pagination limit.
+- **Pinned Header & Scroll Architecture:**
+  - A fixed header strip (`.settings-header-strip`) keeps navigation and export actions permanently accessible while the audit table scrolls independently inside `#usage-scroll-body`. Navigating between views automatically resets scroll position (`scrollTop = 0`).
+- **Clear history — single entry point, staged flow:** Settings has one "Clear history" button, not two separate ones. Clicking it opens a **category selection step first** — "What would you like to clear? Chat history / Usage data" — rather than immediately confirming a deletion. Once the user picks one, a second, final confirmation step follows, scoped to that specific category (e.g. picking "Chat history" shows "This will permanently delete N chat conversations. This cannot be undone." with a "Yes, delete" button; picking "Usage data" shows the equivalent for M logged usage/cost records). Only the category the user explicitly selected is affected — the other remains untouched. This is a three-step flow overall: Clear history → choose category → confirm deletion.
 
 ---
 
@@ -131,12 +139,40 @@ This is the most important trust surface in the product. Default posture: **ask,
 ### 4.1 Permission Categories
 | Action | Default Behavior | User Control |
 |---|---|---|
-| Read open file / selection for context | Allowed automatically (read-only, no side effects) | Toggle off in settings if desired |
+| Read open file / selection for context | **Allowed automatically** (read-only, no side effects) | Toggle off in settings if desired |
 | Propose a code edit | Always shown as a **diff preview** first | Accept / Reject / Edit-then-accept per hunk |
-| Apply a code edit | Only after explicit Accept | Can set "auto-accept for this session" per-workspace, revocable anytime |
+| Apply a code edit | **Ask each time** (explicit confirmation dialog / Pending Edits review) | Can set "Allow" (zero-interaction auto-apply) or "Deny" |
 | Create/delete files | Explicit confirmation dialog every time (not auto-accept-able) | N/A — always confirmed |
-| Run a terminal command | Explicit confirmation dialog showing the exact command string before execution | "Always allow this exact command" opt-in per workspace; full terminal access can be disabled entirely in settings |
-| Access to other (unopened) files in workspace | Off by default; must be enabled per-workspace via a permission prompt the first time it's needed | Can be revoked anytime |
+| Run a terminal command | **Ask each time** (explicit confirmation dialog showing exact command) | Can set "Allow" (zero-interaction auto-run), "Always allow this exact command", or "Deny" |
+| Access to other (unopened) files in workspace | **Allowed automatically** (ambient read-only workspace context) | Toggle off in settings if desired |
+
+### 4.1.1 Permission System Refinements & Execution Rules (Amendment)
+
+1. **Allow = Zero Manual Interaction (All Applicable Categories):**
+   - **`applyEdit = Allow`:** When set to Allow, proposed code edits are applied **automatically** with no manual "Apply" button click and no actionable entries placed in the Pending Edits bar. The edit is written to disk immediately once generated, followed by a concise confirmation summary posted to chat (e.g. `✓ Applied: updated auth.ts`).
+   - **`runTerminalCommand = Allow`:** When set to Allow, proposed terminal commands execute **automatically** with no "Run in Terminal" button click and no modal confirmation dialog, followed by an execution summary posted to chat.
+   - **`Ask` Mode:** When either permission is set to Ask, the standard manual flow remains completely unchanged (user reviews and clicks Apply/Deny/Diff for edits, Run/Deny for commands).
+   - **`Deny` Mode:** Refused immediately without dialogs or execution. To preserve user trust and prevent false claims of success from optimistic model narration, when an edit proposal or terminal command is generated under Deny mode, the extension immediately surfaces a clear notice and appends a distinct system correction in chat: `"⚠️ This edit was not applied — Code edits permission is currently set to Denied."`, and renders the proposal card with an explicit denial badge (`✗ Edit blocked — Code edits permission is set to Denied`). The disk remains untouched and no false success is asserted.
+   - **Safety Invariant:** All security, backup, and recovery mechanisms apply identically for auto-applied actions under Allow as they do for manually clicked actions:
+     - **Shadow-git Checkpointing (§4.3):** A shadow-git commit is created immediately prior to applying any edit.
+     - **Secret Redaction (§7.1):** Outgoing context and terminal outputs are scanned and masked.
+     - **Scoped Restore & Drift Detection:** The user may rewind any auto-applied turn via the undo button on the user message.
+     - **Safe Failure on Malformed Edits:** Malformed `SEARCH/REPLACE` blocks or file-write failures fail safely, surfacing clear error messages in chat without corrupting or wiping existing files.
+   - **Ambient Read Categories:** `readActiveContext` and `readWorkspaceFiles` operate with zero manual interaction under Allow (ambient read-only context).
+
+2. **Standard Default Permission States (Fresh Install / New Workspace):**
+   | Permission | Default State | Behavior |
+   |---|---|---|
+   | Read open file for context (`readActiveContext`) | **Allowed** | Ambient read of active editor buffer |
+   | Code edits (`applyEdit`) | **Ask each time** | Review via diff preview & Pending Edits bar |
+   | Terminal commands (`runTerminalCommand`) | **Ask each time** | Modal dialog with exact command and cwd |
+   | Access other workspace files (`readWorkspaceFiles`) | **Allowed** | Ambient cross-file resolution & symbol search |
+   *These defaults apply on initial installation or fresh workspace state. Once customized by the user in Settings, chosen values persist and are never silently overwritten back to defaults.*
+
+3. **Live Mid-Session Permission Updates:**
+   - Permission modifications made in Settings (or via Command Palette) take effect **immediately on the very next action** within an active conversation — without requiring a new chat session, window reload, or extension restart.
+   - Applies symmetrically in both directions (loosening from Ask/Deny to Allow, and tightening from Allow back to Ask/Deny) across all categories.
+   - **Pending Edits Lifecycle on Mode Switch:** Pre-existing edits that were proposed under `Ask` and remain in the Pending Edits bar are not retroactively applied to disk upon switching to `Allow`. They remain pending for the user's manual disposition, while all edits generated subsequently auto-apply immediately.
 
 ### 4.2 Permission UX
 - First time any category is needed, show a native VS Code notification/dialog with **Allow / Allow for this session / Deny**.
@@ -197,11 +233,13 @@ The extension maintains its **own private git repository**, entirely separate fr
 - Local store: SQLite file in the extension's global storage path (`context.globalStorageUri`), not synced anywhere.
 
 ### 5.4 Settings Surface
-- Panel position (left/right)
-- Default model
-- Permission states (§4.1)
-- Usage data retention period / clear-history button
-- **Version indicator:** Displays the current extension version (e.g. `OpenRouter v0.2.0`) pinned at the bottom of the Settings view, updated synchronously with `package.json` across version increments.
+- **Streamlined Configuration:** To eliminate clutter and preserve vertical space, redundant manual panel position buttons (Left/Right) and duplicate default model dropdowns are removed from the Settings UI. Panel positioning is handled natively via VS Code view drag-and-drop (or setting `openrouterCopilot.panelPosition`), and model selection is handled directly via the primary chat header combobox.
+- **Pinned Header Strip:** A fixed header strip (`.settings-header-strip`) keeps the `‹ Back` navigation button and "Settings" title permanently pinned at the top, while configuration options scroll smoothly inside `#settings-scroll-body`. Scroll position is automatically reset (`scrollTop = 0`) on view transitions.
+- **Permission States:** Interactive toggles and selectors for file read, code edit auto-apply/ask/deny, terminal execution, and cross-file access (§4.1).
+- **Reviewer Model Configuration:** Workspace-scoped master toggle, side-by-side reviewer model and dynamic reasoning-effort selector, and customizable reviewer system prompt (§10).
+- **History & Retention:** Staged "Clear history" flow with category selection (Chat history vs. Usage data) and scoped confirmation dialogs (§3.5).
+- **Privacy Policy Link:** Direct link in Settings pointing to OpenRouter's official privacy documentation at `https://openrouter.ai/privacy` (§7.3).
+- **Version Indicator:** Displays the current extension version (e.g. `OpenRouter v0.2.0`) pinned at the bottom of the Settings view, updated synchronously with `package.json` across version increments.
 
 ---
 
@@ -318,9 +356,15 @@ openrouter-copilot/
 - Type-to-search combobox for model selection + auto-refresh on chat launch
 - Multi-session chat management with persistent storage (`chat_sessions.json`), new chat generation, session dropdown list, session switching, inline session renaming (`✏️`) to aid recollection, and session deletion
 - Markdown rendering for assistant output (fenced code blocks with copy action, inline formatting, headers, lists)
-- User input copy affordance (small copy button on input box and individual message headers)
 - "Clarify" aspect quoting: ability to select or quote aspects of agent output directly into context for follow-up clarification
-- Executive Task Summary cards auto-extracted and highlighted upon task completion
+  - **Attachment Chip Representation:** Quoting an assistant response (via the message-header `Clarify` button or the floating `Clarify Selection` toolbar on highlighted text) attaches a compact chip to the attachment preview bar above the input field instead of injecting raw text or Markdown into the textarea.
+  - **Sequential Numbering & Dynamic Re-indexing:** Quote chips are numbered sequentially starting at 1 (`Quote 1: "<snippet>..."`, `Quote 2: "<snippet>..."`, etc.). If an intermediate quote is deleted via its `✕` button, the remaining chips automatically re-index dynamically (e.g. `Quote 3` becomes `Quote 2`), ensuring zero numbering gaps and allowing users to address specific quotes directly in their prompt by label (`Quote 1: ...`) or number (`1. ...`).
+  - **Scoped Selection Lifecycle:** The floating selection toolbar specifically binds to assistant messages within `#messages-container` while `view-chat` is active, avoiding cross-view toolbar leaks or non-rendering bugs.
+  - **Clean Typing Experience:** The input textarea remains clean, unobstructed, and focused, omitting any mandatory `"Can you clarify: "` boilerplate so users can ask specific questions, challenge assumptions, or answer numbered questions freely.
+  - **Smart Fallback on Empty Input:** If a user attaches one or more quote chips and sends without typing custom text, the system automatically appends a natural fallback query (`Can you clarify this?`, or `Can you clarify these points?` if multiple quotes exist) directly into the outgoing payload sent to the model.
+  - **Multi-Quote Stacking & Deduplication:** Supports highlighting and attaching multiple distinct excerpts across the conversation. Exact duplicate quotes are automatically detected and ignored.
+  - **Hover Behavior:** Chips truncate smoothly with an ellipsis without showing distracting hover tooltips.
+  - **Grounding in Chat History:** Dispatched quotes are assembled into Markdown blockquotes (`> [line]`) prepended to the user's prompt, preserving explicit conversational grounding and sequential 1-to-1 order for the model and subsequent chat turns.
 - Basic settings panel (API key, panel position, default model)
 - Live in-editor context freshness: real-time in-memory buffer reading (`document.getText()`) on every turn, webview-focus fallback to `visibleTextEditors`, in-memory document priority for workspace file mentions, and explicit superseding directives in prompt payloads to prevent stale-context regressions.
 - Network resilience & stream error recovery: automatic silent retry (up to 2 extra attempts with exponential backoff) for transient network dropouts / fetch failures before reporting an error; in-chat interactive error card with single-click **"⎌ Retry Request"** button if all retries fail, avoiding intrusive raw error popups.
@@ -351,10 +395,9 @@ openrouter-copilot/
 - Window-close clear trigger for shadow checkpoints
 
 ### Phase 5 — Cost & Context Management
-- Token usage logging (SQLite store), cost computation from pricing data
-- Terminal command audit logging into the same store
-- Usage Report view: summary cards, filters (model/date/project), per-project tagging,
-  filtered CSV export
+- Token usage logging (SQLite / local JSON store), cost computation from pricing data
+- Terminal command audit logging into the same store (cost: 0, tokens: 0)
+- Usage Report view: 4 summary cards (Today, This Week, This Month, Total Cost) with reactive filtering, cascading project/model filters, auto-selected workspace default, table pagination (100 rows + "Show more"), filtered CSV export with live count, and pinned header architecture
 - Rolling auto-summarization (long-conversation trigger) + model-switch summarization
 - Pinned context tier (manual pin/unpin, exclusion from summarization, token meter split)
 - Context meter in footer strip (tokens / max context %, instant reset on new chat click, and session-synchronized token calculation upon switching history)
@@ -389,7 +432,7 @@ openrouter-copilot/
 ### 7.3 Provider Data-Retention Preference
 - A setting exposing provider-level data handling where OpenRouter's model/provider metadata makes this determinable (e.g. preferring providers with documented zero-data-retention terms over those that retain/train on API data by default).
 - Scope this carefully — OpenRouter's granularity on this varies by provider, so treat it as an informational preference/filter rather than a guaranteed enforcement mechanism, and be explicit in the UI about that limitation rather than implying a stronger guarantee than can actually be verified.
-- At minimum: a direct link from Settings to OpenRouter's own data-policy documentation, so the extension isn't making privacy claims on providers' behalf that it can't independently confirm.
+- At minimum: a direct link from Settings to OpenRouter's own data-policy documentation (`https://openrouter.ai/privacy`), so the extension isn't making privacy claims on providers' behalf that it can't independently confirm.
 
 ### 7.4 Sequencing Note
 - §7.1 (secret redaction) is the priority item — it's the one failure mode in this phase that's silent and irreversible once it happens, and realistic given how often real codebases contain stray credentials. Recommended as a required item before using the extension on any real (non-demo) client project.
@@ -451,7 +494,11 @@ To prevent conflicting instructions (e.g. attempting to produce an implementatio
 ### 9.3 Directive 2: Default-to-Plan Behavior
 - **Default Requirement:** Before taking side-effecting actions (emitting ` ```edit_file `, ` ```create_file `, or ` ```bash ` blocks), the assistant outputs a concise plain-language implementation plan explaining what will be changed and why.
 - **Per-Request Overrides:** If the user explicitly asks to skip planning ("just do it", "skip the plan", "go ahead", "proceed directly", "no plan needed"), the planning step is bypassed for that request only.
-- **Trivial Fixes Exception:** Genuinely trivial, low-risk, single-file edits (e.g. fixing a typo, simple rename, or one-line bug fix) may skip the plan without an explicit user override.
+- **Planning-skip exceptions (no user override required):**
+  - **Trivial single-file edits:** typo fixes, simple renames, one-line bug fixes.
+  - **Documentation and text file tasks:** creating or updating any `.md`, `.txt`, `.rst`, or similar non-executable file — READMEs, PRDs, changelogs, notes, specifications. These carry zero execution risk and no workspace side effects. The Implementation Plan → Proceed → Walkthrough lifecycle must never trigger for these tasks regardless of how the request is phrased (e.g. "generate a PRD", "write specs", "draft a README").
+  - **Explicit single-file creation:** any task where the user has specified both *what* to write and *where*, leaving nothing ambiguous to resolve before acting.
+- **Planning trigger threshold:** The plan → proceed → walkthrough lifecycle activates only when a task modifies **3 or more interrelated code files**, or involves breaking architectural changes, schema migrations, or package replacements. This threshold is fixed — individual models routed through the extension must not drift below it based on keyword matching (e.g. "PRD", "specifications", "architecture") without meeting the file-count or destructiveness criteria.
 
 ### 9.4 Directive 3: Search-Before-Read Code Navigation
 - Instructs the assistant to favor targeted search/grep queries to locate functions and symbols rather than reading entire files sequentially line-by-line. This significantly improves performance and token efficiency on cheaper models.
@@ -467,3 +514,240 @@ To prevent conflicting instructions (e.g. attempting to produce an implementatio
 
 ### 9.6 Architectural Note: Model-Agnostic Prompt Directives
 All four directives are implemented directly within the base system prompt transmitted with every completion call (`buildSystemPrompt()`). They are prompt-based directives rather than hardcoded programmatic state machines, ensuring consistent behavior across all selected OpenRouter models. As prompt directives, lower-tier models may occasionally follow them with varying fidelity compared to frontier models.
+
+
+## Phase 10 — Reviewer Model Settings Configuration
+
+**Goal:** Establish the configuration and settings layer for a dedicated Reviewer Model. This phase encompasses Settings panel controls, per-workspace state isolation, and configuration persistence. It prepares the system for the upcoming Two-Tier Reviewer Model workflow.
+
+> [!NOTE]
+> **Out of Scope for Phase 10:** The actual review flow mechanics (the Proceed vs. Review choice in the chat thread, sending plan/walkthrough documents to the reviewer model, and thread/comment-based feedback via VS Code's native Comments API) are a separate, subsequent phase and are NOT part of this configuration feature.
+
+### 10.1 Per-Workspace Scoping & Isolation
+- Consistent with other project-sensitive data in this extension (Usage Report per-project filtering, shadow-git checkpoints, chat history, and permissions):
+  - All Reviewer Model settings are strictly **scoped per-workspace** using VS Code's `ConfigurationTarget.Workspace` / `workspaceState`.
+  - Opening a different workspace displays that workspace's own configuration (off by default, or whatever was specifically saved for that project). Settings never leak or bleed across projects.
+
+### 10.2 Master Toggle (Feature Gate)
+- **Setting:** `openrouter.reviewer.enabled` (Boolean, default `false`).
+- **Behavior:**
+  - **OFF (default):** The reviewer model combobox selector, reasoning-effort control, and system prompt text area are completely hidden from the Settings UI (not merely greyed out or disabled).
+  - **ON:** The model combobox selector, reasoning-effort control, and prompt text area become visible for configuration.
+  - If the user turns the toggle ON without having chosen a model, an inline prompt/warning reminds them to pick a reviewer model for the workspace.
+
+### 10.3 Reviewer Model & Reasoning Effort Selection
+- **Searchable Combobox:** Reuses the model selector combobox component (§3.3), allowing real-time filtering, context-length indicators, and ZDR privacy badges.
+- **Model Independence:** Fully independent of the primary chat model. The user may configure a different model (e.g. an analytical or reasoning model), the same model, or a model at a different reasoning-effort tier.
+- **Side-by-Side Row Layout (`.reviewer-model-row`):** The Reviewer Model combobox and Reasoning Effort dropdown are positioned horizontally on the exact same row, saving vertical space and maintaining visual balance in the settings panel.
+- **Smart Conditional Visibility:** The Reasoning Effort dropdown only renders inline beside the combobox when the selected reviewer model actually supports reasoning effort (`supportsReasoningEffort`, e.g. `o1`, `o3`, `deepseek-r1`). For standard or non-reasoning models, the reasoning effort dropdown is completely hidden from the DOM and the model combobox smoothly expands to 100% full width.
+
+### 10.4 Editable Reviewer System Prompt
+- **Text Area:** Multi-line text area showing the active reviewer system prompt for the workspace.
+- **Default Prompt:** Pre-filled with a strict, comprehensive default instructing the reviewer to critique correctness, logic bugs, completeness, unhandled edge cases, security vulnerabilities, and architectural regression risks.
+- **Reset to Default Action:** A "Reset to Default" button restores the built-in default system prompt for the current workspace only, without altering any other workspace's saved reviewer prompt.
+
+### 10.5 Live Mid-Session Updates
+- In accordance with the live mid-session update principle established for permissions (§4.1), updates to any of these three settings (toggle, model/effort, system prompt) take effect immediately without requiring a window or extension reload, even if a conversation is actively open.
+
+
+## Phase 11 — Reviewer Model Review Flow
+
+**Goal:** Implement the end-to-end review flow enabling a dedicated, workspace-configured Reviewer Model to critique implementation plans before execution and verification walkthroughs after completion, operating through a dedicated full-view conversation panel with native VS Code Comments API support and selective feedback return to the main model.
+
+This phase directly builds upon two foundational prerequisites:
+1. **Two-Tier Plan/Walkthrough Artifact Architecture:** Detailed plans and verification walkthroughs generated as standalone Markdown documents with byte-for-byte fidelity stored in `HistoryStore` (`planDocument` and `walkthroughDocument`).
+2. **Reviewer Model Settings Configuration (Phase 10):** Per-workspace master toggle (`openrouter.reviewer.enabled`), independent model selection, dynamic reasoning effort, and editable custom reviewer system prompt.
+
+---
+
+### 11.1 Trigger Point & Conditional Visibility
+- **Artifact Types Covered:**
+  - **Implementation Plans (Pre-Execution):** A **"Review"** action button appears alongside **"Proceed"** and **"View"** on the plan's summary card in the chat stream.
+  - **Walkthrough / Results (Post-Execution):** A **"Review"** action button appears alongside **"View"** on the completed walkthrough's summary card (standalone, as there is no "Proceed" action after execution).
+- **Workspace Feature Gate:**
+  - The "Review" action appears **strictly when Reviewer Model is enabled** for the active workspace (`openrouter.reviewer.enabled === true`).
+  - When disabled (`false`, the default), existing chat behavior is completely unchanged — no "Review" option appears anywhere.
+
+---
+
+### 11.2 What Happens on "Review"
+- **Byte-for-Byte Fidelity Transmission:**
+  - On clicking "Review", the extension extracts the exact stored `planDocument` or `walkthroughDocument` content (retrieved from `HistoryStore` or disk cache per the existing fidelity guarantee) and transmits it to the reviewer model.
+  - The request uses the current workspace's configured reviewer model, reasoning effort tier, and reviewer system prompt (Phase 10).
+- **Dedicated Full-View Navigation:**
+  - Opens a **separate, full view** (`view-reviewer`) within the webview container.
+  - Reuses the identical top-level view navigation pattern already established for Settings (`view-settings`) and Usage Report (`view-usage`) (with clean back/forward navigation to return to `view-chat`), avoiding cluttered split-pane layouts that degrade readability on narrow sidebar configurations.
+
+---
+
+### 11.3 The Reviewer Panel
+- **Layout & Structure:**
+  - **Header Strip:** Features a `‹ Main Chat` back navigation button, view title ("Review Implementation Plan" or "Review Walkthrough"), and a pill badge displaying the active reviewer model and reasoning effort.
+  - **Collapsible Artifact Section:** Displays the original artifact document in a scrollable reference preview. Includes an "Open in Editor Tab" button to open the real artifact Markdown document directly in a native VS Code editor tab for line-specific inspection.
+  - **Reviewer Conversation Stream:** Dedicated back-and-forth chat conversation thread between the user and the reviewer model. Users can ask clarifying questions, challenge critiques, request deeper security analysis, or explore alternatives.
+    - **Header Clarify Affordance:** Assistant messages in the Reviewer stream include a `Clarify` button next to `Copy` to quote the full reviewer response directly into the Reviewer's input bar as a chip.
+    - **Reviewer Aspect Quoting & Sequential Numbering:** Users can highlight specific critique sentences and click `💬 Clarify Selection` on the selection toolbar to discuss that specific point without cluttering the input textarea. Chips are numbered sequentially (`Quote 1: ...`, `Quote 2: ...`) with dynamic re-indexing upon removal.
+    - **Smart Fallback Precedence:** When a quote is attached in the Reviewer input bar and sent without typed text, the smart fallback query (`Can you clarify this?`) takes precedence over the default artifact review prompt (`Please review these Plan docs.`).
+    - **Session Switching Cleanup:** Switching between review sessions, creating a new review session, or clicking reset context automatically cleanses any unsent quote chips in the Reviewer input bar.
+  - **Input Bar:** Compact prompt input with an attachment preview bar (`#reviewer-attachment-preview-bar`), Send, and Stop streaming controls dedicated strictly to the reviewer model.
+- **Native Comments API Integration (`vscode.comments.createCommentController`):**
+  - Integrates VS Code's native Comments API (`openrouter-reviewer`, label: "OpenRouter Reviewer Comments").
+  - Comment threads bind directly to the real `file://` URI generated by `ArtifactDocumentManager.prepareArtifactFile()`.
+  - Because artifacts are stored outside the user's workspace git tracking (e.g. in `storageUri/artifacts/` or OS temp), users can create threaded, range-specific inline comments without risk of committing reasoning artifacts to git.
+
+---
+
+### 11.4 Returning Feedback to the Main Model & Dual Selection Actions
+- **Strict Architectural Isolation:**
+  - The reviewer conversation is **NEVER** sent wholesale or automatically to the main model.
+  - The main model maintains **zero visibility** into the reviewer conversation, reviewer model identity, reasoning effort, or prompt instructions.
+  - Selection listeners and floating action bars are strictly scoped to their respective active views (`view-chat` vs `view-reviewer`), preventing cross-view toolbar leaks.
+- **Dual-Action Reviewer Selection Toolbar:**
+  Highlighting or selecting text strictly within any Reviewer assistant response reveals a dual-action toolbar:
+  1. `💬 Clarify Selection`: Attaches the highlighted excerpt as a quote chip into the **Reviewer's own input bar** to follow up or challenge the critique.
+  2. `↵ Send to Main Model`: Transfers only that selected feedback snippet to the **Main Chat's draft prompt input** and returns to the main chat view.
+- **Message Action Button:**
+  Clicking `Send to Main Model` on any reviewer message card transfers that entire response to the main chat's draft prompt input.
+- **Draft Insertion Without Auto-Send:**
+  - Selected feedback lands in the **main chat's draft input field** (`#prompt-input`).
+  - It is **NOT** sent automatically. The user remains in total control to inspect, edit, prepend their own context or instructions, or combine multiple feedback snippets before pressing Enter/Send.
+- **Seamless Main Conversation Continuation:**
+  - Once sent by the user, the prompt is processed as a standard user message in the existing chat session.
+  - The primary model responds naturally to the user prompt, with no awareness that the feedback originated from an auxiliary reviewer model.
+
+---
+
+### 11.5 Post-Mortem Follow-Through
+- Post-mortem walkthrough reviews follow the exact same selective transfer workflow:
+  - If a review of a completed task reveals an overlooked edge case or performance issue, transferring feedback to the main chat initiates a standard follow-up turn.
+  - This may naturally trigger a fresh plan → execute → verify cycle in the main chat if the issue warrants a code change.
+
+---
+
+### 11.6 Cost & Usage Logging
+- **Distinct Logging Tag:**
+  - Every call made to the Reviewer Model is logged in the `UsageStore` with `type: "reviewer"`, strictly separate from `type: "chat_completion"` and `type: "summarization"`.
+  - Costs and token counts are never blended into the primary model's totals.
+- **Explainability & Model Transparency:**
+  - The logged model name explicitly records the reviewer model and active reasoning effort tier: `Model Name (Effort)` (e.g. `anthropic/claude-3.7-sonnet (High)`).
+- **Audit Table & Model Filtering:**
+  - The Usage Report table renders reviewer entries with a dedicated `🔍 Reviewer` type pill.
+  - The existing Model Filter dropdown in the Usage Report includes reviewer models, allowing users to filter and audit reviewer consumption independently.
+
+---
+
+### 11.7 Reviewer Consolidation pass & Stream Outcome Handling (Consolidation Amendment)
+- **Item 1: Plan Artifact Conversational Summary Guarantee:**
+  - Generating an implementation plan or walkthrough artifact must always produce a short conversational summary sentence in the chat stream alongside the artifact card (e.g. "I have prepared an implementation plan for your review.").
+  - Fallback parsing ensures that even if model output contains only the fenced document block, a friendly conversational intro sentence accompanies the artifact notice.
+- **Item 2: Unified Shared Chat Input Architecture:**
+  - Both main chat and reviewer panels share a single controller factory (`createChatInputController`) ensuring full feature parity: auto-growing textarea, multi-line Shift+Enter handling, image/text attachments with preview chips, and drag-and-drop file upload.
+- **Item 3: Three-Way Stream Outcome Handling:**
+  - **Outcome 1 (Zero chunks received, then failure):** No message bubble is ever created. Renders a distinct error card with a direct Retry button.
+  - **Outcome 2 (Full stream completed successfully):** Normal markdown rendering with enabled `Send to Main Model` action.
+  - **Outcome 3 (Partial-then-failed stream):**
+    - The partial content received is strictly preserved (never discarded).
+    - Visually and structurally marked incomplete with an inline warning badge: `⚠️ Response interrupted — incomplete`.
+    - Dedicated `Retry` action replaces the partial turn upon restart.
+    - Forwarding to the main model via `Send to Main Model` prepends an explicit `[Note: Reviewer response was interrupted/incomplete]` warning banner to prevent sending cut-off critiques unknowingly.
+- **Item 4: Shared Capability Detection & Reasoning Effort Selector:**
+  - The reviewer configuration dropdown wires into `detectModelCapabilities()` and dynamic reasoning effort selectors (`low`, `medium`, `high`) matching main chat capabilities.
+- **Item 5: Direct Reviewer Access & Independent Reviewer Sessions:**
+  - Main header includes a dedicated reviewer button (`#reviewer-toggle-btn`) for standalone review mode.
+  - Reviewer maintains its own independent session history stored in `reviewer_sessions.json` with full session lifecycle (new session, switch, rename, delete) without bleeding into main chat history.
+  - **Session Continuity & Context Reuse:** Clicking "Review" on a plan/walkthrough card checks if a reviewer session is already active/open for the current artifact context; if one exists, it is reused directly (reopening/focusing `#view-reviewer` with existing history) instead of creating duplicate sessions or re-streaming initial prompts. Only when there is genuinely no active reviewer session (first review action, or after explicitly starting a new session or switching away) is a fresh reviewer session created. Sending follow-up messages within an open reviewer conversation always appends to the current session's history without spawning new sessions.
+- **Item 6: Reviewer Context Management & In-Panel Model Switching:**
+  - Live token meter in the reviewer strip with warning thresholds.
+  - Manual context reset ("Start fresh from here").
+  - In-panel model combobox and reasoning selector with drop-with-notice warning banner for multimodal capability mismatches.
+
+---
+
+### 11.8 Copy, Rendering & Drag-and-Drop Hardening (Phase 11 Amendment)
+- **Item 1: Reviewer Message & Code Block Copy Buttons:**
+  - Standardized reviewer message cards (both user and assistant roles) to include full `.message-header` with `.role-tag` ("You" / "Reviewer") and `.message-header-actions` containing `.msg-copy-btn` for 100% parity with main chat.
+  - Reviewer message rendering routes through `renderFormattedContent()`, ensuring that every fenced code block automatically receives its own per-block `.code-block-copy-btn` via `renderCodeBlock()`.
+- **Item 2: Streaming Performance & Throttling / Debouncing:**
+  - Token-by-token reviewer stream chunks (`handleReviewerStreamChunk`) are throttled via `requestAnimationFrame` and a time-window lock (`REVIEWER_RENDER_THROTTLE_MS = 60ms`) to eliminate continuous DOM clearing and full subtree reconstruction on every token.
+  - Both stream completion (`handleReviewerStreamDone`) and stream interruption (`handleReviewerStreamError`) execute an immediate synchronous flush (`flushReviewerStreamRender`) to guarantee zero missing content.
+  - Copy button listeners and headers are attached once to the outer message shell, preventing listener accumulation, duplicate fires, or event handler leaks across chunk updates.
+- **Item 3: Unterminated Code Fence Streaming Parity:**
+  - `renderFormattedContent()` detects partially received / open-ended code fences (`/```([^\r\n]*)\r?\n([\s\S]*)$/`) during active streaming and renders them as live pending code blocks via `renderCodeBlock()`, eliminating raw unformatted fence syntax or flickering layout shifts mid-stream.
+- **Item 4: Drop-Zone Signature Safety & Parity:**
+  - `createChatInputController({ dropZone?: HTMLElement })` safely preserves default drop handling on `inputBoxWrapper` while binding the dedicated reviewer container (`#view-reviewer`) when configured. Main chat call sites omitting `dropZone` retain their exact pre-amendment drag-and-drop behavior.
+- **Item 5: Prompt Fencing Directives & Token Budget:**
+  - Updated `src/prompt/systemPrompt.ts` (Tone & Style) and `DEFAULT_REVIEWER_SYSTEM_PROMPT` in `src/settings/configuration.ts` to mandate that copy-intended artifacts, snippets, and commands be enclosed in dedicated fenced code blocks with language tags, separate from conversational commentary.
+  - Added token length impact is ~30 tokens on the system prompts, representing less than 0.05% of typical context windows, well within any pinned prompt budget.
+- **Item 6: Reviewer Session Continuity & Artifact Context Attachment:**
+  - Extended `ChatSession` in `HistoryStore` to track `artifactType`, `artifactMessageId`, and `artifactContent`.
+  - When "Review" is clicked while a reviewer session is already open/active (whether from the same or a different plan/walkthrough card), the extension does NOT create a new session and does NOT auto-send.
+  - Instead, the artifact document is added to the current session's input box as an attachment chip (reusing `reviewerChatInputController.addAttachment()`), focusing the textarea and allowing the user to optionally type a note (e.g. "check again") before clicking Send explicitly.
+  - When the user sends this attachment, the plan/walkthrough content is transmitted as system-role context (never printed as raw markdown in the chat bubble), and the visible user-turn displays only the user's typed note (or clean default instruction), preserving single-session integrity.
+  - Retained explicit `NEW_REVIEWER_SESSION` control (+ New Session) as the single intentional mechanism for initiating fresh standalone review sessions.
+- **Item 7: First Reviewer User Turn Displays Configured Reviewer System Prompt:**
+  - On initial "Review" click for a plan or walkthrough artifact, the visible user turn rendered in the reviewer conversation thread displays the workspace's configured Reviewer System Prompt text (custom or default) rather than a generic placeholder, giving the user direct visibility into the critique instructions.
+  - The model request includes this prompt in both system role (with full byte-for-byte artifact document context) and user turn, while the document itself is rendered exclusively in the top Collapsible Artifact Section.
+
+---
+
+### 11.9 Attachment Preview Bar Wrapping, Stacking & Viewport Parity (Phase 11 Amendment)
+- **Item 1: Multi-line Wrapping & Stacking (`flex-wrap: wrap`):**
+  - Updated `.attachment-preview-bar` with `display: flex; flex-wrap: wrap; gap: 6px 8px; width: 100%; box-sizing: border-box;` in both Main Chat (`#attachment-preview-bar`) and Reviewer Chat (`#reviewer-attachment-preview-bar`).
+  - Quote attachment chips, files, and image preview chips now dynamically wrap and stack across lines instead of overflowing horizontally past the right edge of the screen.
+- **Item 2: Viewport Constrained Scrolling & Ellipsis Protection:**
+  - Added `max-height: 140px; overflow-y: auto; overflow-x: hidden;` with custom compact scrollbars to `.attachment-preview-bar`, allowing numerous quotes (e.g. 4–6 multi-select questions) to stack comfortably while preventing displacement of the input textarea.
+  - Enforced `max-width: min(240px, 100%)` and `box-sizing: border-box; flex-shrink: 0;` on `.attachment-chip`, coupled with `min-width: 0; flex: 1 1 auto;` on `.attachment-name` so labels truncate with an ellipsis (`...`) under narrow sidebar conditions while protecting quote icons and remove buttons (`flex-shrink: 0;`).
+
+---
+
+## Phase 12 — Usage Report & Settings Architecture Streamlining
+
+**Goal:** Upgrade the Usage Report audit view with comprehensive multi-dimensional financial tracking (4-card metric grid with Total Cost), real-time reactive filtering, cascading dependent project-model dropdowns, and high-performance table pagination; streamline the in-panel Settings surface by eliminating redundant controls and pinning headers for frictionless navigation.
+
+### 12.1 4-Card Spend Metric Grid & Reactive Filtering
+- **Total Cost Metric Card (`#spend-total`):**
+  - Added a 4th metric card displaying cumulative lifetime spend alongside Today (`#spend-today`), This Week (`#spend-week`), and This Month (`#spend-month`).
+  - Layout: Fluid 4-column responsive grid (`repeat(4, 1fr)`) with an `@media (max-width: 360px)` breakpoint that wraps into an ergonomic 2x2 grid for narrow sidebar configurations.
+- **Dynamic Reactive Re-Aggregation:**
+  - All 4 spend cards reactively recompute whenever `#filter-project` or `#filter-model` changes.
+  - Selecting a specific project or model updates Today, Week, Month, and Total Cost cards to show the exact financial metrics for that slice, rather than static global totals.
+
+### 12.2 Contextual Workspace Filtering & Cascading Dropdowns
+- **Auto-Selected Workspace Project Default:**
+  - On opening the Usage Report, `#filter-project` automatically detects and selects the active workspace project name.
+  - "All Projects" remains available at the top of the dropdown for viewing organization-wide spend.
+- **Cascading / Dependent Model Filter:**
+  - Selecting a project in `#filter-project` queries the usage dataset and updates the `#filter-model` dropdown options to include only models that were actually invoked within that project.
+  - Prevents confusing zero-result states caused by selecting incompatible project/model filter combinations.
+
+### 12.3 Table Pagination & Export Fidelity
+- **Audit Table Pagination (100-Row Chunks):**
+  - The audit log table renders up to 100 rows initially with a smooth "Show more" button for subsequent 100-row chunks, preventing DOM bloat and UI lag on large audit logs.
+- **Full-Dataset CSV Export:**
+  - The Export CSV button dynamically updates its label with the total filtered record count (`📥 Export CSV (N)`).
+  - Clicking Export writes all records matching the active filters to the CSV file, regardless of visual table pagination limit.
+
+### 12.4 Terminal Command Audit Logging Integrity
+- Terminal commands executed via the chat proposal pipeline log directly to `UsageStore` with `cost: 0`, `promptTokens: 0`, `completionTokens: 0`, `totalTokens: 0`, and the active workspace project name.
+- Ensures terminal commands appear in audit logs and project usage views without artificially inflating token counters or financial metrics.
+
+### 12.5 Settings Surface Streamlining & Privacy Link
+- **Elimination of Redundant Controls:**
+  - Removed manual "Panel position" Left/Right segmented buttons and guide box from the Settings view, relying on VS Code's native drag-and-drop view container management.
+  - Removed duplicate "Default model" dropdown from Settings, directing users to the primary type-to-search combobox in the chat header.
+- **Updated Privacy Policy Link:**
+  - Updated the official OpenRouter data policy link in Settings to point to `https://openrouter.ai/privacy`.
+
+### 12.6 Pinned Header Navigation & Scroll Position Resets
+- **Fixed Header Architecture (`.settings-header-strip`):**
+  - Both `#view-settings` and `#view-usage` utilize a pinned header strip containing back navigation buttons and view titles.
+  - Content scrolls inside dedicated containers (`#settings-scroll-body`, `#usage-scroll-body`), ensuring navigation controls are always accessible without scrolling back to top.
+- **Scroll Position Reset:**
+  - Navigating into Settings or Usage Report automatically resets `scrollTop = 0` on the respective scrollable body for a clean starting view.
+
+### 12.7 Reviewer Model Inline Layout & Smart Visibility
+- **Side-by-Side Presentation (`.reviewer-model-row`):**
+  - Reviewer Model combobox and Reasoning Effort dropdown sit on the same horizontal row within `#reviewer-config-section`.
+- **Smart Conditional Visibility:**
+  - Reasoning Effort dropdown renders inline beside the combobox only when the selected model supports reasoning (`supportsReasoningEffort`).
+  - For standard models, the reasoning effort dropdown collapses completely, and the model selector expands to 100% width.

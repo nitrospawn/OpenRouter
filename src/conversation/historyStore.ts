@@ -9,6 +9,8 @@ export interface StoredChatMessage {
   timestamp: number;
   checkpointId?: string;
   affectedFiles?: string[];
+  planDocument?: string;
+  walkthroughDocument?: string;
 }
 
 export interface ChatSessionMeta {
@@ -25,19 +27,27 @@ export interface ChatSession {
   createdAt: number;
   updatedAt: number;
   messages: StoredChatMessage[];
+  artifactType?: 'plan' | 'walkthrough' | 'standalone';
+  artifactMessageId?: string;
+  artifactContent?: string;
 }
 
 export class HistoryStore {
   private static readonly HISTORY_FILE = 'chat_sessions.json';
   private static readonly LEGACY_FILE = 'chat_history.json';
+  private static readonly REVIEWER_FILE = 'reviewer_sessions.json';
   private sessions: ChatSession[] = [];
   private activeSessionId: string | null = null;
   private hasLoaded = false;
 
+  private reviewerSessions: ChatSession[] = [];
+  private activeReviewerSessionId: string | null = null;
+  private hasLoadedReviewer = false;
+
   constructor(private readonly storageUri?: vscode.Uri) {}
 
   private _createNewSession(firstMessageSnippet?: string): ChatSession {
-    const id = `session-${Date.now()}`;
+    const id = `session-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     let title = 'New Chat';
     if (firstMessageSnippet) {
       title = firstMessageSnippet.slice(0, 30).trim() || 'New Chat';
@@ -178,6 +188,17 @@ export class HistoryStore {
     return false;
   }
 
+  public async getMessageById(messageId: string): Promise<StoredChatMessage | undefined> {
+    if (!this.hasLoaded) {
+      await this.loadSessions();
+    }
+    for (const session of this.sessions) {
+      const found = session.messages.find((m) => m.id === messageId);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
   private _findMessageIndex(messages: StoredChatMessage[], messageId: string): number {
     let idx = messages.findIndex((m) => m.id === messageId);
     if (idx !== -1) return idx;
@@ -311,6 +332,199 @@ export class HistoryStore {
       await vscode.workspace.fs.writeFile(fileUri, encoded);
     } catch (err) {
       console.error('Failed to save chat sessions to disk:', err);
+    }
+  }
+
+  // --- Reviewer Session Management (PRD Phase 11 Consolidation) ---
+
+  private _createNewReviewerSession(
+    titlePrefix = 'Review Session',
+    context?: {
+      artifactType?: 'plan' | 'walkthrough' | 'standalone';
+      artifactMessageId?: string;
+      artifactContent?: string;
+    }
+  ): ChatSession {
+    const id = `reviewer-session-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const session: ChatSession = {
+      id,
+      title: titlePrefix,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [],
+      artifactType: context?.artifactType,
+      artifactMessageId: context?.artifactMessageId,
+      artifactContent: context?.artifactContent,
+    };
+    this.reviewerSessions.unshift(session);
+    this.activeReviewerSessionId = id;
+    return session;
+  }
+
+  public async loadReviewerSessions(): Promise<{ activeSession: ChatSession; allSessions: ChatSessionMeta[] }> {
+    if (!this.hasLoadedReviewer) {
+      await this._loadReviewerFromDisk();
+      this.hasLoadedReviewer = true;
+    }
+
+    if (this.reviewerSessions.length === 0) {
+      this._createNewReviewerSession();
+    }
+
+    let active = this.reviewerSessions.find((s) => s.id === this.activeReviewerSessionId);
+    if (!active) {
+      active = this.reviewerSessions[0];
+      this.activeReviewerSessionId = active.id;
+    }
+
+    const allSessions = this.reviewerSessions.map((s) => ({
+      id: s.id,
+      title: s.title,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+      messageCount: s.messages.length,
+    }));
+
+    return { activeSession: active, allSessions };
+  }
+
+  public async switchReviewerSession(sessionId: string): Promise<StoredChatMessage[]> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+    const found = this.reviewerSessions.find((s) => s.id === sessionId);
+    if (found) {
+      this.activeReviewerSessionId = found.id;
+      return found.messages;
+    }
+    const { activeSession } = await this.loadReviewerSessions();
+    return activeSession.messages;
+  }
+
+  public async startNewReviewerSession(
+    titlePrefix = 'Review Session',
+    context?: {
+      artifactType?: 'plan' | 'walkthrough' | 'standalone';
+      artifactMessageId?: string;
+      artifactContent?: string;
+    }
+  ): Promise<ChatSession> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+    const current = this.reviewerSessions.find((s) => s.id === this.activeReviewerSessionId);
+    if (current && current.messages.length === 0) {
+      current.title = titlePrefix;
+      if (context) {
+        current.artifactType = context.artifactType;
+        current.artifactMessageId = context.artifactMessageId;
+        current.artifactContent = context.artifactContent;
+      }
+      await this._saveReviewerToDisk();
+      return current;
+    }
+
+    const newSession = this._createNewReviewerSession(titlePrefix, context);
+    await this._saveReviewerToDisk();
+    return newSession;
+  }
+
+  public async saveReviewerSessions(): Promise<void> {
+    await this._saveReviewerToDisk();
+  }
+
+  public async appendReviewerMessage(message: StoredChatMessage): Promise<void> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+
+    let active = this.reviewerSessions.find((s) => s.id === this.activeReviewerSessionId);
+    if (!active) {
+      active = this._createNewReviewerSession();
+    }
+
+    // Auto-update title from first user message if still default generic title
+    if (active.title === 'Review Session' && message.role === 'user' && message.content.trim()) {
+      active.title = message.content.trim().slice(0, 32).replace(/[\r\n]+/g, ' ');
+    }
+
+    active.messages.push(message);
+    active.updatedAt = Date.now();
+    await this._saveReviewerToDisk();
+  }
+
+  public async renameReviewerSession(sessionId: string, newTitle: string): Promise<boolean> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+    const session = this.reviewerSessions.find((s) => s.id === sessionId);
+    if (session) {
+      session.title = newTitle.trim().replace(/[\r\n]+/g, ' ') || 'Untitled Review';
+      session.updatedAt = Date.now();
+      await this._saveReviewerToDisk();
+      return true;
+    }
+    return false;
+  }
+
+  public async getReviewerSessionsList(): Promise<ChatSessionMeta[]> {
+    const { allSessions } = await this.loadReviewerSessions();
+    return allSessions;
+  }
+
+  public async deleteReviewerSession(sessionId: string): Promise<boolean> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+    const initialLen = this.reviewerSessions.length;
+    this.reviewerSessions = this.reviewerSessions.filter((s) => s.id !== sessionId);
+    if (this.reviewerSessions.length === initialLen) {
+      return false;
+    }
+    if (this.activeReviewerSessionId === sessionId) {
+      this.activeReviewerSessionId = this.reviewerSessions.length > 0 ? this.reviewerSessions[0].id : null;
+    }
+    if (this.reviewerSessions.length === 0) {
+      this._createNewReviewerSession();
+    }
+    await this._saveReviewerToDisk();
+    return true;
+  }
+
+  public async clearReviewerHistory(): Promise<void> {
+    this.reviewerSessions = [];
+    this.activeReviewerSessionId = null;
+    this._createNewReviewerSession();
+    await this._saveReviewerToDisk();
+  }
+
+  private async _loadReviewerFromDisk(): Promise<void> {
+    if (!this.storageUri) return;
+
+    const reviewerUri = vscode.Uri.joinPath(this.storageUri, HistoryStore.REVIEWER_FILE);
+    try {
+      const data = await vscode.workspace.fs.readFile(reviewerUri);
+      const json = JSON.parse(new TextDecoder().decode(data));
+      if (Array.isArray(json)) {
+        this.reviewerSessions = json;
+        if (this.reviewerSessions.length > 0) {
+          this.activeReviewerSessionId = this.reviewerSessions[0].id;
+        }
+      }
+    } catch {
+      this.reviewerSessions = [];
+    }
+  }
+
+  private async _saveReviewerToDisk(): Promise<void> {
+    if (!this.storageUri) return;
+    try {
+      await vscode.workspace.fs.createDirectory(this.storageUri);
+      const fileUri = vscode.Uri.joinPath(this.storageUri, HistoryStore.REVIEWER_FILE);
+      const encoded = new TextEncoder().encode(JSON.stringify(this.reviewerSessions, null, 2));
+      await vscode.workspace.fs.writeFile(fileUri, encoded);
+    } catch (err) {
+      console.error('Failed to save reviewer sessions to disk:', err);
     }
   }
 }

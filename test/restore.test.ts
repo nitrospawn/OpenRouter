@@ -413,3 +413,45 @@ test('UNDO_TURN end-to-end: historyStore is strictly NOT truncated if drift is c
   history = await historyStore.loadHistory();
   assert.strictEqual(history.length, 0, 'historyStore must now be completely empty as the undone message is removed');
 });
+
+test('ScopedRestore: deletes newly created files that did not exist in the checkpoint commit while preserving other files', async () => {
+  const os = await import('os');
+  const fs = await import('fs');
+  const path = await import('path');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scoped-restore-newfile-test-'));
+  try {
+    const aiCreatedFile = 'ai_created.md';
+    const userFile = 'user_created.md';
+
+    const aiCreatedFullPath = path.join(tempDir, aiCreatedFile);
+    const userFullPath = path.join(tempDir, userFile);
+
+    fs.writeFileSync(aiCreatedFullPath, 'AI generated content');
+    fs.writeFileSync(userFullPath, 'User original content');
+
+    const mockRepo = new MockShadowRepo();
+    mockRepo.workTree = tempDir;
+
+    // Simulate real git checkout: fails when trying to checkout a file that never existed in commit
+    mockRepo.runGit = async (args: string[]) => {
+      mockRepo.executedCommands.push(args);
+      if (args[0] === 'checkout') {
+        const file = args[args.length - 1];
+        if (file === aiCreatedFile || args.includes(aiCreatedFile)) {
+          throw new Error(`error: pathspec '${aiCreatedFile}' did not match any file(s) known to git`);
+        }
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const restore = new ScopedRestore(mockRepo as any);
+    const result = await restore.restore('cp-initial', [aiCreatedFile], true);
+
+    assert.strictEqual(result.success, true, 'Restore must succeed when deleting newly created file');
+    assert.strictEqual(fs.existsSync(aiCreatedFullPath), false, 'Newly created file must be deleted from disk on undo');
+    assert.strictEqual(fs.existsSync(userFullPath), true, 'User file must remain completely untouched on disk');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

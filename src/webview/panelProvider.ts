@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { SecretStore } from '../auth/secretStore';
 import { OpenRouterClient, OpenRouterModel, ChatMessageContentPart, ProviderRoutingOptions } from '../api/openrouterClient';
 import { detectModelCapabilities } from '../api/modelCapabilities';
@@ -7,6 +8,7 @@ import { Configuration } from '../settings/configuration';
 import { PermissionManager } from '../permissions/permissionManager';
 import { DiffPreviewManager } from '../editor/diffPreview';
 import { ContextReader } from '../editor/contextReader';
+import { TerminalOutputTracker } from '../terminal/terminalOutputTracker';
 import { CommandRunner } from '../terminal/commandRunner';
 import { ShadowRepo } from '../shadowGit/shadowRepo';
 import { CheckpointManager } from '../shadowGit/checkpoint';
@@ -19,6 +21,9 @@ import { UsageStore } from '../usage/usageStore';
 import { PricingCalculator } from '../api/pricing';
 import { ProjectResolver } from '../usage/projectResolver';
 import { buildSystemPrompt } from '../prompt/systemPrompt';
+import { extractArtifacts } from '../prompt/responseParser';
+import { ArtifactDocumentManager } from '../editor/artifactDocumentManager';
+import { ReviewerCommentController } from '../comments/reviewerCommentController';
 import { EXTENSION_VERSION } from '../version';
 
 export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
@@ -30,6 +35,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
   private _checkpointManager?: CheckpointManager;
   private _scopedRestore?: ScopedRestore;
   private _activeAbortController?: AbortController;
+  private _reviewerCommentController?: ReviewerCommentController;
+  private _reviewerHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  private _activeReviewerAbortController?: AbortController;
+  private _activeReviewerModelOverride?: string;
+  private _activeReviewerReasoningEffortOverride?: string;
+  private _lastReviewerUserPrompt?: string;
+  private _activeReviewerArtifactContent?: string;
+  private _activeReviewerArtifactType?: 'plan' | 'walkthrough';
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -39,6 +52,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     private readonly _usageStore: UsageStore,
     private readonly _storageUri?: vscode.Uri
   ) {
+    this._reviewerCommentController = new ReviewerCommentController();
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (_storageUri && workspaceFolders && workspaceFolders.length > 0) {
       this._shadowRepo = new ShadowRepo(_storageUri, workspaceFolders[0].uri);
@@ -68,6 +82,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           await this._historyStore.startNewSessionOnLaunch();
           await this._loadChatHistory();
           await this._sendSessionsData();
+          await this.sendSettingsData();
           break;
 
         case 'SUBMIT_API_KEY': {
@@ -122,18 +137,150 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         case 'PREVIEW_DIFF': {
           const workspaceFolders = vscode.workspace.workspaceFolders;
           if (workspaceFolders && workspaceFolders.length > 0) {
-            const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, data.filePath);
+            const fileUri = path.isAbsolute(data.filePath)
+              ? vscode.Uri.file(data.filePath)
+              : vscode.Uri.joinPath(workspaceFolders[0].uri, data.filePath);
             await DiffPreviewManager.openDiffPreview(fileUri, data.newContent);
           }
+          break;
+        }
+
+        case 'VIEW_ARTIFACT': {
+          await ArtifactDocumentManager.openArtifactDocument(
+            this._historyStore,
+            data.artifactType,
+            data.messageId,
+            data.content,
+            this._storageUri
+          );
+          break;
+        }
+
+        case 'START_REVIEW': {
+          await this._handleStartReview(data.artifactType, data.messageId, data.content);
+          break;
+        }
+
+        case 'OPEN_DIRECT_REVIEWER': {
+          await this._handleOpenDirectReviewer();
+          break;
+        }
+
+        case 'SEND_REVIEWER_MESSAGE': {
+          await this._handleSendReviewerMessage(
+            data.content,
+            data.modelId,
+            data.reasoningEffort,
+            data.artifactContent,
+            data.artifactType
+          );
+          break;
+        }
+
+        case 'RETRY_REVIEWER_MESSAGE': {
+          await this._handleRetryReviewerMessage();
+          break;
+        }
+
+        case 'GET_REVIEWER_SESSIONS': {
+          await this._sendReviewerSessionsData();
+          break;
+        }
+
+        case 'NEW_REVIEWER_SESSION': {
+          await this._historyStore.startNewReviewerSession('Standalone Review');
+          await this._handleOpenDirectReviewer();
+          break;
+        }
+
+        case 'SWITCH_REVIEWER_SESSION': {
+          const msgs = await this._historyStore.switchReviewerSession(data.sessionId);
+          this._reviewerHistory = msgs.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+          await this._sendReviewerSessionsData();
+          const { activeSession } = await this._historyStore.loadReviewerSessions();
+          if (activeSession.artifactContent && (activeSession.artifactType === 'plan' || activeSession.artifactType === 'walkthrough')) {
+            this._activeReviewerArtifactContent = activeSession.artifactContent;
+            this._activeReviewerArtifactType = activeSession.artifactType;
+          } else {
+            this._activeReviewerArtifactContent = undefined;
+            this._activeReviewerArtifactType = undefined;
+          }
+          const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
+          const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
+          this._postMessage({
+            type: 'REVIEWER_VIEW_DATA',
+            artifactType: activeSession.artifactType || 'standalone',
+            artifactContent: activeSession.artifactContent || '',
+            reviewerModel,
+            reviewerReasoningEffort,
+            history: [...this._reviewerHistory],
+            activeSessionId: activeSession.id,
+          });
+          break;
+        }
+
+        case 'RENAME_REVIEWER_SESSION': {
+          await this._historyStore.renameReviewerSession(data.sessionId, data.newTitle);
+          await this._sendReviewerSessionsData();
+          break;
+        }
+
+        case 'DELETE_REVIEWER_SESSION': {
+          await this._historyStore.deleteReviewerSession(data.sessionId);
+          await this._sendReviewerSessionsData();
+          break;
+        }
+
+        case 'RESET_REVIEWER_CONTEXT': {
+          // Manual "Start fresh from here": Clear current reviewer session turns
+          this._reviewerHistory = [];
+          const { activeSession } = await this._historyStore.loadReviewerSessions();
+          await this._historyStore.startNewReviewerSession('Review Session (Fresh)');
+          await this._handleOpenDirectReviewer();
+          break;
+        }
+
+        case 'STOP_REVIEWER_STREAM': {
+          if (this._activeReviewerAbortController) {
+            this._activeReviewerAbortController.abort();
+            this._activeReviewerAbortController = undefined;
+          }
+          this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
           break;
         }
 
         case 'ACCEPT_EDIT': {
           const workspaceFolders = vscode.workspace.workspaceFolders;
           if (workspaceFolders && workspaceFolders.length > 0) {
-            const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, data.filePath);
+            const fileUri = path.isAbsolute(data.filePath)
+              ? vscode.Uri.file(data.filePath)
+              : vscode.Uri.joinPath(workspaceFolders[0].uri, data.filePath);
 
-            // Step 1: Create a shadow-git checkpoint of the affected file before applying the edit
+            let fileExists = true;
+            try {
+              await vscode.workspace.fs.stat(fileUri);
+            } catch {
+              fileExists = false;
+            }
+
+            const relativePath = vscode.workspace.asRelativePath(fileUri);
+
+            // Step 1: Gate with consolidated permission check BEFORE creating checkpoints or touching disk
+            const permStatus = await this._permissionManager.checkApplyEditPermission(
+              relativePath,
+              !fileExists
+            );
+
+            if (permStatus === 'denied') {
+              this._postMessage({
+                type: 'EDIT_APPLIED',
+                editId: data.editId,
+                success: false,
+              });
+              break;
+            }
+
+            // Step 2: Create a shadow-git checkpoint of the affected file before applying the edit
             let checkpointId: string | undefined;
             if (this._checkpointManager) {
               const res = await this._checkpointManager.createCheckpoint(
@@ -145,14 +292,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               }
             }
 
-            // Step 2: Apply the workspace edit
+            // Step 3: Apply the workspace edit (skipPermissionCheck: true because already checked and approved above)
             const success = await DiffPreviewManager.applyEdit(
               fileUri,
               data.newContent,
-              this._permissionManager
+              this._permissionManager,
+              true
             );
 
-            // Step 3: Tag the most-recent user message with this checkpoint so the undo
+            // Step 4: Tag the most-recent user message with this checkpoint so the undo
             // icon in the user message header is always-visible and scoped to this turn.
             if (checkpointId && success) {
               const history = await this._historyStore.loadHistory();
@@ -177,9 +325,89 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         case 'ACCEPT_ALL_EDITS': {
           const workspaceFolders = vscode.workspace.workspaceFolders;
           if (workspaceFolders && workspaceFolders.length > 0 && data.edits.length > 0) {
+            // Step 1: Check permissions upfront before checkpoint or file system operations
+            const editPerm = this._permissionManager.getPermission('applyEdit');
+            if (editPerm === 'deny') {
+              vscode.window.showErrorMessage('Applying edits is currently disabled in OpenRouter permissions.');
+              for (const edit of data.edits) {
+                this._postMessage({
+                  type: 'EDIT_APPLIED',
+                  editId: edit.editId,
+                  success: false,
+                });
+              }
+              break;
+            }
+
+            const resolvedEdits = await Promise.all(
+              data.edits.map(async (edit) => {
+                const fileUri = path.isAbsolute(edit.filePath)
+                  ? vscode.Uri.file(edit.filePath)
+                  : vscode.Uri.joinPath(workspaceFolders[0].uri, edit.filePath);
+                let fileExists = true;
+                try {
+                  await vscode.workspace.fs.stat(fileUri);
+                } catch {
+                  fileExists = false;
+                }
+                return {
+                  edit,
+                  fileUri,
+                  fileExists,
+                  relativePath: vscode.workspace.asRelativePath(fileUri),
+                };
+              })
+            );
+
+            // If any edit is a new file, check createDeleteFiles permission
+            const anyNewFile = resolvedEdits.some((e) => !e.fileExists);
+            if (anyNewFile) {
+              const createPerm = this._permissionManager.getPermission('createDeleteFiles');
+              if (createPerm === 'deny') {
+                vscode.window.showErrorMessage('Creating files is currently disabled in OpenRouter permissions.');
+                for (const edit of data.edits) {
+                  this._postMessage({
+                    type: 'EDIT_APPLIED',
+                    editId: edit.editId,
+                    success: false,
+                  });
+                }
+                break;
+              }
+            }
+
+            // If applyEdit is 'ask', prompt user once for the bulk operation
+            if (editPerm === 'ask') {
+              const fileCount = data.edits.length;
+              const choice = await vscode.window.showWarningMessage(
+                `OpenRouter wants to apply edits to ${fileCount} file${fileCount > 1 ? 's' : ''}.`,
+                { modal: true },
+                'Apply All',
+                'Apply All for this Session',
+                'Deny'
+              );
+              if (choice === 'Deny' || !choice) {
+                vscode.window.showInformationMessage('Bulk edit cancelled.');
+                for (const edit of data.edits) {
+                  this._postMessage({
+                    type: 'EDIT_APPLIED',
+                    editId: edit.editId,
+                    success: false,
+                  });
+                }
+                break;
+              }
+              if (choice === 'Apply All for this Session') {
+                await this._permissionManager.setPermission('applyEdit', 'allow_session');
+                if (anyNewFile) {
+                  await this._permissionManager.setPermission('createDeleteFiles', 'allow_session');
+                }
+              }
+            }
+
             const affectedFiles = data.edits.map((e) => e.filePath);
 
-            // Step 1: Create a single unified shadow-git checkpoint for all affected files
+            // Step 2: Create a single unified shadow-git checkpoint for all affected files
             let checkpointId: string | undefined;
             if (this._checkpointManager) {
               const res = await this._checkpointManager.createCheckpoint(
@@ -191,24 +419,24 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               }
             }
 
-            // Step 2: Apply each edit sequentially
-            for (const edit of data.edits) {
-              const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, edit.filePath);
+            // Step 3: Apply each edit sequentially with skipPermissionCheck = true
+            for (const item of resolvedEdits) {
               const success = await DiffPreviewManager.applyEdit(
-                fileUri,
-                edit.newContent,
-                this._permissionManager
+                item.fileUri,
+                item.edit.newContent,
+                this._permissionManager,
+                true
               );
 
               this._postMessage({
                 type: 'EDIT_APPLIED',
-                editId: edit.editId,
+                editId: item.edit.editId,
                 success,
                 checkpointId, // All edits share this common checkpointId for unified per-turn undo
               });
             }
 
-            // Step 3: Tag the most-recent user message with the unified checkpoint
+            // Step 4: Tag the most-recent user message with the unified checkpoint
             if (checkpointId) {
               const history = await this._historyStore.loadHistory();
               const lastUserMsg = [...history].reverse().find((m) => m.role === 'user');
@@ -469,6 +697,24 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           await this._sendSettingsData();
           break;
 
+        case 'SET_REVIEWER_SETTING':
+          if (data.key === 'enabled') {
+            await Configuration.setReviewerEnabled(data.value);
+          } else if (data.key === 'model') {
+            await Configuration.setReviewerModel(data.value);
+          } else if (data.key === 'reasoningEffort') {
+            await Configuration.setReviewerReasoningEffort(data.value);
+          } else if (data.key === 'systemPrompt') {
+            await Configuration.setReviewerSystemPrompt(data.value);
+          }
+          await this._sendSettingsData();
+          break;
+
+        case 'RESET_REVIEWER_PROMPT':
+          await Configuration.resetReviewerSystemPrompt();
+          await this._sendSettingsData();
+          break;
+
         case 'PROMPT_UPDATE_KEY': {
           const updated = await this._secretStore.promptForApiKey();
           if (updated) {
@@ -527,7 +773,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async _sendSettingsData() {
+  private async _sendSettingsData(): Promise<void> {
+    await this.sendSettingsData();
+  }
+
+  public async sendSettingsData(): Promise<void> {
     const apiKey = await this._secretStore.getApiKey();
     let apiKeyMasked = 'Not set';
     if (apiKey) {
@@ -546,16 +796,24 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const redactionMode = Configuration.getRedactionMode();
     const dataCollectionPolicy = Configuration.getDataCollectionPolicy();
     const warnOnDataTraining = Configuration.getWarnOnDataTraining();
+    const reviewerEnabled = Configuration.getReviewerEnabled();
+    const reviewerModel = Configuration.getReviewerModel();
+    const reviewerReasoningEffort = Configuration.getReviewerReasoningEffort();
+    const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
 
     const formatted = this._cachedModels.map((m) => {
       // Model supports ZDR if top_provider does not allow data collection or explicit support flag
       const supportsZdr = m.top_provider?.allow_data_collection === false || m.supports_zdr === true;
+      const caps = detectModelCapabilities(m);
       return {
         id: m.id,
         name: m.name,
         context_length: m.context_length,
         pricing: m.pricing,
         supports_zdr: supportsZdr,
+        supports_reasoning_effort: caps.supportsReasoningEffort,
+        supported_reasoning_efforts: caps.supportedReasoningEfforts,
+        supports_vision: caps.supportsVision,
       };
     });
 
@@ -571,6 +829,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       dataCollectionPolicy,
       warnOnDataTraining,
       models: formatted,
+      reviewerEnabled,
+      reviewerModel,
+      reviewerReasoningEffort,
+      reviewerSystemPrompt,
     });
   }
 
@@ -603,6 +865,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         timestamp: h.timestamp,
         checkpointId: h.checkpointId,
         affectedFiles: h.affectedFiles,
+        planDocument: h.planDocument,
+        walkthroughDocument: h.walkthroughDocument,
       })),
     });
   }
@@ -649,12 +913,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         if (!supportsZdr && enforceZdr) {
           hiddenZdrCount++;
         }
+        const caps = detectModelCapabilities(m);
         return {
           id: m.id,
           name: m.name,
           context_length: m.context_length,
           pricing: m.pricing,
           supports_zdr: supportsZdr,
+          supports_reasoning_effort: caps.supportsReasoningEffort,
+          supported_reasoning_efforts: caps.supportedReasoningEfforts,
+          supports_vision: caps.supportsVision,
         };
       });
 
@@ -786,8 +1054,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       timestamp: Date.now(),
     });
 
+    const assistantMessageId = `${Date.now()}-assistant`;
     this._postMessage({ type: 'SET_BUSY', busy: true });
-    this._postMessage({ type: 'MESSAGE_STREAM_START', messageId: `${Date.now()}-assistant` });
+    this._postMessage({ type: 'MESSAGE_STREAM_START', messageId: assistantMessageId });
 
     // Build context-aware prompt messages
     const history = await this._historyStore.loadHistory();
@@ -807,6 +1076,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    const terminalOutputs = TerminalOutputTracker.getRecentOutputsFormatted();
+
     const systemPrompt = buildSystemPrompt({
       activeFile: editorCtx.hasContext && editorCtx.relativePath ? {
         relativePath: editorCtx.relativePath,
@@ -816,6 +1087,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       } : undefined,
       workspaceFiles,
       referencedFile: referencedFileResult || undefined,
+      terminalOutputs: terminalOutputs || undefined,
+      permissions: {
+        applyEdit: this._permissionManager.getPermission('applyEdit'),
+        runTerminalCommand: this._permissionManager.getPermission('runTerminalCommand'),
+      },
     });
 
     // Phase 7: Secret Scanning & Redaction Pipeline
@@ -889,6 +1165,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           path: referencedFileResult.relativePath,
           contentSnippet: referencedFileResult.content.slice(0, 1000),
         } : undefined,
+        terminalOutputs: terminalOutputs ? terminalOutputs.slice(0, 500) : undefined,
         imageCount: images?.length || 0,
         redactedCount: totalDetectedSecrets,
         hasZdrOnly: dataPolicy === 'deny',
@@ -914,16 +1191,22 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         accumulatedContent += chunk;
         this._postMessage({
           type: 'MESSAGE_STREAM_CHUNK',
-          messageId: `${Date.now()}-assistant`,
+          messageId: assistantMessageId,
           chunk,
         });
       },
       async (usage) => {
         this._activeAbortController = undefined;
+
+        // Extract two-tier artifacts (plan / walkthrough) from the raw model response
+        const { planDocument, walkthroughDocument, chatSummary } = extractArtifacts(accumulatedContent);
+
         await this._historyStore.appendMessage({
-          id: `${Date.now()}-assistant`,
+          id: assistantMessageId,
           role: 'assistant',
-          content: accumulatedContent,
+          content: chatSummary,
+          planDocument,
+          walkthroughDocument,
           model: selectedModel,
           timestamp: Date.now(),
         });
@@ -958,10 +1241,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
         this._postMessage({
           type: 'MESSAGE_STREAM_DONE',
-          messageId: `${Date.now()}-assistant`,
+          messageId: assistantMessageId,
           usage,
+          chatSummary,
+          planDocument,
+          walkthroughDocument,
         });
         this._postMessage({ type: 'SET_BUSY', busy: false });
+
+        // Auto-execution under Allow = Zero Manual Interaction
+        await this._handleAutoExecution(accumulatedContent);
       },
       (err) => {
         this._activeAbortController = undefined;
@@ -994,6 +1283,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const records = await this._usageStore.loadRecords();
     const projects = await this._usageStore.getDistinctProjects();
     const models = await this._usageStore.getDistinctModels();
+    const currentProject = ProjectResolver.getActiveProjectName();
 
     this._postMessage({
       type: 'USAGE_REPORT_DATA',
@@ -1001,7 +1291,606 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       records,
       projects,
       models,
+      currentProject,
     });
+  }
+
+  private async _handleAutoExecution(content: string): Promise<void> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return;
+    }
+
+    const fileActionRegex = /```(?:create_file|edit_file|file):([^\r\n]+)\r?\n([\s\S]*?)```/gi;
+    const applyEditPerm = this._permissionManager.getPermission('applyEdit');
+
+    if (applyEditPerm === 'deny') {
+      const matches: { filePath: string; fileName: string; editId: string }[] = [];
+      let fileMatch;
+      let editCount = 0;
+      while ((fileMatch = fileActionRegex.exec(content)) !== null) {
+        editCount++;
+        let filePath = fileMatch[1].trim();
+        const lastColon = filePath.lastIndexOf(':');
+        if (lastColon > 1) {
+          const afterColon = filePath.substring(lastColon + 1).trim();
+          if (!afterColon.includes('/') && !afterColon.includes('\\')) {
+            filePath = filePath.substring(0, lastColon).trim();
+          }
+        }
+        matches.push({
+          filePath,
+          fileName: path.basename(filePath),
+          editId: `${Date.now()}-${editCount}`,
+        });
+      }
+
+      for (const m of matches) {
+        const text = matches.length === 1
+          ? `⚠️ This edit was not applied — Code edits permission is currently set to Denied.`
+          : `⚠️ This edit to \`${m.fileName}\` was not applied — Code edits permission is currently set to Denied.`;
+
+        const deniedMsg = {
+          id: `${Date.now()}-denied-${m.editId}`,
+          role: 'assistant' as const,
+          content: text,
+          timestamp: Date.now(),
+        };
+        if (this._historyStore?.appendMessage) {
+          await this._historyStore.appendMessage(deniedMsg);
+        }
+        this._postMessage({
+          type: 'MESSAGE_RECEIVED',
+          message: deniedMsg,
+        });
+        this._postMessage({
+          type: 'EDIT_APPLIED',
+          editId: m.editId,
+          success: false,
+        });
+      }
+    } else if (applyEditPerm === 'allow') {
+      let fileMatch;
+      let editCount = 0;
+      while ((fileMatch = fileActionRegex.exec(content)) !== null) {
+        editCount++;
+        let filePath = fileMatch[1].trim();
+        const lastColon = filePath.lastIndexOf(':');
+        if (lastColon > 1) {
+          const afterColon = filePath.substring(lastColon + 1).trim();
+          if (!afterColon.includes('/') && !afterColon.includes('\\')) {
+            filePath = filePath.substring(0, lastColon).trim();
+          }
+        }
+        const newContent = fileMatch[2];
+        const editId = `${Date.now()}-${editCount}`;
+
+        const fileUri = path.isAbsolute(filePath)
+          ? vscode.Uri.file(filePath)
+          : vscode.Uri.joinPath(workspaceFolders[0].uri, filePath);
+
+        let fileExists = true;
+        try {
+          await vscode.workspace.fs.stat(fileUri);
+        } catch {
+          fileExists = false;
+        }
+
+        const relativePath = vscode.workspace.asRelativePath(fileUri);
+
+        try {
+          // Check permission (for new file, verifies createDeleteFiles)
+          const permStatus = await this._permissionManager.checkApplyEditPermission(
+            relativePath,
+            !fileExists
+          );
+
+          if (permStatus === 'denied') {
+            const deniedMsg = {
+              id: `${Date.now()}-error-${editCount}`,
+              role: 'assistant' as const,
+              content: `⚠️ Could not auto-apply edit to \`${relativePath}\`: permission denied.`,
+              timestamp: Date.now(),
+            };
+            if (this._historyStore?.appendMessage) {
+              await this._historyStore.appendMessage(deniedMsg);
+            }
+            this._postMessage({
+              type: 'MESSAGE_RECEIVED',
+              message: deniedMsg,
+            });
+            this._postMessage({
+              type: 'EDIT_APPLIED',
+              editId,
+              success: false,
+            });
+            continue;
+          }
+
+          // Pre-resolve proposed content to catch malformed SEARCH/REPLACE blocks early with exact error message
+          let originalContent = '';
+          if (fileExists) {
+            try {
+              const data = await vscode.workspace.fs.readFile(fileUri);
+              originalContent = new TextDecoder('utf-8').decode(data);
+            } catch {
+              // ignore
+            }
+          }
+          DiffPreviewManager.resolveProposedContent(originalContent, newContent);
+
+          // Shadow-git checkpointing applies identically
+          let checkpointId: string | undefined;
+          if (this._checkpointManager) {
+            const res = await this._checkpointManager.createCheckpoint(
+              [filePath],
+              `Auto-apply edit to ${filePath}`
+            );
+            if (res) {
+              checkpointId = res;
+            }
+          }
+
+          // Apply edit (skipPermissionCheck = true because checked above)
+          const success = await DiffPreviewManager.applyEdit(
+            fileUri,
+            newContent,
+            this._permissionManager,
+            true
+          );
+
+          if (success) {
+            // Tag turn checkpoint
+            if (checkpointId) {
+              const history = await this._historyStore.loadHistory();
+              const lastUserMsg = [...history].reverse().find((m) => m.role === 'user');
+              if (lastUserMsg) {
+                const existing = lastUserMsg.affectedFiles ?? [];
+                const merged = Array.from(new Set([...existing, filePath]));
+                await this._historyStore.tagTurnCheckpoint(lastUserMsg.id, checkpointId, merged);
+              }
+            }
+
+            const fileName = path.basename(filePath);
+            const appliedMsg = {
+              id: `${Date.now()}-applied-${editCount}`,
+              role: 'assistant' as const,
+              content: `✓ **Applied:** updated \`${fileName}\``,
+              timestamp: Date.now(),
+            };
+            if (this._historyStore?.appendMessage) {
+              await this._historyStore.appendMessage(appliedMsg);
+            }
+            this._postMessage({
+              type: 'MESSAGE_RECEIVED',
+              message: appliedMsg,
+            });
+
+            this._postMessage({
+              type: 'EDIT_APPLIED',
+              editId,
+              success: true,
+              checkpointId,
+            });
+          } else {
+            const failMsg = {
+              id: `${Date.now()}-fail-${editCount}`,
+              role: 'assistant' as const,
+              content: `⚠️ Failed to auto-apply edit to \`${relativePath}\`.`,
+              timestamp: Date.now(),
+            };
+            if (this._historyStore?.appendMessage) {
+              await this._historyStore.appendMessage(failMsg);
+            }
+            this._postMessage({
+              type: 'MESSAGE_RECEIVED',
+              message: failMsg,
+            });
+            this._postMessage({
+              type: 'EDIT_APPLIED',
+              editId,
+              success: false,
+            });
+          }
+        } catch (err: any) {
+          // Malformed search/replace or write error: fail safely with clear chat error message
+          const errMsg = {
+            id: `${Date.now()}-fail-${editCount}`,
+            role: 'assistant' as const,
+            content: `⚠️ Failed to auto-apply edit to \`${relativePath}\`: ${err.message}`,
+            timestamp: Date.now(),
+          };
+          if (this._historyStore?.appendMessage) {
+            await this._historyStore.appendMessage(errMsg);
+          }
+          this._postMessage({
+            type: 'MESSAGE_RECEIVED',
+            message: errMsg,
+          });
+          this._postMessage({
+            type: 'EDIT_APPLIED',
+            editId,
+            success: false,
+          });
+        }
+      }
+    }
+
+    // 2. Auto-run proposed terminal commands if runTerminalCommand === 'allow'
+    const runTerminalPerm = this._permissionManager.getPermission('runTerminalCommand');
+    if (runTerminalPerm === 'allow') {
+      const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
+      let match;
+      let cmdCount = 0;
+      while ((match = bashRegex.exec(content)) !== null) {
+        const command = match[1].trim();
+        if (command) {
+          cmdCount++;
+          const result = await CommandRunner.executeCommand(command, this._permissionManager);
+          const outcome = result.executed
+            ? `(completed)`
+            : result.cancelled
+            ? `(cancelled)`
+            : `(failed)`;
+          const termMsg = {
+            id: `${Date.now()}-term-${cmdCount}`,
+            role: 'assistant' as const,
+            content: `✓ **Ran in terminal:** \`${command}\` ${outcome}`,
+            timestamp: Date.now(),
+          };
+          if (this._historyStore?.appendMessage) {
+            await this._historyStore.appendMessage(termMsg);
+          }
+          this._postMessage({
+            type: 'MESSAGE_RECEIVED',
+            message: termMsg,
+          });
+        }
+      }
+    } else if (runTerminalPerm === 'deny') {
+      const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
+      let match;
+      let cmdCount = 0;
+      while ((match = bashRegex.exec(content)) !== null) {
+        const command = match[1].trim();
+        if (command) {
+          cmdCount++;
+          const deniedMsg = {
+            id: `${Date.now()}-term-denied-${cmdCount}`,
+            role: 'assistant' as const,
+            content: `⚠️ Terminal command \`${command.slice(0, 30)}\` was not executed — Terminal commands permission is currently set to Denied.`,
+            timestamp: Date.now(),
+          };
+          if (this._historyStore?.appendMessage) {
+            await this._historyStore.appendMessage(deniedMsg);
+          }
+          this._postMessage({
+            type: 'MESSAGE_RECEIVED',
+            message: deniedMsg,
+          });
+        }
+      }
+    }
+  }
+
+  private async _handleOpenDirectReviewer(): Promise<void> {
+    if (!Configuration.getReviewerEnabled()) {
+      return;
+    }
+
+    const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
+    const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
+
+    const { activeSession } = await this._historyStore.loadReviewerSessions();
+    if (activeSession.artifactContent && (activeSession.artifactType === 'plan' || activeSession.artifactType === 'walkthrough')) {
+      this._activeReviewerArtifactContent = activeSession.artifactContent;
+      this._activeReviewerArtifactType = activeSession.artifactType;
+    } else {
+      this._activeReviewerArtifactContent = undefined;
+      this._activeReviewerArtifactType = undefined;
+    }
+
+    this._reviewerHistory = activeSession.messages.map((m) => ({
+      role: m.role as 'user' | 'assistant',
+      content: m.content,
+    }));
+
+    this._postMessage({
+      type: 'REVIEWER_VIEW_DATA',
+      artifactType: activeSession.artifactType || 'standalone',
+      artifactContent: activeSession.artifactContent || '',
+      reviewerModel,
+      reviewerReasoningEffort,
+      history: [...this._reviewerHistory],
+      activeSessionId: activeSession.id,
+    });
+    await this._sendReviewerSessionsData();
+  }
+
+  private async _sendReviewerSessionsData(): Promise<void> {
+    const { activeSession, allSessions } = await this._historyStore.loadReviewerSessions();
+    this._postMessage({
+      type: 'REVIEWER_SESSIONS_LOADED',
+      sessions: allSessions,
+      activeSessionId: activeSession.id,
+    });
+  }
+
+  private async _handleStartReview(
+    artifactType: 'plan' | 'walkthrough',
+    messageId?: string,
+    fallbackContent?: string
+  ): Promise<void> {
+    const apiKey = await this._secretStore.getApiKey();
+    if (!apiKey) {
+      vscode.window.showErrorMessage('No OpenRouter API key found. Please save your key first.');
+      return;
+    }
+
+    const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
+    if (!reviewerModel) {
+      vscode.window.showWarningMessage('Please select a Reviewer Model in Settings before starting a review.');
+      return;
+    }
+
+    const prepared = await ArtifactDocumentManager.prepareArtifactFile(
+      this._historyStore,
+      artifactType,
+      messageId,
+      fallbackContent,
+      this._storageUri
+    );
+
+    if (!prepared) {
+      vscode.window.showErrorMessage(`No ${artifactType} document content found.`);
+      return;
+    }
+
+    const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
+    const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
+    const sessionTitle = `Review: ${artifactType === 'plan' ? 'Plan' : 'Walkthrough'}`;
+
+    // Check if a reviewer session is already active/open
+    const { activeSession } = await this._historyStore.loadReviewerSessions();
+    const isSessionActive =
+      (activeSession && activeSession.messages && activeSession.messages.length > 0) ||
+      (this._reviewerHistory && this._reviewerHistory.length > 0);
+
+    if (isSessionActive) {
+      // Repeat click while reviewer session is active:
+      // Do NOT create a new session, do NOT auto-send.
+      // Update the active artifact context and attach the artifact to the current session's input bar.
+      this._activeReviewerArtifactContent = prepared.content;
+      this._activeReviewerArtifactType = artifactType;
+      if (activeSession) {
+        activeSession.artifactContent = prepared.content;
+        activeSession.artifactType = artifactType;
+        activeSession.artifactMessageId = messageId;
+        await this._historyStore.saveReviewerSessions();
+      }
+
+      this._postMessage({
+        type: 'REVIEWER_ATTACH_ARTIFACT',
+        artifactType,
+        artifactContent: prepared.content,
+        artifactName: artifactType === 'plan' ? 'Plan docs' : 'Results docs',
+        artifactUri: prepared.uri.toString(),
+        messageId,
+      });
+      return;
+    }
+
+    this._activeReviewerArtifactContent = prepared.content;
+    this._activeReviewerArtifactType = artifactType;
+
+    // No active session for this context: start a fresh reviewer session dedicated to this artifact
+    const newSession = await this._historyStore.startNewReviewerSession(sessionTitle, {
+      artifactType,
+      artifactMessageId: messageId,
+      artifactContent: prepared.content,
+    });
+
+    // The initial user turn displays the configured Reviewer System Prompt so the user sees the exact critique instructions
+    const initialUserPrompt = reviewerSystemPrompt;
+    this._reviewerHistory = [{ role: 'user', content: initialUserPrompt }];
+    this._lastReviewerUserPrompt = initialUserPrompt;
+
+    await this._historyStore.appendReviewerMessage({
+      id: `${Date.now()}-user`,
+      role: 'user',
+      content: initialUserPrompt,
+      timestamp: Date.now(),
+    });
+
+    // Inform webview to navigate to reviewer view
+    this._postMessage({
+      type: 'REVIEWER_VIEW_DATA',
+      artifactType,
+      artifactContent: prepared.content,
+      artifactUri: prepared.uri.toString(),
+      messageId,
+      reviewerModel,
+      reviewerReasoningEffort,
+      history: [...this._reviewerHistory],
+      activeSessionId: newSession.id,
+    });
+    await this._sendReviewerSessionsData();
+
+    // Start streaming reviewer response
+    await this._streamReviewerResponse(reviewerModel, reviewerReasoningEffort, reviewerSystemPrompt);
+  }
+
+  private async _handleSendReviewerMessage(
+    userText: string,
+    modelOverride?: string,
+    reasoningEffortOverride?: string,
+    artifactContent?: string,
+    artifactType?: 'plan' | 'walkthrough'
+  ): Promise<void> {
+    const apiKey = await this._secretStore.getApiKey();
+    if (!apiKey) {
+      vscode.window.showErrorMessage('No OpenRouter API key found.');
+      return;
+    }
+
+    if (modelOverride) {
+      this._activeReviewerModelOverride = modelOverride;
+    }
+    if (reasoningEffortOverride) {
+      this._activeReviewerReasoningEffortOverride = reasoningEffortOverride;
+    }
+
+    if (artifactContent) {
+      this._activeReviewerArtifactContent = artifactContent;
+      this._activeReviewerArtifactType = artifactType || 'plan';
+      const { activeSession } = await this._historyStore.loadReviewerSessions();
+      if (activeSession) {
+        activeSession.artifactContent = artifactContent;
+        activeSession.artifactType = artifactType || 'plan';
+        await this._historyStore.saveReviewerSessions();
+      }
+    }
+
+    const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
+    const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
+    const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
+
+    this._reviewerHistory.push({ role: 'user', content: userText });
+    this._lastReviewerUserPrompt = userText;
+
+    await this._historyStore.appendReviewerMessage({
+      id: `${Date.now()}-user`,
+      role: 'user',
+      content: userText,
+      timestamp: Date.now(),
+    });
+
+    await this._streamReviewerResponse(reviewerModel, reviewerReasoningEffort, reviewerSystemPrompt);
+  }
+
+  private async _handleRetryReviewerMessage(): Promise<void> {
+    const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
+    const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
+    const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
+
+    // Re-run stream with the current conversation history
+    await this._streamReviewerResponse(reviewerModel, reviewerReasoningEffort, reviewerSystemPrompt);
+  }
+
+  private async _streamReviewerResponse(
+    model: string,
+    reasoningEffort: string,
+    systemPrompt: string
+  ): Promise<void> {
+    const apiKey = await this._secretStore.getApiKey();
+    if (!apiKey) return;
+
+    this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: true });
+    this._postMessage({ type: 'REVIEWER_STREAM_START' });
+
+    let accumulatedChunk = '';
+    const abortController = new AbortController();
+    this._activeReviewerAbortController = abortController;
+
+    let effectiveSystemPrompt = systemPrompt;
+    if (this._activeReviewerArtifactContent) {
+      const artifactLabel =
+        this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs';
+      effectiveSystemPrompt = `${systemPrompt}\n\n# Document Under Review (${artifactLabel}):\n${this._activeReviewerArtifactContent}`;
+    }
+
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      { role: 'system', content: effectiveSystemPrompt },
+      ...this._reviewerHistory,
+    ];
+
+    const dataPolicy = Configuration.getDataCollectionPolicy();
+    const providerOptions: ProviderRoutingOptions = {
+      data_collection: dataPolicy,
+      zdr: dataPolicy === 'deny',
+    };
+
+    await OpenRouterClient.sendChatCompletionStream(
+      apiKey,
+      model,
+      messages,
+      (chunk) => {
+        accumulatedChunk += chunk;
+        this._postMessage({
+          type: 'REVIEWER_STREAM_CHUNK',
+          chunk,
+        });
+      },
+      async (usage) => {
+        this._activeReviewerAbortController = undefined;
+        this._reviewerHistory.push({ role: 'assistant', content: accumulatedChunk });
+
+        await this._historyStore.appendReviewerMessage({
+          id: `${Date.now()}-assistant`,
+          role: 'assistant',
+          content: accumulatedChunk,
+          model,
+          timestamp: Date.now(),
+        });
+
+        if (usage) {
+          const modelObj = this._cachedModels.find((m) => m.id === model);
+          const cost = PricingCalculator.calculateCost(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            modelObj?.pricing
+          );
+
+          let loggedModelName = model;
+          if (reasoningEffort) {
+            const formattedEffort =
+              reasoningEffort.charAt(0).toUpperCase() + reasoningEffort.slice(1).toLowerCase();
+            loggedModelName = `${model} (${formattedEffort})`;
+          }
+
+          // Log strictly as type: "reviewer"
+          await this._usageStore.appendRecord({
+            type: 'reviewer',
+            project: ProjectResolver.getActiveProjectName(),
+            model: loggedModelName,
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens,
+            cost,
+          });
+        }
+
+        this._postMessage({
+          type: 'REVIEWER_STREAM_DONE',
+          usage,
+        });
+        this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
+        await this._sendReviewerSessionsData();
+      },
+      (err) => {
+        this._activeReviewerAbortController = undefined;
+        this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
+
+        const isPartial = accumulatedChunk.trim().length > 0;
+        if (isPartial) {
+          // Case 3: Partial stream received, then error
+          this._reviewerHistory.push({
+            role: 'assistant',
+            content: `${accumulatedChunk}\n\n[Response interrupted]`,
+          });
+        }
+
+        this._postMessage({
+          type: 'REVIEWER_STREAM_ERROR',
+          message: err.message || 'Reviewer request failed',
+          partial: isPartial,
+          canRetry: true,
+        });
+      },
+      providerOptions,
+      abortController.signal,
+      reasoningEffort
+    );
   }
 
   private _postMessage(message: HostToWebviewMessage) {
@@ -1015,6 +1904,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const styleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'ui', 'style.css')
     );
+    const reviewerEnabled = Configuration.getReviewerEnabled();
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1072,6 +1962,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               <div id="session-history-list" class="session-history-list"></div>
             </div>
           </div>
+          <button id="reviewer-toggle-btn" class="icon-btn${reviewerEnabled ? '' : ' hidden'}" title="Open Reviewer Panel">🔍</button>
           <button id="settings-btn" class="icon-btn" title="Open Settings & Permissions">⚙️</button>
         </div>
         
@@ -1129,6 +2020,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         <div class="input-box-wrapper" id="input-box-wrapper">
           <textarea id="prompt-input" rows="1" placeholder="Ask, edit, or run something..."></textarea>
           <input type="file" id="image-file-input" accept="image/*" style="display:none;" />
+          <input type="file" id="doc-file-input" accept=".txt,.md,.json,.ts,.tsx,.js,.jsx,.py,.rs,.go,.cpp,.c,.h,.css,.html,.yaml,.yml,.toml,.sh,.bash,.csv,text/*" style="display:none;" />
           <div class="input-inline-actions">
             <button id="copy-input-btn" class="inline-icon-btn" title="Copy input text">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1140,6 +2032,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="9 14 4 9 9 4"></polyline>
                 <path d="M20 20v-7a4 4 0 0 0-4-4H4"></path>
+              </svg>
+            </button>
+            <button id="attach-file-btn" class="inline-icon-btn" title="Attach file">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
               </svg>
             </button>
             <button id="upload-img-btn" class="inline-icon-btn" title="Attach image">
@@ -1180,10 +2077,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     </div>
 
     <!-- TAB 2: Usage Report View (Accessed via Settings) -->
-    <div id="view-usage" class="tab-content-view hidden" style="display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:16px; gap:14px;">
-      <div class="settings-header">
+    <div id="view-usage" class="tab-content-view hidden" style="display:flex; flex-direction:column; flex:1; min-height:0; overflow:hidden;">
+      <div class="settings-header-strip" style="display:flex; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--sidebar-bg); flex-shrink:0; z-index:10;">
         <button id="usage-back-btn" class="settings-back-btn">‹ Usage Report</button>
       </div>
+
+      <div id="usage-scroll-body" style="display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:16px; gap:14px;">
 
       <!-- Summary Spend Cards -->
       <div class="spend-cards-row">
@@ -1198,6 +2097,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         <div class="spend-card">
           <div class="spend-label">This Month</div>
           <div id="spend-month" class="spend-val">$0.00</div>
+        </div>
+        <div class="spend-card">
+          <div class="spend-label">Total Cost</div>
+          <div id="spend-total" class="spend-val">$0.00</div>
         </div>
       </div>
 
@@ -1233,13 +2136,17 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         </table>
       </div>
     </div>
+  </div>
 
     <!-- TAB 3: In-Panel Settings View (Matching User Mockup) -->
-    <div id="view-settings" class="tab-content-view hidden" style="display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:16px; gap:18px;">
-      <!-- Header with back button -->
-      <div class="settings-header">
+    <div id="view-settings" class="tab-content-view hidden" style="display:flex; flex-direction:column; flex:1; min-height:0; overflow:hidden;">
+      <!-- Pinned Header Strip -->
+      <div class="settings-header-strip" style="display:flex; align-items:center; padding:10px 16px; border-bottom:1px solid var(--border); background:var(--sidebar-bg); flex-shrink:0; z-index:10;">
         <button id="settings-back-btn" class="settings-back-btn">‹ Settings</button>
       </div>
+
+      <!-- Scrollable Settings Body -->
+      <div id="settings-scroll-body" style="display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; padding:16px; gap:18px;">
 
       <!-- Account Section -->
       <div class="settings-group">
@@ -1248,34 +2155,6 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           <span id="settings-masked-key" class="settings-masked-text">sk-or-••••••••••••</span>
           <button id="settings-update-key-btn" class="btn secondary">Update key</button>
         </div>
-      </div>
-
-      <!-- Panel position Section -->
-      <div class="settings-group">
-        <div class="settings-group-title">Panel position</div>
-        <div class="segmented-control">
-          <button id="pos-left-btn" class="segment-btn active">Left</button>
-          <button id="pos-right-btn" class="segment-btn">Right</button>
-        </div>
-        <div id="position-guide-box" class="position-guide-box hidden">
-          <div class="guide-title">
-            <span id="guide-title-text">👉 How to move Chat to the Right:</span>
-            <button id="guide-close-btn" class="guide-close-btn" title="Dismiss">✕</button>
-          </div>
-          <div id="guide-body-text" class="guide-body">
-            <div>1. Right-click the <strong>OpenRouter (✨)</strong> icon or "Chat" header.</div>
-            <div>2. Click <strong>"Move to Secondary Side Bar"</strong>.</div>
-            <div style="margin-top: 4px; opacity: 0.8;">(Or simply drag &amp; drop the ✨ icon to the right side bar).</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Default model Section -->
-      <div class="settings-group">
-        <div class="settings-group-title">Default model</div>
-        <select id="settings-default-model" class="settings-select">
-          <option value="">Loading models...</option>
-        </select>
       </div>
 
       <!-- Permissions Section -->
@@ -1296,7 +2175,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           </div>
           <div class="permission-row" data-cat="readWorkspaceFiles">
             <span>Access other workspace files</span>
-            <button class="perm-pill deny">Denied</button>
+            <button class="perm-pill allow">Allowed</button>
           </div>
         </div>
         <button id="reset-permissions-btn" class="btn secondary" style="margin-top:8px;">Reset all permissions</button>
@@ -1334,12 +2213,61 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           </select>
         </div>
         <div style="margin-top: 8px; font-size: 11px;">
-          <a href="https://openrouter.ai/docs/privacy" target="_blank" style="color: var(--vscode-textLink-foreground); text-decoration: none;">
+          <a href="https://openrouter.ai/privacy" target="_blank" style="color: var(--vscode-textLink-foreground); text-decoration: none;">
             🔗 OpenRouter Privacy &amp; Data Policy documentation
           </a>
         </div>
         <div style="margin-top: 4px; font-size: 10px; opacity: 0.65; line-height: 1.3;">
           Note: Existing chat history saved prior to enabling secret redaction is persisted as-is and not retroactively rescanned.
+        </div>
+      </div>
+
+      <!-- Reviewer Model Section (PRD Phase 10 - Per-Workspace) -->
+      <div class="settings-group">
+        <div class="settings-group-title">Reviewer Model (Per-Workspace)</div>
+        <label class="checkbox-row">
+          <span>Enable Reviewer Model</span>
+          <input type="checkbox" id="chk-reviewer-enabled" />
+        </label>
+        
+        <!-- Controls visible only when Enable Reviewer Model is checked -->
+        <div id="reviewer-config-container" class="reviewer-config-container hidden" style="display:flex; flex-direction:column; gap:10px; margin-top:4px;">
+          <!-- Reviewer Model & Reasoning Effort Row (Side-by-side with Smart Visibility) -->
+          <div class="reviewer-model-row" style="display:flex; gap:8px; align-items:flex-start; width:100%;">
+            <!-- Searchable Reviewer Model Combobox -->
+            <div class="reviewer-field-group" style="flex:1; min-width:0;">
+              <label class="settings-field-label">Reviewer Model</label>
+              <div class="combobox-container" style="position:relative; width:100%;">
+                <div class="combobox-input-wrapper">
+                  <input type="text" id="reviewer-model-search-input" class="combobox-input" placeholder="Select reviewer model..." autocomplete="off" />
+                  <span class="combobox-arrow">▼</span>
+                </div>
+                <div id="reviewer-model-dropdown" class="combobox-dropdown hidden"></div>
+              </div>
+              <div id="reviewer-model-warning" class="reviewer-model-warning hidden" style="font-size:11px; color:#e3b341; margin-top:2px;">
+                ⚠️ Please pick a reviewer model for this workspace.
+              </div>
+            </div>
+
+            <!-- Reasoning Effort Selection (Shown on same row if reviewer model supports reasoning) -->
+            <div id="reviewer-reasoning-container" class="reviewer-field-group hidden" style="width:115px; flex-shrink:0;">
+              <label class="settings-field-label" style="white-space:nowrap;">Reasoning Effort</label>
+              <select id="reviewer-reasoning-select" class="settings-select" style="width:100%; height:26px; padding:3px 6px; font-size:11.5px; border-radius:4px;">
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Editable Reviewer System Prompt -->
+          <div class="reviewer-field-group">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+              <label class="settings-field-label" style="margin-bottom:0;">Reviewer System Prompt</label>
+              <button id="reset-reviewer-prompt-btn" class="btn secondary" style="font-size:11px; padding:2px 8px;" title="Restore default prompt for this workspace">Reset to Default</button>
+            </div>
+            <textarea id="reviewer-system-prompt" class="settings-textarea" rows="6" placeholder="Enter custom reviewer prompt..."></textarea>
+          </div>
         </div>
       </div>
 
@@ -1355,6 +2283,142 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       <!-- Version Footer -->
       <div class="settings-version-footer">
         <span>OpenRouter v${EXTENSION_VERSION}</span>
+      </div>
+    </div>
+  </div>
+
+    <!-- TAB 4: Dedicated Reviewer View (PRD Phase 11) -->
+    <div id="view-reviewer" class="tab-content-view hidden" style="display:flex; flex-direction:column; flex:1; min-height:0; overflow:hidden;">
+      <!-- Reviewer Header with In-Panel Model Switcher & Reviewer Sessions -->
+      <div class="header" style="border-bottom:1px solid var(--border); padding:8px 10px; display:flex; flex-direction:column; gap:6px; background:var(--vscode-sideBar-background);">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:6px;">
+          <button id="reviewer-back-btn" class="settings-back-btn" style="background:none; border:none; color:var(--vscode-foreground); cursor:pointer; font-size:12px; font-weight:600; display:flex; align-items:center; gap:4px; padding:2px 4px;">
+            ‹ Chat
+          </button>
+          
+          <!-- In-Panel Searchable Reviewer Model Selector -->
+          <div class="combobox-container" style="flex:1; max-width:200px; position:relative;">
+            <div class="combobox-input-wrapper">
+              <input type="text" id="reviewer-panel-model-input" class="combobox-input" placeholder="Reviewer Model..." autocomplete="off" style="font-size:11px; padding:3px 6px;" />
+              <span class="combobox-arrow">▼</span>
+            </div>
+            <div id="reviewer-panel-model-dropdown" class="combobox-dropdown hidden"></div>
+          </div>
+
+          <!-- Reviewer Reasoning Effort Selector -->
+          <div id="reviewer-panel-reasoning-container" class="reasoning-effort-container hidden">
+            <select id="reviewer-panel-reasoning-select" class="reasoning-effort-select" title="Reviewer Reasoning Effort" style="font-size:11px; padding:2px 4px;">
+              <option value="low">Low</option>
+              <option value="medium" selected>Medium</option>
+              <option value="high">High</option>
+            </select>
+          </div>
+
+          <!-- Reviewer Sessions Menu -->
+          <div class="session-dropdown-container">
+            <button id="reviewer-new-chat-btn" class="icon-btn" title="Reviewer Sessions / New Session" style="font-size:12px; padding:3px 6px;">➕</button>
+            <div id="reviewer-session-dropdown" class="session-dropdown hidden">
+              <div class="session-dropdown-header">
+                <span>Reviewer Sessions</span>
+              </div>
+              <div id="reviewer-session-item-new" class="session-menu-action">
+                <span class="action-icon">➕</span>
+                <span class="action-text">New Review Session</span>
+              </div>
+              <div class="session-dropdown-divider"></div>
+              <div class="session-history-title">Previous Reviews</div>
+              <div id="reviewer-session-history-list" class="session-history-list"></div>
+            </div>
+          </div>
+
+          <!-- Start Fresh / Context Reset Action -->
+          <button id="reviewer-reset-context-btn" class="icon-btn" title="Start fresh from here (reset reviewer context)" style="font-size:12px; padding:3px 6px;">🔄</button>
+        </div>
+
+        <!-- Drop-with-notice warning banner for in-panel model switch -->
+        <div id="reviewer-capability-notice-banner" class="capability-notice-banner hidden" style="margin:0;">
+          <span id="reviewer-capability-notice-text"></span>
+          <button id="reviewer-capability-notice-close" class="banner-close-btn" title="Dismiss">✕</button>
+        </div>
+      </div>
+
+      <!-- Split Container: Artifact Preview on top / collapsible & Conversation below -->
+      <div style="display:flex; flex-direction:column; flex:1; min-height:0; position:relative;">
+        <!-- Artifact Reference Header & Collapsible Document Preview -->
+        <div id="reviewer-artifact-section" class="reviewer-artifact-section" style="border-bottom:1px solid var(--border); background:rgba(0,0,0,0.15);">
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:6px 12px;">
+            <div style="display:flex; align-items:center; gap:6px; font-size:11.5px; font-weight:500;">
+              <span>📄</span>
+              <span id="reviewer-artifact-label">Artifact Document</span>
+            </div>
+            <div style="display:flex; gap:6px;">
+              <button id="reviewer-open-tab-btn" class="btn secondary" style="font-size:10.5px; padding:2px 6px;" title="Open document in VS Code editor tab for line-specific commenting">
+                Open in Tab
+              </button>
+              <button id="reviewer-toggle-artifact-btn" class="btn secondary" style="font-size:10.5px; padding:2px 6px;">
+                Collapse
+              </button>
+            </div>
+          </div>
+          <div id="reviewer-artifact-preview-body" style="max-height:140px; overflow-y:auto; padding:6px 12px; font-size:11px; font-family:var(--vscode-editor-font-family, monospace); background:rgba(0,0,0,0.25); border-top:1px solid rgba(255,255,255,0.05); white-space:pre-wrap; word-break:break-word;"></div>
+        </div>
+
+        <!-- Reviewer Conversation Thread -->
+        <div id="reviewer-messages" class="messages-container chat-container" style="flex:1; min-height:0; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:12px;"></div>
+
+        <!-- Floating Selection Toolbar for Selective Return to Main Model -->
+        <div id="reviewer-selection-toolbar" class="hidden" style="position:absolute; bottom:80px; left:50%; transform:translateX(-50%); background:#1f242c; border:1px solid var(--border); border-radius:6px; padding:4px 8px; box-shadow:0 4px 12px rgba(0,0,0,0.4); display:flex; align-items:center; gap:8px; z-index:100;">
+          <span style="font-size:11px; color:#8b949e;">Selected text</span>
+          <button id="reviewer-clarify-selection-btn" class="btn secondary" style="font-size:11px; padding:2px 8px;">
+            💬 Clarify Selection
+          </button>
+          <button id="reviewer-send-selection-btn" class="btn primary" style="font-size:11px; padding:2px 8px;">
+            ↵ Send to Main Model
+          </button>
+        </div>
+
+        <!-- Shared-UX Reviewer Input Bar -->
+        <div class="input-bar" style="border-top:1px solid var(--border); background:var(--vscode-sideBar-background); padding:8px 10px;">
+          <!-- Reviewer Attachment preview bar (Images & Text) -->
+          <div id="reviewer-attachment-preview-bar" class="attachment-preview-bar hidden"></div>
+
+          <div class="input-box-wrapper" id="reviewer-input-box-wrapper">
+            <textarea id="reviewer-prompt-input" rows="1" placeholder="Converse with reviewer..."></textarea>
+            <input type="file" id="reviewer-image-file-input" accept="image/*" style="display:none;" />
+            <input type="file" id="reviewer-doc-file-input" accept=".txt,.md,.json,.ts,.tsx,.js,.jsx,.py,.rs,.go,.cpp,.c,.h,.css,.html,.yaml,.yml,.toml,.sh,.bash,.csv,text/*" style="display:none;" />
+            <div class="input-inline-actions">
+              <button id="reviewer-attach-file-btn" class="inline-icon-btn" title="Attach file">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+                </svg>
+              </button>
+              <button id="reviewer-upload-img-btn" class="inline-icon-btn" title="Attach image">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="3" ry="3"></rect>
+                  <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                  <polyline points="21 15 16 10 5 21"></polyline>
+                </svg>
+              </button>
+              <button id="reviewer-send-btn" class="inline-send-btn" title="Send to Reviewer (Enter)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="5" y1="12" x2="19" y2="12"></line>
+                  <polyline points="12 5 19 12 12 19"></polyline>
+                </svg>
+              </button>
+              <button id="reviewer-stop-btn" class="inline-stop-btn hidden" title="Stop generating">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2"></rect>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Reviewer Footer Strip with Visible Context Meter -->
+        <div class="footer-strip" style="display:flex; justify-content:space-between; align-items:center; padding:4px 10px; font-size:10px; opacity:0.8; border-top:1px solid var(--border);">
+          <span id="reviewer-status-text">Ready</span>
+          <span id="reviewer-token-meter" title="Reviewer conversation context usage">0 tokens</span>
+        </div>
       </div>
     </div>
   </div>

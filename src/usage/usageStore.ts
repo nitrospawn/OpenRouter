@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 
-export type UsageEventType = 'chat_completion' | 'terminal_command' | 'summarization';
+export type UsageEventType = 'chat_completion' | 'terminal_command' | 'summarization' | 'reviewer';
 
 export interface UsageAuditRecord {
   id: string;
@@ -79,7 +79,7 @@ export class UsageStore {
     return fullRecord;
   }
 
-  public async getSpendSummary(): Promise<SpendSummary> {
+  public async getSpendSummary(filter?: { project?: string; model?: string }): Promise<SpendSummary> {
     const records = await this.loadRecords();
     const now = new Date();
     
@@ -100,6 +100,15 @@ export class UsageStore {
     let total = 0;
 
     for (const r of records) {
+      if (filter) {
+        if (filter.project && filter.project !== 'all' && r.project !== filter.project) {
+          continue;
+        }
+        if (filter.model && filter.model !== 'all' && r.model !== filter.model) {
+          continue;
+        }
+      }
+
       const cost = r.cost || 0;
       total += cost;
       if (r.timestamp >= startOfToday) {
@@ -127,10 +136,13 @@ export class UsageStore {
     return Array.from(set);
   }
 
-  public async getDistinctModels(): Promise<string[]> {
+  public async getDistinctModels(project?: string): Promise<string[]> {
     const records = await this.loadRecords();
     const set = new Set<string>();
     for (const r of records) {
+      if (project && project !== 'all' && r.project !== project) {
+        continue;
+      }
       if (r.model) {
         set.add(r.model);
       }

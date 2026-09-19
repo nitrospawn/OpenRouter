@@ -142,6 +142,7 @@ export function activate(context: vscode.ExtensionContext) {
             'Deny': 'deny',
           };
           await permissionManager.setPermission(selected.category, mapping[choice.label]);
+          await panelProvider.sendSettingsData();
           vscode.window.showInformationMessage(`Updated ${selected.label} to: ${choice.label}`);
         }
       }
@@ -214,7 +215,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Register CodeActionProvider for QuickFix so right-clicking a diagnostic or viewing QuickFix in Problems panel includes OpenRouter
   context.subscriptions.push(
-    vscode.languages.registerCodeActionProvider(
+    vscode.languages.registerCodeActionsProvider(
       { scheme: 'file' },
       {
         provideCodeActions(
@@ -257,6 +258,15 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('openrouter.sendAllProblems', async () => {
       await vscode.commands.executeCommand('openrouter.chatView.focus');
       panelProvider.insertInputText('@all_problems', true);
+    })
+  );
+
+  // Live mid-session updates for configuration changes
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(async (e) => {
+      if (e.affectsConfiguration('openrouter')) {
+        await panelProvider.sendSettingsData();
+      }
     })
   );
 }

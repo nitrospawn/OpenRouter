@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { detectModelCapabilities } from '../src/api/modelCapabilities';
+import { detectModelCapabilities, getDefaultReasoningEffort } from '../src/api/modelCapabilities';
 import { OpenRouterClient } from '../src/api/openrouterClient';
 import { UsageStore } from '../src/usage/usageStore';
 
@@ -268,4 +268,12 @@ test('Switching to a model that does not support reasoning effort clears/ignores
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('getDefaultReasoningEffort: defaults to low when supported, with robust fallbacks', () => {
+  assert.strictEqual(getDefaultReasoningEffort(['low', 'medium', 'high']), 'low', 'Standard reasoning models must default to low');
+  assert.strictEqual(getDefaultReasoningEffort(['medium', 'high']), 'medium', 'Should fallback to medium if low unavailable');
+  assert.strictEqual(getDefaultReasoningEffort(['high', 'max']), 'high', 'Should fallback to first item if low and medium unavailable');
+  assert.strictEqual(getDefaultReasoningEffort([]), 'low', 'Should default to low on empty array');
+  assert.strictEqual(getDefaultReasoningEffort(undefined), 'low', 'Should default to low on undefined');
 });

@@ -42,6 +42,145 @@ model selector high , low , mid✅
 context refinement ✅
 
 send confirmation notification for apply or approval to telegram
+## Completed ✅
+
+1. When an agent finishes a task, it shares a brief summary of what was carried out.✅
+2. When the model is writing text to users, it renders properly instead of showing raw markdown.
+3. User messages are rendered as plain text, not markdown.
+4. A tiny copy button was added to the user input text, in case the user wants to copy the request.
+5. Ability to select an aspect of the agent's output and add it to context to get more clarification.
+6. A retry mechanism was added in the backend for errors coming from OpenRouter.
+7. When a previous conversation is reopened, it no longer shows approval messages (Preview Diff / Apply / Reject) as still highlighted/active once the user has already made a choice.
+8. The context token counter resets when the "+" (new chat) button is clicked.
+9. Ability to rename a conversation in history, to aid recollection.
+10. Ability to send all or specific problems highlighted in VS Code's Problems panel to the agent for resolution.
+11. When the agent needs the user to apply or reject an edit, the option is no longer inside the body of the message — it's a persistent bar below the header / above the input field, with an "Apply All" / "Reject All" option when 3+ changes need acknowledgment.
+12. No redo button — undo only.
+13. When undo is clicked, the chat below that point is completely cleared from the user's view and from context.
+14. After undo, the user's input field is auto-filled with the undone message so it's ready to edit and resend.
+15. When the model writes a large code block, it's collapsed by default (crunched) to avoid excessive scrolling — showing just a snippet, with a summary visible since the full content is written to the file.
+16. Model selector supports High / Medium / Low reasoning-effort selection.
+17. Context refinement — the assistant resolves context and clarifies before acting, plans by default, searches efficiently, and verifies its own work.
+
+## Backlog — Bugs & Feature Requests to Address
 
 
-please ensure that after edits, the file is saved when user click on apply
+
+2. **Reasoning Effort Selector doesn't remember last selection.** It 
+   currently always defaults to "Medium" on reopen, rather than 
+   remembering and restoring whatever the user last selected (per model, 
+   or globally — needs a decision) the next time the panel/extension is 
+   opened. leave  Solution default to low[✅]
+
+3. **Model selector in Settings needs a search bar.** The default-model 
+   field in the Settings panel currently only supports scrolling through 
+   the full model list to find one — it should have the same type-to-
+   search combobox behavior already built for the main chat panel's model 
+   selector (§3.3), instead of a plain scrollable list.[we removed it]✅
+   
+   
+   
+  6. **OpenRouter privacy policy link is broken.** The link in Settings 
+   pointing to OpenRouter's data/privacy documentation (added as part of 
+   Phase 7, §7.3) is not working — needs to be checked and fixed/updated 
+   to a working URL.✅
+
+
+5. **No visible reasoning/progress indicator while the agent is working.** 
+   When the agent is actively working through a request (clarifying, 
+   planning, generating, verifying — per Phase 9's multi-step flow), there 
+   should be some visible indication in the chat UI of what step it's on 
+   or that it's actively reasoning through something, rather than just a 
+   generic loading/streaming state with no insight into what's happening.
+
+
+
+
+1. **File not saved after applying an edit.** When the user clicks "Apply" 
+   on a proposed edit, the file should be automatically saved to disk 
+   afterward — currently it appears the edit is applied to the open 
+   editor buffer but not saved, leaving it as an unsaved/dirty file the 
+   user has to manually save themselves.
+
+
+4. **Agent frequently fails to see/find the correct directory.** Most of 
+   the time, it doesn't correctly locate or recognize the workspace 
+   directory it should be operating in — needs investigation into why 
+   directory/workspace-root resolution is unreliable.
+
+
+
+
+
+8. **Lightweight `@file` mention system.** A simple `@filename` 
+   autocomplete in the chat input to manually pull a specific file into 
+   context, beyond just the currently-active file. Reduces reliance on 
+   the AI's own search/resolution step (Phase 9) — directly supports the 
+   "declare the file, skip the search" cost-optimization strategy for 
+   lower-tier models. Distinct from the plain-text `@current_problems` / 
+   `@all_problems` tokens (Phase 8) — this would need actual file-path 
+   resolution/autocomplete, not just literal string detection.
+
+9. **Desktop notification when a long-running task finishes while unfocused.** 
+   If the panel isn't focused when a long agentic task (planning → action 
+   → verification, or a terminal command) completes, there's currently no 
+   way to know it's done without checking back manually.
+
+10. **Visible OpenRouter balance/quota indicator.** If OpenRouter's API 
+    exposes remaining balance/quota, surface it somewhere (e.g. near the 
+    Usage Report or in Settings) so the user can see remaining budget at 
+    a glance, especially relevant given active use of pro-tier models.
+
+11. **Respect VS Code's light/dark theme automatically.** Confirm the 
+    extension's UI (chat panel, settings, usage report) adapts to the 
+    user's active VS Code theme rather than assuming dark mode, since all 
+    mockups/CSS built so far have assumed a dark theme by default.
+	
+	
+12. **"Send Problems to Agent" behaves differently between Antigravity IDE 
+    and stock VS Code — visible in one, not the other.** Needs 
+    investigation to determine the actual cause, which could be one of 
+    two very different things:
+    - (a) Antigravity IDE (a VS Code fork with its own built-in AI 
+      features) may have its OWN native "send problems to agent" 
+      capability unrelated to this extension entirely — meaning what's 
+      being seen there isn't necessarily this extension's Phase 8 feature 
+      at all, just a similar-looking built-in Antigravity feature.
+    - (b) This extension's own Problems-panel contribution (the 
+      "openrouter.sendCurrentProblems" / "openrouter.sendAllProblems" 
+      commands and their `view/title` menu registration under 
+      `workbench.panel.markers.view`) may not be registering correctly in 
+      stock VS Code specifically — worth checking whether the Problems 
+      panel view ID or menu contribution point differs between standard 
+      VS Code and the Antigravity fork, which could cause the menu items 
+      to silently fail to appear in one but not the other.
+    - Needs a direct side-by-side check: open the Problems panel in both 
+      environments with this same extension installed, and confirm 
+      whether the extension's own commands/icons are present in both, 
+      absent in both, or genuinely differ — before assuming which of (a) 
+      or (b) is actually happening.
+	
+enable message quesue , user can send multiple mesages but it quies 
+
+
+clarify selection is not working in reviewer panel
+
+
+when happens to all the artifact created does it remain in the system?
+
+
+auto syn to a git repos if connected and activated
+
+
+under usage reprot , when i toggle a selected project it shoudl give me the totla cost for that project for that day , week , month and overall
+
+
+can the modeuluse tools like github app installatiion?
+
+
+
+    Async tool calling: Let Astra continue working while your application runs a tool and manages ongoing work.
+    Mid-turn steering: Now you can send additional instructions and corrections while GPT-6 Astra is working.
+    Change reasoning mid-conversation: Adjust reasoning effort mid-conversation while preserving the original prompt prefix for caching.
+
+Get started

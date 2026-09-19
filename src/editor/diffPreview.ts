@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import { PermissionManager } from '../permissions/permissionManager';
-import { ConfirmationDialogs } from '../permissions/confirmationDialogs';
 
 export class DiffPreviewManager {
   private static readonly SCHEME = 'openrouter-diff';
@@ -26,6 +25,60 @@ export class DiffPreviewManager {
   }
 
   /**
+   * Resolves proposed content which may contain SEARCH/REPLACE blocks.
+   * If the proposed content contains `<<<< SEARCH`, it applies the search/replace to the original content.
+   * Uses strict exact matching. Throws an error if a search block is not found.
+   */
+  public static resolveProposedContent(originalContent: string, proposedContent: string): string {
+    if (!proposedContent.includes('<<<< SEARCH')) {
+      return proposedContent;
+    }
+
+    // Normalize line endings to LF to prevent strict matching failures on Windows
+    originalContent = originalContent.replace(/\r\n/g, '\n');
+    proposedContent = proposedContent.replace(/\r\n/g, '\n');
+
+    const blockRegex = /<<<< SEARCH(?:\n([\s\S]*?))?\n====\n([\s\S]*?)\n>>>>/g;
+    let match;
+    let resolvedContent = originalContent;
+    let hasMatches = false;
+
+    // We must reset lastIndex in case we reuse the regex
+    blockRegex.lastIndex = 0;
+
+    while ((match = blockRegex.exec(proposedContent)) !== null) {
+      hasMatches = true;
+      const searchBlock = match[1] ?? '';
+      const replaceBlock = match[2];
+
+      if (searchBlock === '') {
+        if (originalContent.trim() === '') {
+          resolvedContent = replaceBlock;
+          continue;
+        }
+        throw new Error('Empty SEARCH block is not allowed. The AI proposed an invalid edit block.');
+      }
+
+      if (!resolvedContent.includes(searchBlock)) {
+        throw new Error(
+          "The AI's proposed edit no longer matches this file's current content — it may have changed since the edit was proposed. Please ask again."
+        );
+      }
+
+      // Replace only the first occurrence to avoid replacing multiple identical blocks if not intended.
+      // But standard search/replace usually replaces the first exact match it finds.
+      resolvedContent = resolvedContent.replace(searchBlock, replaceBlock);
+    }
+
+    if (!hasMatches) {
+      // It had '<<<< SEARCH' but didn't match the regex pattern exactly.
+      throw new Error("The AI's proposed edit contains a malformed SEARCH/REPLACE block. Please ask again.");
+    }
+
+    return resolvedContent;
+  }
+
+  /**
    * Opens side-by-side diff comparing current file content against proposed content
    */
   public static async openDiffPreview(
@@ -42,8 +95,16 @@ export class DiffPreviewManager {
     }
 
     const pathKey = fileUri.path;
+    let resolvedContent: string;
+    try {
+      resolvedContent = this.resolveProposedContent(originalContent, proposedContent);
+    } catch (err: any) {
+      vscode.window.showErrorMessage(err.message);
+      return;
+    }
+
     this.originalContentMap.set(pathKey, originalContent);
-    this.proposedContentMap.set(pathKey, proposedContent);
+    this.proposedContentMap.set(pathKey, resolvedContent);
 
     const originalUri = vscode.Uri.parse(
       `${this.SCHEME}:${pathKey}?original#${fileUri.fsPath} (Current)`
@@ -66,15 +127,9 @@ export class DiffPreviewManager {
   public static async applyEdit(
     fileUri: vscode.Uri,
     newContent: string,
-    permissionManager: PermissionManager
+    permissionManager: PermissionManager,
+    skipPermissionCheck: boolean = false
   ): Promise<boolean> {
-    const state = permissionManager.getPermission('applyEdit');
-
-    if (state === 'deny') {
-      vscode.window.showErrorMessage('Applying edits is currently disabled in OpenRouter permissions.');
-      return false;
-    }
-
     let fileExists = true;
     try {
       await vscode.workspace.fs.stat(fileUri);
@@ -82,20 +137,30 @@ export class DiffPreviewManager {
       fileExists = false;
     }
 
-    if (state === 'ask') {
-      const confirmed = await ConfirmationDialogs.confirmFileEdit(
-        vscode.workspace.asRelativePath(fileUri),
-        !fileExists
-      );
-
-      if (confirmed === 'deny') {
-        vscode.window.showInformationMessage('Edit cancelled.');
+    if (!skipPermissionCheck) {
+      const relativePath = vscode.workspace.asRelativePath(fileUri);
+      const permStatus = await permissionManager.checkApplyEditPermission(relativePath, !fileExists);
+      if (permStatus === 'denied') {
         return false;
       }
+    }
 
-      if (confirmed === 'allow_session') {
-        await permissionManager.setPermission('applyEdit', 'allow_session');
+    let originalContent = '';
+    if (fileExists) {
+      try {
+        const data = await vscode.workspace.fs.readFile(fileUri);
+        originalContent = new TextDecoder('utf-8').decode(data);
+      } catch {
+        // ignore
       }
+    }
+
+    let resolvedContent: string;
+    try {
+      resolvedContent = this.resolveProposedContent(originalContent, newContent);
+    } catch (err: any) {
+      vscode.window.showErrorMessage(err.message);
+      return false;
     }
 
     const edit = new vscode.WorkspaceEdit();
@@ -109,7 +174,7 @@ export class DiffPreviewManager {
         document.positionAt(0),
         document.positionAt(document.getText().length)
       );
-      edit.replace(fileUri, fullRange, newContent);
+      edit.replace(fileUri, fullRange, resolvedContent);
     }
 
     const success = await vscode.workspace.applyEdit(edit);
