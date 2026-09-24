@@ -1,6 +1,11 @@
 import { renderCodeBlock } from './codeBlockUI';
 import { isLongUserMessage, getUserMessagePreviewText } from './codeBlockUtils';
 import { getDefaultReasoningEffort } from '../../api/modelCapabilities';
+import { MainProgressManager, ReviewerProgressManager } from './agentProgress';
+import { shouldSwitchDirectToReviewer, setReviewerButtonActivity, preserveStreamingElements } from './reviewerNavigation';
+import { AttachedFileRef } from '../messages';
+import { SmartScrollController } from './smartScroll';
+import { isReadOnly } from '../../terminal/commandClassifier';
 // Declared VS Code Webview API
 declare function acquireVsCodeApi(): {
   postMessage(message: any): void;
@@ -58,8 +63,11 @@ const reasoningEffortSelect = document.getElementById('reasoning-effort-select')
 const visionBadge = document.getElementById('vision-badge') as HTMLSpanElement;
 const audioBadge = document.getElementById('audio-badge') as HTMLSpanElement;
 const toolsBadge = document.getElementById('tools-badge') as HTMLSpanElement;
+const agenticBadge = document.getElementById('agentic-badge') as HTMLSpanElement;
 
 const messagesContainer = document.getElementById('messages-container') as HTMLDivElement;
+const mainScrollBottomBtn = document.getElementById('main-scroll-bottom-btn') as HTMLElement;
+export const mainScrollController = new SmartScrollController(messagesContainer, mainScrollBottomBtn);
 const promptInput = document.getElementById('prompt-input') as HTMLTextAreaElement;
 const copyInputBtn = document.getElementById('copy-input-btn') as HTMLButtonElement;
 const sendBtn = document.getElementById('send-btn') as HTMLButtonElement;
@@ -81,17 +89,135 @@ export interface ChatInputAttachment {
   artifactType?: 'plan' | 'walkthrough';
   isQuote?: boolean;
   isReviewerFeedback?: boolean;
+  uri?: string;
+  filePath?: string;
 }
 
 export interface ChatInputController {
   getAttachments(): ChatInputAttachment[];
   clearAttachments(): void;
-  addAttachment(name: string, data: string, isImage: boolean, isArtifact?: boolean, artifactType?: 'plan' | 'walkthrough', isQuote?: boolean, isReviewerFeedback?: boolean): void;
+  addAttachment(
+    name: string,
+    data: string,
+    isImage: boolean,
+    isArtifact?: boolean,
+    artifactType?: 'plan' | 'walkthrough',
+    isQuote?: boolean,
+    isReviewerFeedback?: boolean,
+    uri?: string,
+    filePath?: string
+  ): void;
   getValue(): string;
   setValue(val: string): void;
   focus(): void;
   resetHeight(): void;
   setEnabled(enabled: boolean): void;
+}
+
+export const messageAttachmentsMap = new Map<string, { typedText: string; attachments: ChatInputAttachment[] }>();
+
+export function extractAttachmentsAndPrompt(
+  content: string,
+  images?: Array<{ name: string; dataUrl: string }>
+): { cleanText: string; attachments: ChatInputAttachment[] } {
+  const reconstructed: ChatInputAttachment[] = [];
+  let workingContent = content;
+
+  // 1. Reviewer Feedback
+  const feedbackMatch = workingContent.match(/<!-- reviewer-feedback:start -->[\s\S]*?\[Reviewer Feedback\]:\s*([\s\S]*?)<!-- reviewer-feedback:end -->/);
+  if (feedbackMatch) {
+    const feedbackData = feedbackMatch[1].trim();
+    reconstructed.push({
+      id: `rf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: 'Reviewer Feedback',
+      data: feedbackData,
+      isImage: false,
+      isReviewerFeedback: true,
+    });
+    workingContent = workingContent.replace(/<!-- reviewer-feedback:start -->[\s\S]*?<!-- reviewer-feedback:end -->\s*/g, '').trim();
+  } else if (workingContent.startsWith('[Reviewer Feedback]:')) {
+    const parts = workingContent.split('\n\n');
+    const feedbackData = parts.slice(1).join('\n\n').trim();
+    reconstructed.push({
+      id: `rf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: 'Reviewer Feedback',
+      data: feedbackData,
+      isImage: false,
+      isReviewerFeedback: true,
+    });
+    workingContent = parts[0].trim();
+  }
+
+  // 2. Attached Files (```filename.ext\n...\n```)
+  const fileRegex = /(?:^|\n)```([a-zA-Z0-9_.\-/\\]+\.[a-zA-Z0-9]+)\r?\n([\s\S]*?)```/g;
+  let fm: RegExpExecArray | null;
+  const nonCodeLangs = ['javascript', 'typescript', 'python', 'bash', 'cmd', 'powershell', 'json', 'html', 'css', 'plan', 'walkthrough'];
+  while ((fm = fileRegex.exec(workingContent)) !== null) {
+    const fileName = fm[1];
+    const fileData = fm[2];
+    if (fileName && !nonCodeLangs.includes(fileName.toLowerCase())) {
+      reconstructed.push({
+        id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: fileName,
+        data: fileData,
+        isImage: false,
+        filePath: fileName,
+      });
+    }
+  }
+  workingContent = workingContent.replace(/(?:^|\n)```([a-zA-Z0-9_.\-/\\]+\.[a-zA-Z0-9]+)\r?\n[\s\S]*?```/g, (match, fn) => {
+    if (fn && !nonCodeLangs.includes(fn.toLowerCase())) {
+      return '';
+    }
+    return match;
+  }).trim();
+
+  // 3. Quotes (lines starting with `> `)
+  const quoteRegex = /(?:^|\n)((?:> [^\n]*(?:\r?\n|$))+)/g;
+  let qm: RegExpExecArray | null;
+  while ((qm = quoteRegex.exec(workingContent)) !== null) {
+    const quoteBlock = qm[1];
+    const cleanQuote = quoteBlock
+      .split('\n')
+      .map(line => line.replace(/^>\s?/, ''))
+      .join('\n')
+      .trim();
+    if (cleanQuote) {
+      reconstructed.push({
+        id: `quote-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        name: 'Quote',
+        data: cleanQuote,
+        isImage: false,
+        isQuote: true,
+      });
+    }
+  }
+  workingContent = workingContent.replace(/(?:^|\n)(?:> [^\n]*(?:\r?\n|$))+/g, '').trim();
+
+  // 4. Images
+  if (images && images.length > 0) {
+    images.forEach((img, idx) => {
+      reconstructed.push({
+        id: `img-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+        name: img.name || 'Image attachment',
+        data: img.dataUrl,
+        isImage: true,
+      });
+    });
+  }
+
+  // 5. Clean fallback prompt placeholders if attachments were present
+  if (
+    workingContent === 'Can you clarify this?' ||
+    workingContent === 'Can you clarify these points?' ||
+    workingContent === 'Please address the attached reviewer feedback.'
+  ) {
+    if (reconstructed.length > 0) {
+      workingContent = '';
+    }
+  }
+
+  return { cleanText: workingContent, attachments: reconstructed };
 }
 
 export function createChatInputController(options: {
@@ -151,6 +277,16 @@ export function createChatInputController(options: {
         `;
         chip.appendChild(iconSpan);
         chip.title = att.data.length > 300 ? `${att.data.slice(0, 300)}...` : att.data;
+      } else if (!att.isImage && !att.isQuote) {
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'attachment-doc-icon';
+        iconSpan.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+          </svg>
+        `;
+        chip.appendChild(iconSpan);
       }
       const nameSpan = document.createElement('span');
       nameSpan.className = 'attachment-name';
@@ -202,9 +338,10 @@ export function createChatInputController(options: {
 
   function handleTextFile(file: File) {
     if (!file) return;
+    const filePath = (file as any).path || (file as any).webkitRelativePath || file.name || undefined;
     if (typeof FileReader === 'undefined') {
       const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
-      attachmentsList.push({ id, name: file.name || 'Attached document', data: (file as any).data || '', isImage: false });
+      attachmentsList.push({ id, name: file.name || 'Attached document', data: (file as any).data || '', isImage: false, filePath });
       render();
       return;
     }
@@ -213,7 +350,7 @@ export function createChatInputController(options: {
       const result = e.target?.result as string;
       if (result) {
         const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
-        attachmentsList.push({ id, name: file.name || 'Attached document', data: result, isImage: false });
+        attachmentsList.push({ id, name: file.name || 'Attached document', data: result, isImage: false, filePath });
         render();
       }
     };
@@ -372,7 +509,17 @@ export function createChatInputController(options: {
       if (fileInput) fileInput.value = '';
       if (docFileInput) docFileInput.value = '';
     },
-    addAttachment: (name: string, data: string, isImage: boolean, isArtifact?: boolean, artifactType?: 'plan' | 'walkthrough', isQuote?: boolean, isReviewerFeedback?: boolean) => {
+    addAttachment: (
+      name: string,
+      data: string,
+      isImage: boolean,
+      isArtifact?: boolean,
+      artifactType?: 'plan' | 'walkthrough',
+      isQuote?: boolean,
+      isReviewerFeedback?: boolean,
+      uri?: string,
+      filePath?: string
+    ) => {
       if (isQuote && attachmentsList.some((a) => a.isQuote && a.data === data)) {
         return;
       }
@@ -380,7 +527,18 @@ export function createChatInputController(options: {
         return;
       }
       const id = Date.now().toString() + Math.random().toString(36).substring(2, 7);
-      attachmentsList.push({ id, name, data, isImage, isArtifact, artifactType, isQuote, isReviewerFeedback });
+      attachmentsList.push({
+        id,
+        name,
+        data,
+        isImage,
+        isArtifact,
+        artifactType,
+        isQuote,
+        isReviewerFeedback,
+        uri,
+        filePath,
+      });
       render();
     },
     getValue: () => textarea?.value || '',
@@ -436,6 +594,7 @@ const resetPermissionsBtn = document.getElementById('reset-permissions-btn') as 
 const chkAutoSummarize = document.getElementById('chk-auto-summarize') as HTMLInputElement;
 const chkFullHistory = document.getElementById('chk-full-history') as HTMLInputElement;
 const settingsViewUsageBtn = document.getElementById('settings-view-usage-btn') as HTMLButtonElement;
+const settingsViewLogsBtn = document.getElementById('settings-view-logs-btn') as HTMLButtonElement;
 const settingsClearHistoryBtn = document.getElementById('settings-clear-history-btn') as HTMLButtonElement;
 const capabilityNoticeBanner = document.getElementById('capability-notice-banner') as HTMLDivElement;
 const capabilityNoticeText = document.getElementById('capability-notice-text') as HTMLSpanElement;
@@ -505,6 +664,10 @@ function updateReviewerToggleBtnVisibility(enabled: boolean) {
 }
 updateReviewerToggleBtnVisibility(isReviewerEnabled);
 
+function setReviewerActivityIndicator(active: boolean) {
+  setReviewerButtonActivity(reviewerToggleBtn, active);
+}
+
 // Dedicated Reviewer View DOM References (PRD Phase 11 Consolidation)
 const viewReviewer = document.getElementById('view-reviewer') as HTMLDivElement;
 const reviewerBackBtn = document.getElementById('reviewer-back-btn') as HTMLButtonElement;
@@ -514,6 +677,8 @@ const reviewerOpenTabBtn = document.getElementById('reviewer-open-tab-btn') as H
 const reviewerToggleArtifactBtn = document.getElementById('reviewer-toggle-artifact-btn') as HTMLButtonElement;
 const reviewerArtifactPreviewBody = document.getElementById('reviewer-artifact-preview-body') as HTMLDivElement;
 const reviewerMessages = document.getElementById('reviewer-messages') as HTMLDivElement;
+const reviewerScrollBottomBtn = document.getElementById('reviewer-scroll-bottom-btn') as HTMLElement;
+export const reviewerScrollController = new SmartScrollController(reviewerMessages, reviewerScrollBottomBtn);
 const reviewerSelectionToolbar = document.getElementById('reviewer-selection-toolbar') as HTMLDivElement;
 const reviewerSendSelectionBtn = document.getElementById('reviewer-send-selection-btn') as HTMLButtonElement;
 const reviewerClarifySelectionBtn = document.getElementById('reviewer-clarify-selection-btn') as HTMLButtonElement;
@@ -552,6 +717,7 @@ const reviewerTokenMeter = document.getElementById('reviewer-token-meter') as HT
 let currentReviewerArtifact: { type: 'plan' | 'walkthrough' | 'standalone'; content: string; uri?: string; messageId?: string } | null = null;
 let activeReviewerAssistantEl: HTMLElement | null = null;
 let activeReviewerAssistantContentEl: HTMLElement | null = null;
+let reviewerProgressManager: ReviewerProgressManager | null = null;
 let currentSelectedReviewerText = '';
 let activeReviewerSessionId = '';
 let activeReviewerModelId = '';
@@ -563,9 +729,41 @@ let previousCapabilities: {
   supportsTools: boolean;
   supportsReasoningEffort?: boolean;
   supportedReasoningEfforts?: string[];
+  isAgentic?: boolean;
 } | null = null;
 let currentReasoningEffort: string | undefined = undefined;
 let currentSessionTokens = 0;
+
+export function formatExecutionDuration(durationMs?: number): string {
+  if (durationMs === undefined || durationMs === null || isNaN(durationMs) || durationMs <= 0) {
+    return '';
+  }
+  const totalSeconds = durationMs / 1000;
+  if (totalSeconds < 59.95) {
+    return `${totalSeconds.toFixed(1)}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainingSeconds = Math.round(totalSeconds % 60);
+  if (remainingSeconds === 60) {
+    return `${minutes + 1}m 0s`;
+  }
+  return `${minutes}m ${remainingSeconds}s`;
+}
+
+export function createDurationBadge(durationMs: number): HTMLElement {
+  const badge = document.createElement('span');
+  badge.className = 'msg-duration-badge';
+  const formatted = formatExecutionDuration(durationMs);
+  badge.title = `Generation time: ${formatted}`;
+  badge.innerHTML = `
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="10"></circle>
+      <polyline points="12 6 12 12 16 14"></polyline>
+    </svg>
+    <span>${formatted}</span>
+  `;
+  return badge;
+}
 let hiddenZdrModelsCount = 0;
 let isZdrOnlyPolicyActive = true;
 let isWarnOnDataTrainingActive = true;
@@ -588,8 +786,21 @@ interface ProposedEditData {
 
 let loadedModels: ModelOption[] = [];
 let currentModelId = '';
+
+export function getModelDisplayName(modelId?: string): string {
+  if (!modelId) return 'OpenRouter';
+  const found = loadedModels.find((m) => m.id === modelId);
+  if (found && found.name) {
+    return found.name;
+  }
+  const parts = modelId.split('/');
+  const raw = parts.length > 1 ? parts.slice(1).join('/') : parts[0];
+  return raw || modelId;
+}
+
 let activeAssistantMessageEl: HTMLDivElement | null = null;
 let activeAssistantContentEl: HTMLDivElement | null = null;
+let mainProgressManager: MainProgressManager | null = null;
 let lastSentMessage: {
   content: string;
   modelId: string;
@@ -650,21 +861,16 @@ function filterAndRenderModels(filter: string) {
     const title = document.createElement('div');
     title.className = 'combobox-item-title';
     title.textContent = model.name || model.id;
+    titleRow.appendChild(title);
 
-    // Privacy badge in combobox item
-    const zdrBadge = document.createElement('span');
+    // Show ZDR badge only for compliant models; do not show May Train warning badge
     if (model.supports_zdr !== false) {
+      const zdrBadge = document.createElement('span');
       zdrBadge.className = 'combobox-item-zdr ok';
       zdrBadge.textContent = '🛡️ ZDR';
       zdrBadge.title = 'Zero Data Retention / No Training';
-    } else {
-      zdrBadge.className = 'combobox-item-zdr warn';
-      zdrBadge.textContent = '⚠️ May Train';
-      zdrBadge.title = 'Provider may retain or train on data';
+      titleRow.appendChild(zdrBadge);
     }
-
-    titleRow.appendChild(title);
-    titleRow.appendChild(zdrBadge);
 
     const meta = document.createElement('div');
     meta.className = 'combobox-item-meta';
@@ -737,20 +943,16 @@ function filterAndRenderReviewerModels(filter: string) {
     const title = document.createElement('div');
     title.className = 'combobox-item-title';
     title.textContent = model.name || model.id;
+    titleRow.appendChild(title);
 
-    const zdrBadge = document.createElement('span');
+    // Show ZDR badge only for compliant models; do not show May Train warning badge
     if (model.supports_zdr !== false) {
+      const zdrBadge = document.createElement('span');
       zdrBadge.className = 'combobox-item-zdr ok';
       zdrBadge.textContent = '🛡️ ZDR';
       zdrBadge.title = 'Zero Data Retention / No Training';
-    } else {
-      zdrBadge.className = 'combobox-item-zdr warn';
-      zdrBadge.textContent = '⚠️ May Train';
-      zdrBadge.title = 'Provider may retain or train on data';
+      titleRow.appendChild(zdrBadge);
     }
-
-    titleRow.appendChild(title);
-    titleRow.appendChild(zdrBadge);
 
     const meta = document.createElement('div');
     meta.className = 'combobox-item-meta';
@@ -1069,6 +1271,25 @@ window.addEventListener('message', (event) => {
       if (current) {
         modelSearchInput.value = current.name || current.id;
       }
+      // Update any rendered model tags with full friendly display names
+      document.querySelectorAll<HTMLElement>('.role-tag.model-tag').forEach((el) => {
+        const id = el.dataset.modelId || el.title;
+        if (id) {
+          el.textContent = getModelDisplayName(id);
+        }
+      });
+      // If the reviewer view is already visible (e.g. REVIEWER_VIEW_DATA arrived before models loaded),
+      // re-apply the panel model name and reasoning control now that we have the full model list.
+      if (viewReviewer && !viewReviewer.classList.contains('hidden') && activeReviewerModelId) {
+        if (reviewerPanelModelInput) {
+          const foundReviewerModel = loadedModels.find((m) => m.id === activeReviewerModelId);
+          if (foundReviewerModel) {
+            reviewerPanelModelInput.value = foundReviewerModel.name || foundReviewerModel.id;
+          }
+        }
+        updateReviewerPanelReasoningControl(activeReviewerModelId);
+        updateReviewerTokenMeter();
+      }
       break;
 
     case 'SET_SELECTED_MODEL':
@@ -1077,14 +1298,6 @@ window.addEventListener('message', (event) => {
       modelSearchInput.value = found ? found.name || found.id : msg.modelId;
       updateCapabilitiesUI(msg.capabilities, found ? found.name || found.id : msg.modelId);
       updateTokenMeter(currentSessionTokens);
-
-      // Training Warning Banner check
-      if (isWarnOnDataTrainingActive && found && found.supports_zdr === false) {
-        if (capabilityNoticeBanner && capabilityNoticeText) {
-          capabilityNoticeText.textContent = `⚠️ Warning: ${found.name || found.id} does not guarantee Zero Data Retention and may retain or train on inputs.`;
-          capabilityNoticeBanner.classList.remove('hidden');
-        }
-      }
       break;
 
     case 'CONTEXT_PREVIEW_UPDATE':
@@ -1166,22 +1379,45 @@ window.addEventListener('message', (event) => {
     case 'HISTORY_LOADED':
       messagesContainer.innerHTML = '';
       pendingEditsMap.clear();
+      messageAttachmentsMap.clear();
       updatePendingEditsBar();
       if (msg.activeSessionId) {
         activeSessionId = msg.activeSessionId;
       }
       if (msg.messages && Array.isArray(msg.messages)) {
-        msg.messages.forEach((m: { id: string; role: string; content: string; images?: Array<{ name: string; dataUrl: string }>; checkpointId?: string; affectedFiles?: string[] }) => {
-          appendMessage(m.role, m.content, m.images, true, m.id, m.checkpointId, m.affectedFiles);
+        msg.messages.forEach((m: { id: string; role: string; content: string; images?: Array<{ name: string; dataUrl: string }>; checkpointId?: string; affectedFiles?: string[]; executionDurationMs?: number; isAutoRetry?: boolean; userTypedText?: string; attachments?: any[]; model?: string; isIntermediateStep?: boolean }) => {
+          appendMessage(m.role, m.content, m.images, true, m.id, m.checkpointId, m.affectedFiles, m.executionDurationMs, m.isAutoRetry, m.userTypedText, m.attachments, m.model, m.isIntermediateStep);
         });
+
+        // Initialize lastSentMessage from the last user message in history so retry always works
+        const lastUser = [...msg.messages].reverse().find((m: { role: string }) => m.role === 'user');
+        if (lastUser) {
+          lastSentMessage = {
+            content: lastUser.content,
+            modelId: lastUser.model || currentModelId,
+            images: lastUser.images,
+          };
+        }
 
         // Compute/reset session tokens for the loaded conversation
         if (msg.messages.length === 0) {
           updateTokenMeter(0);
+        } else if (typeof msg.lastTotalTokens === 'number' && msg.lastTotalTokens > 0) {
+          updateTokenMeter(msg.lastTotalTokens);
         } else {
-          // Rough approximation: ~4 characters per token across all messages in session
-          const totalChars = msg.messages.reduce((acc: number, m: { content?: string }) => acc + (m.content?.length || 0), 0);
-          updateTokenMeter(Math.round(totalChars / 4));
+          // Fallback 1: check if any message has totalTokens recorded
+          const lastMsgWithTokens = [...msg.messages].reverse().find((m: { totalTokens?: number }) => typeof m.totalTokens === 'number' && m.totalTokens > 0);
+          if (lastMsgWithTokens?.totalTokens) {
+            updateTokenMeter(lastMsgWithTokens.totalTokens);
+          } else {
+            // Fallback 2: ~4 characters per token across all messages in session, including full plan and walkthrough documents
+            const totalChars = msg.messages.reduce(
+              (acc: number, m: { content?: string; planDocument?: string; walkthroughDocument?: string }) =>
+                acc + (m.content?.length || 0) + (m.planDocument?.length || 0) + (m.walkthroughDocument?.length || 0),
+              0
+            );
+            updateTokenMeter(Math.round(totalChars / 4));
+          }
         }
       } else {
         updateTokenMeter(0);
@@ -1193,6 +1429,10 @@ window.addEventListener('message', (event) => {
       break;
 
     case 'MESSAGE_STREAM_START':
+      if (mainProgressManager) {
+        mainProgressManager.cleanupImmediate();
+        mainProgressManager = null;
+      }
       activeAssistantMessageEl = document.createElement('div');
       activeAssistantMessageEl.className = 'message assistant';
       if (msg.messageId) {
@@ -1203,8 +1443,13 @@ window.addEventListener('message', (event) => {
       streamHeader.className = 'message-header';
 
       const roleTag = document.createElement('div');
-      roleTag.className = 'role-tag';
-      roleTag.textContent = 'OpenRouter';
+      roleTag.className = 'role-tag model-tag';
+      const streamModelId = msg.model || currentModelId;
+      roleTag.textContent = getModelDisplayName(streamModelId);
+      if (streamModelId) {
+        roleTag.title = streamModelId;
+        roleTag.dataset.modelId = streamModelId;
+      }
       streamHeader.appendChild(roleTag);
 
       activeAssistantContentEl = document.createElement('div');
@@ -1214,33 +1459,59 @@ window.addEventListener('message', (event) => {
       activeAssistantMessageEl.appendChild(streamHeader);
       activeAssistantMessageEl.appendChild(activeAssistantContentEl);
       messagesContainer.appendChild(activeAssistantMessageEl);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+      mainProgressManager = new MainProgressManager(messagesContainer, activeAssistantMessageEl);
+
+      mainScrollController.scrollToBottom(true);
       updateAllUndoButtonsAvailability();
       break;
 
     case 'MESSAGE_STREAM_CHUNK':
       if (activeAssistantContentEl) {
         activeAssistantContentEl.textContent += msg.chunk;
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        if (mainProgressManager) {
+          mainProgressManager.onChunk(msg.chunk);
+        }
+        mainScrollController.scrollToBottomIfAtBottom();
       }
       break;
 
     case 'MESSAGE_STREAM_DONE':
+      if (mainProgressManager) {
+        mainProgressManager.cleanupImmediate();
+        mainProgressManager = null;
+      }
       if (activeAssistantContentEl) {
         const textToRender = msg.chatSummary || activeAssistantContentEl.textContent || '';
         activeAssistantContentEl.textContent = '';
-        renderFormattedContent(textToRender, activeAssistantContentEl);
+        renderFormattedContent(textToRender, activeAssistantContentEl, 'assistant', false, msg.messageId);
         if (activeAssistantMessageEl) {
           activeAssistantMessageEl.dataset.rawContent = textToRender;
           parseAndRenderActions(textToRender, activeAssistantMessageEl);
+          if (msg.isIntermediateStep) {
+            collapseIntermediateStepDetails(activeAssistantMessageEl, activeAssistantContentEl);
+          }
         }
 
         // Add copy & clarify buttons to header now that content is complete
         if (activeAssistantMessageEl) {
+          if (msg.model) {
+            const roleTag = activeAssistantMessageEl.querySelector<HTMLElement>('.role-tag');
+            if (roleTag) {
+              roleTag.className = 'role-tag model-tag';
+              roleTag.textContent = getModelDisplayName(msg.model);
+              roleTag.title = msg.model;
+              roleTag.dataset.modelId = msg.model;
+            }
+          }
           const header = activeAssistantMessageEl.querySelector('.message-header');
           if (header && !header.querySelector('.message-header-actions')) {
             const headerActions = document.createElement('div');
             headerActions.className = 'message-header-actions';
+
+            if (msg.executionDurationMs) {
+              headerActions.appendChild(createDurationBadge(msg.executionDurationMs));
+            }
 
             const quoteBtn = document.createElement('button');
             quoteBtn.className = 'msg-quote-btn';
@@ -1279,6 +1550,7 @@ window.addEventListener('message', (event) => {
             header.appendChild(headerActions);
           }
         }
+        mainScrollController.scrollToBottomIfAtBottom();
       }
       activeAssistantMessageEl = null;
       activeAssistantContentEl = null;
@@ -1298,6 +1570,13 @@ window.addEventListener('message', (event) => {
       }
       const card = document.getElementById(`edit-card-${msg.editId}`);
       if (card) {
+        // Ensure card stays collapsed behind
+        card.classList.add('collapsed');
+        const toggleBtn = card.querySelector('.diff-toggle-btn');
+        if (toggleBtn) {
+          toggleBtn.textContent = 'Expand Diff ▾';
+        }
+
         // Remove active action buttons (Preview, Apply, Reject) once a choice is made
         const actionsEl = card.querySelector('.diff-actions');
         if (actionsEl) {
@@ -1308,36 +1587,81 @@ window.addEventListener('message', (event) => {
         if (!badge) {
           badge = document.createElement('div');
           badge.id = `edit-status-${msg.editId}`;
-          badge.style.fontSize = '11px';
-          badge.style.padding = '6px 10px';
-          card.appendChild(badge);
+          badge.className = 'diff-status-badge';
+          const rightContainer = card.querySelector('.diff-header-right');
+          if (rightContainer) {
+            rightContainer.prepend(badge);
+          } else {
+            card.appendChild(badge);
+          }
         }
         badge.style.color = msg.success ? '#7ee787' : '#d73a49';
+        badge.style.background = msg.success ? 'rgba(126, 231, 135, 0.1)' : 'rgba(215, 58, 73, 0.1)';
         badge.textContent = msg.success
           ? '✓ Applied'
           : (currentPermissions.applyEdit === 'deny'
               ? '✗ Edit blocked — Code edits permission is set to Denied'
               : '✗ Failed to apply');
+      }
 
-        if (msg.success && msg.checkpointId) {
-          // Tag the latest user message element with the checkpointId/affectedFiles
-          const lastUserMsg = [...messagesContainer.querySelectorAll('.message.user')].at(-1);
-          if (lastUserMsg) {
-            const undoBtn = lastUserMsg.querySelector('.msg-undo-btn') as HTMLButtonElement | null;
-            if (undoBtn) {
-              undoBtn.dataset.checkpointId = msg.checkpointId;
-              const existing: string[] = undoBtn.dataset.affectedFiles
-                ? JSON.parse(undoBtn.dataset.affectedFiles)
-                : [];
-              const card = document.getElementById(`edit-card-${msg.editId}`);
-              const filePathEl = card?.querySelector('.diff-file-path');
+      if (msg.success && msg.checkpointId) {
+        // Tag the latest user message element with the checkpointId/affectedFiles
+        const userMsgs = [...messagesContainer.querySelectorAll('.message.user')];
+        const lastUserMsg = userMsgs.at(-1);
+        if (lastUserMsg) {
+          const undoBtn = lastUserMsg.querySelector('.msg-undo-btn') as HTMLButtonElement | null;
+          if (undoBtn) {
+            undoBtn.dataset.checkpointId = msg.checkpointId;
+            const existing: string[] = undoBtn.dataset.affectedFiles
+              ? JSON.parse(undoBtn.dataset.affectedFiles)
+              : [];
+            if (msg.filePath) {
+              existing.push(msg.filePath);
+            } else if (card) {
+              const filePathEl = card.querySelector('.diff-file-path');
               if (filePathEl?.textContent) {
                 existing.push(filePathEl.textContent);
               }
-              undoBtn.dataset.affectedFiles = JSON.stringify(Array.from(new Set(existing)));
             }
+            undoBtn.dataset.affectedFiles = JSON.stringify(Array.from(new Set(existing)));
           }
         }
+      }
+      break;
+    }
+
+    case 'EDIT_REVERTED': {
+      markEditResolved(msg.editId, 'rejected');
+      const card = document.getElementById(`edit-card-${msg.editId}`);
+      if (card) {
+        card.classList.add('collapsed');
+        const actionsEl = card.querySelector('.diff-actions');
+        if (actionsEl) {
+          actionsEl.innerHTML = '';
+        }
+        let badge = document.getElementById(`edit-status-${msg.editId}`);
+        if (!badge) {
+          badge = document.createElement('div');
+          badge.id = `edit-status-${msg.editId}`;
+          badge.className = 'diff-status-badge';
+          const rightContainer = card.querySelector('.diff-header-right');
+          if (rightContainer) {
+            rightContainer.prepend(badge);
+          } else {
+            card.appendChild(badge);
+          }
+        }
+        badge.style.color = '#f85149';
+        badge.style.background = 'rgba(215, 58, 73, 0.1)';
+        badge.textContent = '↩️ Reverted';
+      }
+      const revItem = pendingEditsMap.get(msg.editId);
+      if (revItem) {
+        pendingEditsMap.delete(msg.editId);
+        if (revItem.cardEl) {
+          revItem.cardEl.remove();
+        }
+        updatePendingEditsBar();
       }
       break;
     }
@@ -1350,6 +1674,10 @@ window.addEventListener('message', (event) => {
       if (undoBtn) {
         const span = undoBtn.querySelector('span');
         if (span) span.textContent = 'Undo';
+      }
+
+      if (msg.success) {
+        updateTokenMeter(msg.remainingTokens ?? 0);
       }
 
       if (msg.success && msg.truncatedAfterId) {
@@ -1365,6 +1693,9 @@ window.addEventListener('message', (event) => {
                 pendingEditsMap.delete(editId);
               }
             }
+            if (el.id && el.id.startsWith('msg-')) {
+              messageAttachmentsMap.delete(el.id.replace('msg-', ''));
+            }
             
             // Kill any active transitions and hide before removing to prevent compositor ghosting bugs
             el.style.transition = 'none';
@@ -1372,13 +1703,72 @@ window.addEventListener('message', (event) => {
             el.remove();
           }
 
-          // Auto-fill input box with the undone message text
-          const rawText = targetMsg.dataset.rawContent;
-          if (rawText) {
-            promptInput.value = rawText;
+          // Auto-fill input box with the undone message text and reattach attachments
+          const targetId = msg.truncatedAfterId || (targetMsg.id ? targetMsg.id.replace('msg-', '') : '');
+          let textToRestore = '';
+          let attachmentsToRestore: ChatInputAttachment[] = [];
+
+          const inMemory = messageAttachmentsMap.get(targetId);
+          if (inMemory) {
+            textToRestore = inMemory.typedText;
+            attachmentsToRestore = inMemory.attachments;
+          } else if (targetMsg.dataset.userTypedText !== undefined || targetMsg.dataset.attachments) {
+            textToRestore = targetMsg.dataset.userTypedText || '';
+            if (targetMsg.dataset.attachments) {
+              try {
+                attachmentsToRestore = JSON.parse(targetMsg.dataset.attachments);
+              } catch {
+                attachmentsToRestore = [];
+              }
+            }
+          } else {
+            // Fallback for legacy messages without saved attachment metadata
+            const parsed = extractAttachmentsAndPrompt(targetMsg.dataset.rawContent || '');
+            if (!parsed.attachments.some((a) => a.isImage)) {
+              const thumbs = Array.from(targetMsg.querySelectorAll<HTMLImageElement>('.message-attachment-thumb'));
+              thumbs.forEach((thumb, idx) => {
+                if (thumb.src) {
+                  parsed.attachments.push({
+                    id: `img-${Date.now()}-${idx}`,
+                    name: thumb.alt || 'Image attachment',
+                    data: thumb.src,
+                    isImage: true,
+                  });
+                }
+              });
+            }
+            textToRestore = parsed.cleanText;
+            attachmentsToRestore = parsed.attachments;
+          }
+
+          if (mainChatInputController) {
+            mainChatInputController.clearAttachments();
+            if (attachmentsToRestore && attachmentsToRestore.length > 0) {
+              attachmentsToRestore.forEach((att) => {
+                mainChatInputController.addAttachment(
+                  att.name,
+                  att.data,
+                  att.isImage,
+                  att.isArtifact,
+                  att.artifactType,
+                  att.isQuote,
+                  att.isReviewerFeedback,
+                  att.uri,
+                  att.filePath
+                );
+              });
+            }
+          }
+
+          if (textToRestore !== undefined) {
+            promptInput.value = textToRestore;
+            promptInput.style.height = 'auto';
+            promptInput.style.height = `${Math.min(promptInput.scrollHeight, 120)}px`;
             promptInput.focus();
             promptInput.dispatchEvent(new Event('input', { bubbles: true }));
           }
+
+          messageAttachmentsMap.delete(targetId);
 
           // Kill transitions and remove the target user message itself
           targetMsg.style.transition = 'none';
@@ -1430,7 +1820,7 @@ window.addEventListener('message', (event) => {
       break;
 
     case 'REVIEWER_STREAM_DONE':
-      handleReviewerStreamDone();
+      handleReviewerStreamDone(msg.executionDurationMs);
       break;
 
     case 'REVIEWER_STREAM_ERROR':
@@ -1453,26 +1843,156 @@ window.addEventListener('message', (event) => {
       break;
 
     case 'MESSAGE_RECEIVED':
-      appendMessage(msg.message.role, msg.message.content, msg.message.images);
+      appendMessage(
+        msg.message.role,
+        msg.message.content,
+        msg.message.images,
+        false,
+        msg.message.id,
+        msg.message.checkpointId,
+        msg.message.affectedFiles,
+        msg.message.executionDurationMs,
+        msg.message.isAutoRetry,
+        (msg.message as any).userTypedText,
+        (msg.message as any).attachments,
+        (msg.message as any).model,
+        (msg.message as any).isIntermediateStep
+      );
+      break;
+
+    case 'TERMINAL_RUNNING': {
+      const allCards = Array.from(document.querySelectorAll<HTMLElement>('.terminal-card'));
+      allCards.filter((c) => c.dataset.command === msg.command).forEach((card) => {
+        const runBtn = card.querySelector('.terminal-run-btn') as HTMLButtonElement | null;
+        if (runBtn) {
+          runBtn.disabled = true;
+          runBtn.textContent = '⏳ Running...';
+        }
+      });
+      break;
+    }
+
+    case 'TERMINAL_RESULT': {
+      const allCards = Array.from(document.querySelectorAll<HTMLElement>('.terminal-card'));
+      allCards.filter((c) => c.dataset.command === msg.command).forEach((card) => {
+        const runBtn = card.querySelector('.terminal-run-btn') as HTMLButtonElement | null;
+        if (runBtn) {
+          runBtn.disabled = false;
+          runBtn.textContent = '↻ Re-run';
+        }
+
+        // When runTerminalCommand is 'allow' and this command was executed automatically (no runBtn),
+        // the extension posts a dedicated Terminal chat summary message containing the output and exit code.
+        // Skipping statusEl injection on the inline card prevents duplicate terminal output blocks in the chat feed.
+        if (currentPermissions.runTerminalCommand === 'allow' && !runBtn) {
+          return;
+        }
+
+        let statusEl = card.querySelector('.terminal-status-result') as HTMLElement | null;
+        if (!statusEl) {
+          statusEl = document.createElement('div');
+          statusEl.className = 'terminal-status-result';
+          statusEl.style.padding = '6px 10px';
+          statusEl.style.fontSize = '12px';
+          statusEl.style.display = 'flex';
+          statusEl.style.flexDirection = 'column';
+          statusEl.style.gap = '4px';
+          statusEl.style.borderTop = '1px solid rgba(255, 255, 255, 0.08)';
+          card.appendChild(statusEl);
+        }
+
+        let badgeHtml = '';
+        if (msg.cancelled) {
+          badgeHtml = `<span style="color: #d73a49; font-weight: 500;">⚠️ Cancelled by user</span>`;
+        } else if (msg.timedOut) {
+          badgeHtml = `<span style="color: #e3b341; font-weight: 500;">⏰ Timed out after 60s (Process killed)</span>`;
+        } else if (msg.error) {
+          badgeHtml = `<span style="color: #d73a49; font-weight: 500;">✗ Error: ${escapeHtml(msg.error)}</span>`;
+        } else if (msg.exitCode === 0) {
+          badgeHtml = `<span style="color: #7ee787; font-weight: 500;">✓ Completed (Exit Code: 0)</span>`;
+        } else {
+          badgeHtml = `<span style="color: #d73a49; font-weight: 500;">✗ Failed (Exit Code: ${msg.exitCode ?? 'non-zero'})</span>`;
+        }
+
+        const combinedOutput = (msg.stdout + (msg.stderr ? (msg.stdout ? '\n' : '') + msg.stderr : '')).trim();
+        let outputDetailsHtml = '';
+        if (combinedOutput) {
+          outputDetailsHtml = `
+            <details style="margin-top: 4px; background: rgba(0,0,0,0.2); border-radius: 4px; padding: 4px 8px;">
+              <summary style="cursor: pointer; opacity: 0.85; font-size: 11px;">View Output (${combinedOutput.length} chars)</summary>
+              <pre style="margin: 6px 0 0 0; white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; font-family: monospace; font-size: 11px; opacity: 0.9;">${escapeHtml(combinedOutput)}</pre>
+            </details>
+          `;
+        } else {
+          outputDetailsHtml = `<span style="font-size: 11px; opacity: 0.6; font-style: italic;">(No output produced)</span>`;
+        }
+
+        statusEl.innerHTML = badgeHtml + outputDetailsHtml;
+      });
+      break;
+    }
+
+    case 'AGENT_PROGRESS':
+      if (mainProgressManager) {
+        mainProgressManager.setStep(msg.label, msg.detail);
+      }
+      if (statusText) {
+        const fullText = msg.detail ? `${msg.label}: ${msg.detail}` : msg.label;
+        statusText.textContent = fullText;
+        if (msg.phase === 'verifying' || fullText.toLowerCase().includes('terminal')) {
+          statusText.style.color = '#e3b341';
+        } else if (msg.phase === 'writing' || fullText.toLowerCase().includes('edit')) {
+          statusText.style.color = '#79c0ff';
+        } else if (msg.phase === 'thinking') {
+          statusText.style.color = '#d2a8ff';
+        } else {
+          statusText.style.color = '';
+        }
+      }
       break;
 
     case 'SET_BUSY':
       if (msg.busy) {
         sendBtn.classList.add('hidden');
-        if (stopBtn) stopBtn.classList.remove('hidden');
+        if (stopBtn) {
+          stopBtn.classList.remove('hidden');
+          stopBtn.title = msg.statusText ? `Stop (${msg.statusText})` : 'Stop generating';
+        }
         promptInput.disabled = true;
-        statusText.textContent = 'Generating...';
+        const text = msg.statusText || 'Generating...';
+        statusText.textContent = text;
+        if (text.toLowerCase().includes('terminal')) {
+          statusText.style.color = '#e3b341';
+        } else if (text.toLowerCase().includes('edit')) {
+          statusText.style.color = '#79c0ff';
+        } else if (text.toLowerCase().includes('thinking')) {
+          statusText.style.color = '#d2a8ff';
+        } else {
+          statusText.style.color = '';
+        }
+        if (mainProgressManager && msg.statusText) {
+          mainProgressManager.setStep(msg.statusText);
+        }
       } else {
+        if (mainProgressManager) {
+          mainProgressManager.cleanupImmediate();
+          mainProgressManager = null;
+        }
         if (stopBtn) stopBtn.classList.add('hidden');
         sendBtn.classList.remove('hidden');
         sendBtn.disabled = false;
         promptInput.disabled = false;
-        statusText.textContent = 'Ready';
+        statusText.textContent = msg.statusText || 'Ready';
+        statusText.style.color = '';
       }
       break;
 
     case 'ERROR': {
       statusText.textContent = `Error: ${msg.message}`;
+
+      const hadPartialContent = Boolean(
+        activeAssistantContentEl && (activeAssistantContentEl.textContent || '').trim().length > 0
+      );
 
       // Render an in-chat error card with a retry button
       const errorCard = document.createElement('div');
@@ -1501,6 +2021,7 @@ window.addEventListener('message', (event) => {
             modelId: lastSentMessage.modelId || currentModelId,
             images: lastSentMessage.images,
             reasoningEffort: lastSentMessage.reasoningEffort,
+            isRetry: true,
           });
         });
 
@@ -1508,14 +2029,43 @@ window.addEventListener('message', (event) => {
         errorCard.appendChild(actionsDiv);
       }
 
-      if (activeAssistantMessageEl) {
-        activeAssistantMessageEl.appendChild(errorCard);
-      } else {
+      if (!hadPartialContent) {
+        // Case 1: Zero chunks received, then failure
+        if (mainProgressManager) {
+          mainProgressManager.cleanupImmediate();
+          mainProgressManager = null;
+        }
+        if (activeAssistantMessageEl?.parentNode) {
+          activeAssistantMessageEl.remove();
+        }
         messagesContainer.appendChild(errorCard);
+        activeAssistantMessageEl = null;
+        activeAssistantContentEl = null;
+        mainScrollController.scrollToBottomIfAtBottom();
+      } else {
+        // Case 2: Partial stream received, then failure
+        const bubbleToMount = activeAssistantMessageEl;
+        activeAssistantMessageEl = null;
+        activeAssistantContentEl = null;
+
+        const mountErrorBadge = () => {
+          if (bubbleToMount) {
+            bubbleToMount.appendChild(errorCard);
+          } else {
+            messagesContainer.appendChild(errorCard);
+          }
+          mainScrollController.scrollToBottomIfAtBottom();
+        };
+
+        if (mainProgressManager) {
+          const mgr = mainProgressManager;
+          mainProgressManager = null;
+          mgr.cleanupWithFade(mountErrorBadge);
+        } else {
+          mountErrorBadge();
+        }
       }
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
-      activeAssistantMessageEl = null;
-      activeAssistantContentEl = null;
+      updateAllUndoButtonsAvailability();
       break;
     }
 
@@ -1539,32 +2089,34 @@ window.addEventListener('message', (event) => {
 function parseAndRenderActions(content: string, parentEl: HTMLDivElement | null, isHistory = false) {
   if (!parentEl) return;
 
-  // 1. Detect file creation/edit blocks: ```create_file:path/to/file or ```edit_file:path/to/file
-  // Also supports optional language tag: ```create_file:path/to/file:markdown or ```file:path
-  const fileActionRegex = /```(?:create_file|edit_file|file):([^\r\n]+)\r?\n([\s\S]*?)```/gi;
+  // 1. Fallback: check if edit proposals were not yet rendered inline in parentEl
+  const fileActionRegex = /(?:```|````)(?:create_file|edit_file|file|create|edit|patch|(?!plan|walkthrough)[a-zA-Z0-9_-]+):([^\r\n]+)\r?\n((?:[\s\S]*?<<<< SEARCH[\s\S]*?\n>>>>[^\r\n]*|[\s\S]*?))\r?\n(?:```|````)/gi;
   let fileMatch;
   let editCount = 0;
-  const editProposals: { filePath: string; newContent: string; editId: string }[] = [];
+  const baseId = parentEl.id ? parentEl.id.replace('msg-', '') : Date.now();
   while ((fileMatch = fileActionRegex.exec(content)) !== null) {
-    editCount++;
     let filePath = fileMatch[1].trim();
-    // In case model adds a language specifier like "prd.md:markdown",
-    // we only want to split if the colon is NOT part of a Windows drive letter.
+    if (!filePath.includes('.') && !filePath.includes('/') && !filePath.includes('\\')) {
+      continue;
+    }
+    editCount++;
     const lastColon = filePath.lastIndexOf(':');
-    // If there's a colon and it's not the first character after a drive letter (e.g. C:\)
     if (lastColon > 1) {
       const afterColon = filePath.substring(lastColon + 1).trim();
-      // If the part after the colon looks like a language tag (no slashes)
       if (!afterColon.includes('/') && !afterColon.includes('\\')) {
         filePath = filePath.substring(0, lastColon).trim();
       }
     }
     const newContent = fileMatch[2];
-    const editId = `${Date.now()}-${editCount}`;
-    editProposals.push({ filePath, newContent, editId });
+    const editId = `${baseId}-edit-${editCount}`;
+
+    // Only render if not already rendered inline in parentEl
+    if (!parentEl.querySelector(`#edit-card-${editId}`)) {
+      renderEditProposal(editId, { filePath, newContent }, parentEl, isHistory);
+    }
   }
 
-  if (editProposals.length > 0 && currentPermissions.applyEdit === 'deny') {
+  if (editCount > 0 && currentPermissions.applyEdit === 'deny' && !parentEl.querySelector('.edit-denied-notice')) {
     const notice = document.createElement('div');
     notice.className = 'edit-denied-notice';
     notice.style.margin = '8px 0';
@@ -1578,30 +2130,165 @@ function parseAndRenderActions(content: string, parentEl: HTMLDivElement | null,
     parentEl.appendChild(notice);
   }
 
-  for (const item of editProposals) {
-    renderEditProposal(
-      item.editId,
-      {
-        filePath: item.filePath,
-        newContent: item.newContent,
-      },
-      parentEl,
-      isHistory
-    );
-  }
-
   // 2. Detect bash / terminal command blocks ```bash\ncommand\n```
   const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
   let match;
   while ((match = bashRegex.exec(content)) !== null) {
     const command = match[1].trim();
     if (command) {
-      renderTerminalRunAction(command, parentEl);
+      if (isReadOnly(command)) {
+        continue;
+      }
+      // If terminal execution is set to allow or allow_session, terminal commands run automatically
+      // and are displayed in the compact terminal run dropdown. Do not render manual card.
+      const isAllowed = currentPermissions.runTerminalCommand === 'allow' || currentPermissions.runTerminalCommand === 'allow_session';
+      if (isAllowed) {
+        continue;
+      }
+      const alreadyHas = Array.from(parentEl.querySelectorAll('.terminal-card')).some(
+        (el) => (el as HTMLElement).dataset.command === command
+      );
+      if (!alreadyHas) {
+        renderTerminalRunAction(command, parentEl);
+      }
     }
   }
 
   // 3. Detect Task Summary sections (e.g. "### Summary of changes", "**Task Summary:**", "### Task Summary", etc.)
-  renderTaskSummaryCard(content, parentEl);
+  if (!parentEl.querySelector('.task-summary-card')) {
+    renderTaskSummaryCard(content, parentEl);
+  }
+
+  // 4. Render interactive Retry Button if response indicates empty completion or provider failure
+  if (content.includes('⚠️ The model returned an empty response') && !parentEl.querySelector('.empty-response-banner')) {
+    const banner = document.createElement('div');
+    banner.className = 'empty-response-banner';
+
+    const retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.className = 'empty-response-retry-btn';
+    retryBtn.innerHTML = `
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="1 4 1 10 7 10"></polyline>
+        <path d="M3.51 15a9 9 0 1 0 .49-3.51"></path>
+      </svg>
+      <span>Retry Prompt</span>
+    `;
+
+    retryBtn.addEventListener('click', () => {
+      if (lastSentMessage) {
+        retryBtn.disabled = true;
+        const span = retryBtn.querySelector('span');
+        if (span) span.textContent = 'Retrying...';
+        vscode.postMessage({
+          type: 'SEND_MESSAGE',
+          content: lastSentMessage.content,
+          modelId: currentModelId || lastSentMessage.modelId,
+          images: lastSentMessage.images,
+          reasoningEffort: lastSentMessage.reasoningEffort,
+          isRetry: true,
+        });
+      }
+    });
+
+    banner.appendChild(retryBtn);
+    parentEl.appendChild(banner);
+  }
+}
+
+export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, bodyEl: HTMLElement | null) {
+  if (!bodyEl) return;
+
+  // 1. Check if this message has action cards or code blocks
+  const hasActionCards = Boolean(
+    bodyEl.querySelector('.terminal-card, .diff-card, .chat-artifact-card, .task-summary-card') ||
+    (messageEl && messageEl.querySelector('.terminal-card, .diff-card, .chat-artifact-card, .task-summary-card'))
+  );
+
+  const hasCodeBlocks = Boolean(
+    bodyEl.querySelector('.code-block-wrapper, pre')
+  );
+
+  // If there are no actions or code blocks in this step, do not collapse
+  if (!hasActionCards && !hasCodeBlocks) {
+    return;
+  }
+
+  // Already collapsed guard
+  if (bodyEl.querySelector('.intermediate-step-details')) {
+    return;
+  }
+
+  // 2. Identify all top-level commentary elements inside bodyEl
+  const commentaryNodes: HTMLElement[] = [];
+  const children = Array.from(bodyEl.children) as HTMLElement[];
+  for (const child of children) {
+    const isAction =
+      child.classList.contains('code-block-wrapper') ||
+      child.classList.contains('terminal-card') ||
+      child.classList.contains('diff-card') ||
+      child.classList.contains('chat-artifact-card') ||
+      child.classList.contains('task-summary-card') ||
+      child.classList.contains('message-attachments-bar') ||
+      child.classList.contains('empty-response-banner');
+
+    if (!isAction) {
+      commentaryNodes.push(child);
+    }
+  }
+
+  if (commentaryNodes.length === 0) {
+    return;
+  }
+
+  // 3. Check for errors or warnings
+  const fullText = commentaryNodes.map((n) => n.textContent || '').join(' ');
+  if (!fullText.trim()) {
+    return;
+  }
+
+  const hasErrorOrWarning =
+    fullText.includes('⚠️') ||
+    fullText.includes('❌') ||
+    /\b(failed|error|blocked|denied)\b/i.test(fullText);
+
+  // 4. Create details drawer
+  const details = document.createElement('details');
+  details.className = 'intermediate-step-details';
+  if (hasErrorOrWarning) {
+    (details as any).open = true;
+  }
+
+  const summary = document.createElement('summary');
+  summary.className = 'intermediate-step-summary';
+  summary.title = 'Click to expand or collapse step commentary';
+
+  const icon = document.createElement('span');
+  icon.className = 'intermediate-step-icon';
+  icon.textContent = '▸';
+
+  const label = document.createElement('span');
+  label.className = 'intermediate-step-label';
+  label.textContent = hasErrorOrWarning ? 'Step Notes (Attention Needed)' : 'Step Notes';
+
+  summary.appendChild(icon);
+  summary.appendChild(label);
+  details.appendChild(summary);
+
+  const contentDiv = document.createElement('div');
+  contentDiv.className = 'intermediate-step-body';
+
+  commentaryNodes.forEach((node) => {
+    if (typeof (node as any).remove === 'function') {
+      (node as any).remove();
+    } else if (node.parentElement) {
+      node.parentElement.removeChild(node);
+    }
+    contentDiv.appendChild(node);
+  });
+
+  details.appendChild(contentDiv);
+  bodyEl.appendChild(details);
 }
 
 function renderTaskSummaryCard(content: string, parentEl: HTMLElement) {
@@ -1631,11 +2318,12 @@ function renderTaskSummaryCard(content: string, parentEl: HTMLElement) {
 
 function renderTerminalRunAction(command: string, parentEl: HTMLElement) {
   const card = document.createElement('div');
-  card.className = 'diff-card';
+  card.className = 'diff-card terminal-card';
+  card.dataset.command = command;
 
   const header = document.createElement('div');
   header.className = 'diff-header';
-  header.innerHTML = `<span>Terminal Command</span><span style="font-family: monospace; opacity: 0.8;">${escapeHtml(command.slice(0, 30))}</span>`;
+  header.innerHTML = `<span>Terminal Command</span><span style="font-family: monospace; opacity: 0.8;">${escapeHtml(command.slice(0, 40))}</span>`;
 
   const actions = document.createElement('div');
   actions.className = 'diff-actions';
@@ -1656,12 +2344,25 @@ function renderTerminalRunAction(command: string, parentEl: HTMLElement) {
     actions.appendChild(statusSpan);
   } else {
     const runBtn = document.createElement('button');
-    runBtn.className = 'btn';
-    runBtn.textContent = '▶ Run in Terminal';
+    runBtn.className = 'btn terminal-run-btn';
+    runBtn.textContent = '▶ Run Command';
     runBtn.addEventListener('click', () => {
+      runBtn.disabled = true;
+      runBtn.textContent = '⏳ Running...';
       vscode.postMessage({ type: 'RUN_TERMINAL', command });
     });
     actions.appendChild(runBtn);
+
+    const termBtn = document.createElement('button');
+    termBtn.className = 'btn btn-secondary';
+    termBtn.style.fontSize = '11px';
+    termBtn.style.opacity = '0.75';
+    termBtn.title = 'Run in interactive VS Code integrated terminal';
+    termBtn.textContent = 'Integrated Terminal';
+    termBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'RUN_TERMINAL', command, interactive: true });
+    });
+    actions.appendChild(termBtn);
   }
 
   card.appendChild(header);
@@ -1705,7 +2406,11 @@ function updatePendingEditsBar() {
     const fileSpan = document.createElement('span');
     fileSpan.className = 'pending-edit-file';
     fileSpan.textContent = item.filePath;
-    fileSpan.title = item.filePath;
+    fileSpan.title = 'Click to open file in editor';
+    fileSpan.style.cursor = 'pointer';
+    fileSpan.addEventListener('click', () => {
+      vscode.postMessage({ type: 'OPEN_FILE', filePath: item.filePath });
+    });
     info.appendChild(fileSpan);
 
     const actions = document.createElement('div');
@@ -1782,7 +2487,7 @@ function rejectSinglePendingEdit(editId: string) {
     item.cardEl.remove();
   }
 
-  vscode.postMessage({ type: 'REJECT_EDIT', editId });
+  vscode.postMessage({ type: 'REJECT_EDIT', editId, filePath: item.filePath });
 }
 
 // Bulk Actions: Apply All and Reject All (PRD Item 3 & Item 5)
@@ -1795,6 +2500,15 @@ if (applyAllEditsBtn) {
     pendingList.forEach((item) => {
       markEditResolved(item.editId, 'applied');
       if (item.cardEl) {
+        item.cardEl.classList.add('collapsed');
+        const toggleBtn = item.cardEl.querySelector('.diff-toggle-btn');
+        if (toggleBtn) toggleBtn.textContent = 'Expand Diff ▾';
+        const badge = document.getElementById(`edit-status-${item.editId}`);
+        if (badge) {
+          badge.style.color = '#7ee787';
+          badge.style.background = 'rgba(126, 231, 135, 0.1)';
+          badge.textContent = '✓ Applied';
+        }
         const cardApplyBtn = item.cardEl.querySelector('.btn') as HTMLButtonElement;
         if (cardApplyBtn) cardApplyBtn.disabled = true;
       }
@@ -1825,7 +2539,7 @@ if (rejectAllEditsBtn) {
       if (item.cardEl) {
         item.cardEl.remove();
       }
-      vscode.postMessage({ type: 'REJECT_EDIT', editId: item.editId });
+      vscode.postMessage({ type: 'REJECT_EDIT', editId: item.editId, filePath: item.filePath });
     });
 
     pendingEditsMap.clear();
@@ -1842,57 +2556,63 @@ function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: H
     return;
   }
 
+  // Prevent duplicate cards for the same editId
+  if (document.getElementById(`edit-card-${editId}`)) {
+    return;
+  }
+
   const card = document.createElement('div');
-  card.className = 'diff-card';
+  card.className = 'diff-card collapsed';
   card.id = `edit-card-${editId}`;
+
+  const lines = edit.newContent.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const lineCountText = `${lines.length} line${lines.length === 1 ? '' : 's'} written`;
 
   const header = document.createElement('div');
   header.className = 'diff-header';
-  header.innerHTML = `<span>Proposed File</span><span class="diff-file-path">${escapeHtml(edit.filePath)}</span>`;
-  card.appendChild(header);
+  header.style.cursor = 'pointer';
+  header.title = 'Click to expand or collapse edit diff';
 
-  // Fail-safe render of the code block body
-  try {
-    const body = document.createElement('div');
-    body.className = 'diff-body';
-    body.style.marginTop = '8px'; // Add some spacing between header and code
-    renderCodeBlock(edit.filePath, edit.newContent, body, document);
-    card.appendChild(body);
-  } catch (e) {
-    // Ultimate fallback if UI code block fails
-    const fallbackBody = document.createElement('pre');
-    fallbackBody.textContent = edit.newContent;
-    card.appendChild(fallbackBody);
+  const leftContainer = document.createElement('div');
+  leftContainer.className = 'diff-header-left';
+  leftContainer.innerHTML = `
+    <span class="diff-header-icon" style="opacity: 0.7; margin-right: 4px;">📁</span>
+    <span class="diff-header-label" style="opacity: 0.85; font-weight: 500; margin-right: 6px;">Proposed Edit:</span>
+    <span class="diff-file-path" style="cursor: pointer; text-decoration: underline;" title="Click to open file in editor">${escapeHtml(edit.filePath)}</span>
+    <span class="diff-line-count" style="opacity: 0.65; margin-left: 8px; font-size: 11px;">(${lineCountText})</span>
+  `;
+  const filePathEl = leftContainer.querySelector('.diff-file-path');
+  if (filePathEl) {
+    filePathEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'OPEN_FILE', filePath: edit.filePath });
+    });
   }
 
+  const rightContainer = document.createElement('div');
+  rightContainer.className = 'diff-header-right';
+
+  const badge = document.createElement('div');
+  badge.id = `edit-status-${editId}`;
+  badge.className = 'diff-status-badge';
+
   if (previousResolution?.status === 'applied') {
-    // Already applied in this conversation: show clean status badge
-    const badge = document.createElement('div');
-    badge.id = `edit-status-${editId}`;
     badge.style.color = '#7ee787';
-    badge.style.fontSize = '11px';
-    badge.style.padding = '6px 10px';
+    badge.style.background = 'rgba(126, 231, 135, 0.1)';
     badge.textContent = '✓ Applied';
-    card.appendChild(badge);
-  } else if (currentPermissions.applyEdit === 'allow') {
-    // Under Allow: Edit is auto-applied by host with zero manual interaction
-    const badge = document.createElement('div');
-    badge.id = `edit-status-${editId}`;
+  } else if (currentPermissions.applyEdit === 'allow' || currentPermissions.applyEdit === 'allow_session') {
     badge.style.color = '#7ee787';
-    badge.style.fontSize = '11px';
-    badge.style.padding = '6px 10px';
+    badge.style.background = 'rgba(126, 231, 135, 0.1)';
     badge.textContent = '✓ Applied automatically';
-    card.appendChild(badge);
   } else if (currentPermissions.applyEdit === 'deny') {
-    // Under Deny: Edit is blocked by permission settings
-    const badge = document.createElement('div');
-    badge.id = `edit-status-${editId}`;
     badge.style.color = '#d73a49';
-    badge.style.fontSize = '11px';
-    badge.style.padding = '6px 10px';
-    badge.textContent = '✗ Edit blocked — Code edits permission is set to Denied';
-    card.appendChild(badge);
+    badge.style.background = 'rgba(215, 58, 73, 0.1)';
+    badge.textContent = '✗ Edit blocked';
   } else {
+    badge.style.color = '#e3b341';
+    badge.style.background = 'rgba(227, 179, 65, 0.1)';
+    badge.textContent = '⏳ Pending';
+
     // Unresolved proposal (Ask mode): track in pending edits bar if active turn
     if (!isHistory) {
       pendingEditsMap.set(editId, {
@@ -1902,7 +2622,73 @@ function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: H
         cardEl: card,
       });
       updatePendingEditsBar();
+
+      // Inline Accept and Reject action buttons on the card itself
+      const actionsWrapper = document.createElement('div');
+      actionsWrapper.className = 'diff-actions';
+      actionsWrapper.style.display = 'inline-flex';
+      actionsWrapper.style.gap = '6px';
+      actionsWrapper.style.alignItems = 'center';
+      actionsWrapper.style.marginRight = '6px';
+
+      const cardAcceptBtn = document.createElement('button');
+      cardAcceptBtn.className = 'btn btn-sm';
+      cardAcceptBtn.textContent = 'Accept';
+      cardAcceptBtn.title = 'Accept and confirm this change';
+      cardAcceptBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        applySinglePendingEdit(editId);
+      });
+
+      const cardRejectBtn = document.createElement('button');
+      cardRejectBtn.className = 'btn secondary btn-sm';
+      cardRejectBtn.textContent = 'Reject';
+      cardRejectBtn.title = 'Reject and undo this change';
+      cardRejectBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        rejectSinglePendingEdit(editId);
+      });
+
+      actionsWrapper.appendChild(cardAcceptBtn);
+      actionsWrapper.appendChild(cardRejectBtn);
+      rightContainer.appendChild(actionsWrapper);
     }
+  }
+  rightContainer.appendChild(badge);
+
+  const toggleBtn = document.createElement('button');
+  toggleBtn.className = 'diff-toggle-btn';
+  toggleBtn.type = 'button';
+  toggleBtn.textContent = 'Expand Diff ▾';
+  toggleBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isCollapsed = card.classList.toggle('collapsed');
+    toggleBtn.textContent = isCollapsed ? 'Expand Diff ▾' : 'Collapse Diff ▴';
+  });
+  rightContainer.appendChild(toggleBtn);
+
+  header.addEventListener('click', (e) => {
+    if ((e.target as HTMLElement).classList.contains('diff-file-path')) return;
+    const isCollapsed = card.classList.toggle('collapsed');
+    toggleBtn.textContent = isCollapsed ? 'Expand Diff ▾' : 'Collapse Diff ▴';
+  });
+
+  header.appendChild(leftContainer);
+  header.appendChild(rightContainer);
+  card.appendChild(header);
+
+  // Fail-safe render of the code block body
+  try {
+    const body = document.createElement('div');
+    body.className = 'diff-body';
+    renderCodeBlock(edit.filePath, edit.newContent, body, document);
+    card.appendChild(body);
+  } catch (e) {
+    // Ultimate fallback if UI code block fails
+    const fallbackBody = document.createElement('pre');
+    fallbackBody.className = 'diff-body';
+    fallbackBody.textContent = edit.newContent;
+    card.appendChild(fallbackBody);
   }
 
   if (parentEl) {
@@ -1910,7 +2696,7 @@ function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: H
   } else {
     messagesContainer.appendChild(card);
   }
-  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  mainScrollController.scrollToBottomIfAtBottom();
 }
 
 function escapeHtml(str: string) {
@@ -1924,6 +2710,7 @@ function updateCapabilitiesUI(
     supportsTools: boolean;
     supportsReasoningEffort?: boolean;
     supportedReasoningEfforts?: string[];
+    isAgentic?: boolean;
   },
   modelName?: string
 ) {
@@ -1975,9 +2762,8 @@ function updateCapabilitiesUI(
         currentReasoningEffort = defaultChoice;
       }
     } else {
-      // Model does NOT support reasoning effort: hide dropdown and clear stale effort selection
+      // Model does NOT explicitly support reasoning effort: hide dropdown but preserve user's effort preference
       reasoningEffortContainer.classList.add('hidden');
-      currentReasoningEffort = undefined;
     }
   }
 
@@ -2007,6 +2793,18 @@ function updateCapabilitiesUI(
   } else {
     toolsBadge.classList.remove('active');
     toolsBadge.title = 'No tool calling';
+  }
+
+  if (agenticBadge) {
+    if (caps.isAgentic) {
+      agenticBadge.textContent = '⚡ Agentic';
+      agenticBadge.className = 'badge agentic-badge agentic';
+      agenticBadge.title = 'High instruction adherence — recommended for autonomous multi-file execution';
+    } else {
+      agenticBadge.textContent = '💬 Chat';
+      agenticBadge.className = 'badge agentic-badge chat';
+      agenticBadge.title = 'General chat model — recommended for single-turn code generation & questions';
+    }
   }
 }
 
@@ -2056,17 +2854,63 @@ function updateTokenMeter(tokens: number) {
   }
 }
 
+const FILE_LINK_EXTENSIONS = 'py|js|ts|jsx|tsx|md|markdown|json|html|htm|css|scss|less|yaml|yml|toml|xml|csv|tsv|rs|go|c|cpp|h|hpp|cs|java|sql|sh|bash|bat|cmd|ps1|txt|log|svg|png|jpg|jpeg|gif|webp|pdf';
+
+function cleanTrailingPunctuation(str: string): { clean: string; trailing: string } {
+  const match = str.match(/([.,;:!?)]+)$/);
+  if (match) {
+    return {
+      clean: str.slice(0, str.length - match[1].length),
+      trailing: match[1],
+    };
+  }
+  return { clean: str, trailing: '' };
+}
+
+function createClickableFileLink(filePath: string, displayText?: string): HTMLElement {
+  const cleanPath = filePath.trim().replace(/^["']|["']$/g, '');
+  const fileLink = document.createElement('span');
+  fileLink.className = 'clickable-file-link';
+  fileLink.title = `Click to open ${cleanPath}`;
+  fileLink.innerHTML = `<span style="font-size: 10px; opacity: 0.7;">📄</span> ${escapeHtml(displayText || cleanPath)}`;
+  fileLink.addEventListener('click', (e) => {
+    e.stopPropagation();
+    vscode.postMessage({ type: 'OPEN_FILE', filePath: cleanPath });
+  });
+  return fileLink;
+}
+
 function renderInlineMarkdown(text: string, container: HTMLElement) {
   // Regex pattern matching:
-  // 1. Inline code: `code`
-  // 2. Bold/Italic: ***text***
-  // 3. Bold: **text** or __text__
-  // 4. Italic: *text* or _text_
-  // 5. Clickable file links / standalone filenames: e.g. foo.ts, path/to/file.py
-  const inlineRegex = /(`([^`]+)`)|\*\*\*([^*]+)\*\*\*|\*\*([^*]+)\*\*|__([^_]+)__|(?:\*([^*]+)\*)|(?:_([^_]+)_)|(?:\b)([a-zA-Z0-9_\-./\\]+\.(?:py|js|ts|jsx|tsx|md|json|html|css|yaml|yml|rs|go|c|cpp|h|java|sql|sh|txt))\b/g;
+  // 1. Markdown link: [text](target)
+  // 2. Inline code: `code`
+  // 3. Bold/Italic: ***text***
+  // 4. Bold: **text** or __text__
+  // 5. Italic: *text* or _text_
+  // 6. Quoted file paths: "[path]" or '[path]' (handles spaces & Windows drive letters)
+  // 7. Unquoted Windows/POSIX/relative file paths
+  // 8. Standalone filenames and dotfiles
+  const inlineRegex = new RegExp(
+    '(\\[([^\\]]+)\\]\\(([^)]+)\\))|' +
+    '(`([^`]+)`)' +
+    '|\\*\\*\\*([^*]+)\\*\\*\\*' +
+    '|\\*\\*([^*]+)\\*\\*' +
+    '|__([^_]+)__' +
+    '|(?:\\*([^*]+)\\*)' +
+    '|(?:_([^_]+)_)' +
+    '|["\']([a-zA-Z]:[\\\\/][^"\'\\r\\n]+?\\.(?:' + FILE_LINK_EXTENSIONS + '))["\']' +
+    '|["\']([\\\\/][^"\'\\r\\n]+?\\.(?:' + FILE_LINK_EXTENSIONS + '))["\']' +
+    '|["\']([a-zA-Z0-9_.\\-]+[\\\\/][^"\'\\r\\n]+?\\.(?:' + FILE_LINK_EXTENSIONS + '))["\']' +
+    '|\\b([a-zA-Z]:[\\\\/][a-zA-Z0-9_.\\-\\\\/]+?\\.(?:' + FILE_LINK_EXTENSIONS + '))' +
+    '|(?<=[\\s(^]|^)(\\/[a-zA-Z0-9_.\\-]+(?:\\/[a-zA-Z0-9_.\\-]+)*\\.(?:' + FILE_LINK_EXTENSIONS + '))' +
+    '|\\b([a-zA-Z0-9_.\\-]+(?:[\\\\/][a-zA-Z0-9_.\\-]+)+\\.(?:' + FILE_LINK_EXTENSIONS + '))' +
+    '|\\b([a-zA-Z0-9_\\-]+\\.(?:' + FILE_LINK_EXTENSIONS + '))\\b' +
+    '|(?<=[\\s(^]|^)(\\.(?:env|gitignore|eslintrc|prettierrc|editorconfig|npmrc)(?:\\.[a-zA-Z0-9]+)?)\\b',
+    'g'
+  );
 
   let lastIndex = 0;
-  let match;
+  let match: RegExpExecArray | null;
 
   while ((match = inlineRegex.exec(text)) !== null) {
     const matchStart = match.index;
@@ -2078,52 +2922,67 @@ function renderInlineMarkdown(text: string, container: HTMLElement) {
     }
 
     if (match[1]) {
+      // Markdown link: [text](target)
+      const linkText = match[2];
+      const target = match[3].trim();
+      if (/^https?:\/\//i.test(target)) {
+        const a = document.createElement('a');
+        a.href = target;
+        a.target = '_blank';
+        a.rel = 'noreferrer noopener';
+        a.className = 'chat-external-link';
+        a.textContent = linkText;
+        container.appendChild(a);
+      } else {
+        container.appendChild(createClickableFileLink(target, linkText));
+      }
+    } else if (match[4]) {
       // Inline code
-      const codeContent = match[2];
-      // If code block happens to be a recognized workspace file, make it a file link
-      if (/\.([a-zA-Z0-9]+)$/.test(codeContent.trim())) {
-        const fileLink = document.createElement('span');
-        fileLink.className = 'clickable-file-link';
-        fileLink.title = `Click to open ${codeContent.trim()}`;
-        fileLink.innerHTML = `<span style="font-size: 10px; opacity: 0.7;">📄</span> ${escapeHtml(codeContent.trim())}`;
-        fileLink.addEventListener('click', () => {
-          vscode.postMessage({ type: 'OPEN_FILE', filePath: codeContent.trim() });
-        });
-        container.appendChild(fileLink);
+      const codeContent = match[5];
+      const trimmed = codeContent.trim();
+      // If code block represents a recognized workspace file or path, make it a clickable file link
+      const isFileLike = new RegExp('\\.(' + FILE_LINK_EXTENSIONS + ')$', 'i').test(trimmed) || /^\.(?:env|gitignore)/.test(trimmed);
+      const hasCommandSpaces = /\s/.test(trimmed) && /^(npm|npx|node|python|git|cd|mkdir|move|copy|dir|ls|cat|rm|del)\b/i.test(trimmed);
+
+      if (isFileLike && !hasCommandSpaces) {
+        container.appendChild(createClickableFileLink(trimmed));
       } else {
         const codeEl = document.createElement('code');
         codeEl.className = 'inline-code';
         codeEl.textContent = codeContent;
         container.appendChild(codeEl);
       }
-    } else if (match[3]) {
+    } else if (match[6]) {
       // Bold + Italic
       const strong = document.createElement('strong');
       const em = document.createElement('em');
-      em.textContent = match[3];
+      em.textContent = match[6];
       strong.appendChild(em);
       container.appendChild(strong);
-    } else if (match[4] || match[5]) {
+    } else if (match[7] || match[8]) {
       // Bold
       const strong = document.createElement('strong');
-      strong.textContent = match[4] || match[5];
+      strong.textContent = match[7] || match[8];
       container.appendChild(strong);
-    } else if (match[6] || match[7]) {
+    } else if (match[9] || match[10]) {
       // Italic
       const em = document.createElement('em');
-      em.textContent = match[6] || match[7];
+      em.textContent = match[9] || match[10];
       container.appendChild(em);
-    } else if (match[8]) {
-      // Standalone filename
-      const matchedFile = match[8];
-      const fileLink = document.createElement('span');
-      fileLink.className = 'clickable-file-link';
-      fileLink.title = `Click to open ${matchedFile}`;
-      fileLink.innerHTML = `<span style="font-size: 10px; opacity: 0.7;">📄</span> ${escapeHtml(matchedFile)}`;
-      fileLink.addEventListener('click', () => {
-        vscode.postMessage({ type: 'OPEN_FILE', filePath: matchedFile });
-      });
-      container.appendChild(fileLink);
+    } else if (match[11] || match[12] || match[13]) {
+      // Quoted file path
+      const quotedPath = match[11] || match[12] || match[13];
+      container.appendChild(createClickableFileLink(quotedPath));
+    } else {
+      // Unquoted file path, standalone filename, or dotfile
+      const rawPath = match[14] || match[15] || match[16] || match[17] || match[18];
+      if (rawPath) {
+        const { clean, trailing } = cleanTrailingPunctuation(rawPath);
+        container.appendChild(createClickableFileLink(clean));
+        if (trailing) {
+          container.appendChild(document.createTextNode(trailing));
+        }
+      }
     }
 
     lastIndex = matchEnd;
@@ -2134,36 +2993,27 @@ function renderInlineMarkdown(text: string, container: HTMLElement) {
   }
 }
 
-function renderFormattedContent(rawText: string, container: HTMLElement, role?: string) {
-  // Strip out custom action blocks (create_file, edit_file, etc.) from displayed text 
-  // because they will be rendered as interactive action cards below the message
-  const cleanedText = rawText.replace(/```(?:create_file|edit_file|file):([^\r\n]+)\r?\n([\s\S]*?)```/gi, '').trim();
-
-  // Determine appropriate action verb for code block labels
-  const actionVerb = role === 'user' ? 'pasted' : 'written';
-
-  // Split content by fenced code blocks: ```lang\ncode\n```
+function renderMarkdownAndCode(text: string, container: HTMLElement, actionVerb: string) {
+  if (!text) return;
   const fenceRegex = /```([^\r\n]*)\r?\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let match;
 
-  while ((match = fenceRegex.exec(cleanedText)) !== null) {
-    const preText = cleanedText.slice(lastIndex, match.index);
+  while ((match = fenceRegex.exec(text)) !== null) {
+    const preText = text.slice(lastIndex, match.index);
     if (preText) {
       renderMarkdownBlocks(preText, container);
     }
 
     const lang = (match[1] || 'text').trim();
     const code = match[2];
-    
     renderCodeBlock(lang, code, container, document, { actionVerb });
 
     lastIndex = fenceRegex.lastIndex;
   }
 
-  const remaining = cleanedText.slice(lastIndex);
+  const remaining = text.slice(lastIndex);
   if (remaining) {
-    // Check if remaining ends with an in-progress / unterminated code fence: ```lang\n[code...]
     const openFenceMatch = remaining.match(/```([^\r\n]*)\r?\n([\s\S]*)$/);
     if (openFenceMatch && openFenceMatch.index !== undefined) {
       const preOpenFence = remaining.slice(0, openFenceMatch.index);
@@ -2176,6 +3026,253 @@ function renderFormattedContent(rawText: string, container: HTMLElement, role?: 
     } else {
       renderMarkdownBlocks(remaining, container);
     }
+  }
+}
+
+function renderFormattedContent(rawText: string, container: HTMLElement, role?: string, isHistory = false, messageId?: string) {
+  // Strip any internal AI reasoning/thinking tags so they never appear in the output block
+  rawText = rawText
+    .replace(/<(?:think|thought|thinking)>[\s\S]*?<\/(?:think|thought|thinking)>/gi, '')
+    .replace(/<(?:think|thought|thinking)>[\s\S]*$/gi, '')
+    .trim();
+
+  const actionVerb = role === 'user' ? 'pasted' : 'written';
+  const fileActionRegex = /(?:```|````)(?:create_file|edit_file|file|create|edit|patch|(?!plan|walkthrough)[a-zA-Z0-9_-]+):([^\r\n]+)\r?\n((?:[\s\S]*?<<<< SEARCH[\s\S]*?\n>>>>[^\r\n]*|[\s\S]*?))\r?\n(?:```|````)/gi;
+
+  let lastIndex = 0;
+  let match;
+  let editCount = 0;
+
+  while ((match = fileActionRegex.exec(rawText)) !== null) {
+    let filePath = match[1].trim();
+    if (!filePath.includes('.') && !filePath.includes('/') && !filePath.includes('\\')) {
+      continue;
+    }
+    const preText = rawText.slice(lastIndex, match.index);
+    if (preText) {
+      renderMarkdownAndCode(preText, container, actionVerb);
+    }
+
+    editCount++;
+    const lastColon = filePath.lastIndexOf(':');
+    if (lastColon > 1) {
+      const afterColon = filePath.substring(lastColon + 1).trim();
+      if (!afterColon.includes('/') && !afterColon.includes('\\')) {
+        filePath = filePath.substring(0, lastColon).trim();
+      }
+    }
+    const newContent = match[2];
+    const baseId = messageId || (container.closest('.message')?.id?.replace('msg-', '')) || Date.now();
+    const editId = `${baseId}-edit-${editCount}`;
+
+    renderEditProposal(editId, { filePath, newContent }, container, isHistory);
+
+    lastIndex = fileActionRegex.lastIndex;
+  }
+
+  const remaining = rawText.slice(lastIndex);
+  if (remaining) {
+    renderMarkdownAndCode(remaining, container, actionVerb);
+  }
+}
+
+export function renderCollapsibleTerminalOutput(code: string, lang: string, container: HTMLElement) {
+  const lines = code.split(/\r?\n/);
+  const wrapper = document.createElement('div');
+  wrapper.className = 'code-block-wrapper terminal-output-wrapper collapsed';
+
+  const header = document.createElement('div');
+  header.className = 'code-block-header';
+  header.style.cursor = 'pointer';
+  header.title = 'Click to expand or collapse terminal output';
+
+  const titleSpan = document.createElement('span');
+  titleSpan.className = 'terminal-output-title';
+  titleSpan.innerHTML = `<span style="opacity: 0.7; margin-right: 6px;">⌨</span>Terminal Output (${lines.length} line${lines.length === 1 ? '' : 's'})`;
+
+  const actions = document.createElement('div');
+  actions.className = 'code-block-actions';
+  actions.style.display = 'flex';
+  actions.style.gap = '8px';
+
+  const toggleBtn = document.createElement('button');
+  toggleBtn.className = 'code-block-copy-btn';
+  toggleBtn.type = 'button';
+  toggleBtn.textContent = 'View Output';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'code-block-copy-btn';
+  copyBtn.type = 'button';
+  copyBtn.textContent = 'Copy';
+  copyBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+      navigator.clipboard.writeText(code).then(() => {
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => {
+          copyBtn.textContent = 'Copy';
+        }, 2000);
+      });
+    }
+  });
+
+  actions.appendChild(toggleBtn);
+  actions.appendChild(copyBtn);
+
+  header.appendChild(titleSpan);
+  header.appendChild(actions);
+  wrapper.appendChild(header);
+
+  const pre = document.createElement('pre');
+  pre.style.display = 'none'; // Collapsed by default
+  pre.style.margin = '0';
+  pre.style.maxHeight = '350px';
+  pre.style.overflow = 'auto';
+
+  const codeEl = document.createElement('code');
+  codeEl.textContent = code;
+  pre.appendChild(codeEl);
+  wrapper.appendChild(pre);
+
+  let isExpanded = false;
+  const toggle = (e: Event) => {
+    e.stopPropagation();
+    isExpanded = !isExpanded;
+    if (isExpanded) {
+      wrapper.classList.remove('collapsed');
+      pre.style.display = 'block';
+      toggleBtn.textContent = 'Hide Output';
+    } else {
+      wrapper.classList.add('collapsed');
+      pre.style.display = 'none';
+      toggleBtn.textContent = 'View Output';
+    }
+  };
+
+  header.addEventListener('click', toggle);
+
+  container.appendChild(wrapper);
+}
+
+export function renderCompactTerminalDropdown(rawContent: string, container: HTMLElement) {
+  const headlineMatch = rawContent.match(/✓\s*\*\*Ran in terminal:\*\*\s*([^\r\n]+)/);
+  let headline = headlineMatch ? headlineMatch[1].replace(/[`*]/g, '').trim() : 'Ran terminal command(s)';
+
+  const hasFailed = /\b(failed|timed out|cancelled)\b/i.test(rawContent) ||
+    (/\bexit code:\s*([^0\s\)])/i.test(rawContent));
+
+  const details = document.createElement('details');
+  details.className = 'terminal-run-details';
+  if (hasFailed) {
+    (details as any).open = true;
+  }
+
+  const summary = document.createElement('summary');
+  summary.className = 'terminal-run-summary';
+  summary.title = 'Click to expand or collapse terminal output';
+
+  const icon = document.createElement('span');
+  icon.className = 'terminal-run-icon';
+  icon.textContent = '▸';
+
+  const statusIcon = document.createElement('span');
+  statusIcon.className = 'terminal-run-status-icon';
+  statusIcon.style.color = hasFailed ? '#f85149' : '#7ee787';
+  statusIcon.textContent = hasFailed ? '⚠️' : '✓';
+
+  const labelSpan = document.createElement('span');
+  labelSpan.className = 'terminal-run-label';
+  labelSpan.textContent = headline;
+
+  summary.appendChild(icon);
+  summary.appendChild(statusIcon);
+  summary.appendChild(labelSpan);
+  details.appendChild(summary);
+
+  const body = document.createElement('div');
+  body.className = 'terminal-run-body';
+
+  const cleanBodyText = rawContent
+    .replace(/<!-- terminal-run-summary:(?:start|end) -->/g, '')
+    .replace(/✓\s*\*\*Ran in terminal:\*\*[^\r\n]*/g, '')
+    .trim();
+
+  const cmdBlocks = cleanBodyText.split(/(?:^|\n)\$\s+/).filter((b) => b.trim().length > 0);
+  if (cmdBlocks.length > 0) {
+    for (const block of cmdBlocks) {
+      const itemEl = document.createElement('div');
+      itemEl.className = 'terminal-run-item';
+
+      const firstLineEnd = block.indexOf('\n');
+      const cmdText = firstLineEnd !== -1 ? block.slice(0, firstLineEnd).trim() : block.trim();
+      const rest = firstLineEnd !== -1 ? block.slice(firstLineEnd).trim() : '';
+
+      const headerEl = document.createElement('div');
+      headerEl.className = 'terminal-run-item-header';
+      headerEl.innerHTML = `
+        <span style="opacity: 0.6; user-select: none;">$</span>
+        <code class="terminal-run-item-cmd">${escapeHtml(cmdText)}</code>
+      `;
+      itemEl.appendChild(headerEl);
+
+      const codeMatch = rest.match(/```(?:[^\r\n]*)\r?\n([\s\S]*?)```/);
+      const outputText = codeMatch ? codeMatch[1].trim() : (rest.startsWith('```') ? '' : rest.trim());
+      if (outputText) {
+        const outPre = document.createElement('pre');
+        outPre.className = 'terminal-run-item-output';
+        outPre.textContent = outputText;
+        itemEl.appendChild(outPre);
+      }
+      body.appendChild(itemEl);
+    }
+  } else {
+    const fenceMatch = rawContent.match(/```(?:[^\r\n]*)\r?\n([\s\S]*?)```/);
+    if (fenceMatch && fenceMatch[1].trim()) {
+      const outPre = document.createElement('pre');
+      outPre.className = 'terminal-run-item-output';
+      outPre.textContent = fenceMatch[1].trim();
+      body.appendChild(outPre);
+    }
+  }
+
+  details.appendChild(body);
+  container.appendChild(details);
+}
+
+export function renderTerminalCardContent(rawContent: string, container: HTMLElement) {
+  if (rawContent.includes('Ran in terminal') || rawContent.includes('terminal-run-summary')) {
+    renderCompactTerminalDropdown(rawContent, container);
+    return;
+  }
+
+  const fenceRegex = /```([^\r\n]*)\r?\n([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let foundFence = false;
+
+  while ((match = fenceRegex.exec(rawContent)) !== null) {
+    foundFence = true;
+    const preText = rawContent.slice(lastIndex, match.index).trim();
+    if (preText) {
+      renderMarkdownBlocks(preText, container);
+    }
+
+    const lang = (match[1] || 'text').trim();
+    const code = match[2].trimEnd();
+    if (code) {
+      renderCollapsibleTerminalOutput(code, lang, container);
+    }
+
+    lastIndex = fenceRegex.lastIndex;
+  }
+
+  const remaining = rawContent.slice(lastIndex).trim();
+  if (remaining) {
+    renderMarkdownBlocks(remaining, container);
+  }
+
+  if (!foundFence) {
+    renderFormattedContent(rawContent, container);
   }
 }
 
@@ -2216,8 +3313,24 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
       flushParagraph();
       flushList();
       const isPlan = !!planNoticeMatch;
+      const artifactType = isPlan ? 'plan' : 'walkthrough';
+
+      // Deduplication guard: Never render duplicate artifact cards of the same type in the same message container
+      const rootContainer = (container.closest && container.closest('.message-body')) || container;
+      const alreadyHasCard = Array.from(
+        (rootContainer.querySelectorAll ? rootContainer.querySelectorAll('.chat-artifact-card') : []) as HTMLElement[]
+      ).some(
+        (el) =>
+          (el.dataset && el.dataset.artifactType === artifactType) ||
+          (el.classList && el.classList.contains(`chat-artifact-card-${artifactType}`))
+      );
+      if (alreadyHasCard) {
+        continue;
+      }
+
       const card = document.createElement('div');
-      card.className = 'chat-artifact-card';
+      card.className = `chat-artifact-card chat-artifact-card-${artifactType}`;
+      card.dataset.artifactType = artifactType;
 
       const title = document.createElement('span');
       title.className = 'chat-artifact-title';
@@ -2268,28 +3381,26 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
         actionsWrapper.appendChild(proceedBtn);
       }
 
-      // If Reviewer Model is enabled for this workspace, add "Review" action
-      if (isReviewerEnabled) {
-        const reviewBtn = document.createElement('button');
-        reviewBtn.className = 'chat-artifact-review-btn';
-        reviewBtn.innerHTML = `
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="11" cy="11" r="8"></circle>
-            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-          </svg>
-          <span>Review</span>
-        `;
-        reviewBtn.addEventListener('click', () => {
-          const msgParent = container.closest('.message') as HTMLElement | null;
-          const msgId = msgParent && msgParent.id ? msgParent.id.replace('msg-', '') : undefined;
-          vscode.postMessage({
-            type: 'START_REVIEW',
-            artifactType: isPlan ? 'plan' : 'walkthrough',
-            messageId: msgId,
-          });
+      // On plans and walkthroughs, include active "Review" action
+      const reviewBtn = document.createElement('button');
+      reviewBtn.className = 'chat-artifact-review-btn';
+      reviewBtn.innerHTML = `
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <span>Review</span>
+      `;
+      reviewBtn.addEventListener('click', () => {
+        const msgParent = container.closest('.message') as HTMLElement | null;
+        const msgId = msgParent && msgParent.id ? msgParent.id.replace('msg-', '') : undefined;
+        vscode.postMessage({
+          type: 'START_REVIEW',
+          artifactType: isPlan ? 'plan' : 'walkthrough',
+          messageId: msgId,
         });
-        actionsWrapper.appendChild(reviewBtn);
-      }
+      });
+      actionsWrapper.appendChild(reviewBtn);
 
       card.appendChild(title);
       card.appendChild(actionsWrapper);
@@ -2376,18 +3487,12 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
 
 function updateAllUndoButtonsAvailability() {
   const allMessages = Array.from(messagesContainer.querySelectorAll('.message'));
-  allMessages.forEach((msgEl, idx) => {
+  allMessages.forEach((msgEl) => {
     if (msgEl.classList.contains('user')) {
       const undoBtn = msgEl.querySelector('.msg-undo-btn') as HTMLButtonElement | null;
       if (undoBtn) {
-        const subsequent = allMessages.slice(idx + 1);
-        if (subsequent.length > 0) {
-          undoBtn.disabled = false;
-          undoBtn.title = 'Undo this turn\'s AI changes and rewind conversation';
-        } else {
-          undoBtn.disabled = true;
-          undoBtn.title = 'No subsequent messages or AI response to undo';
-        }
+        undoBtn.disabled = false;
+        undoBtn.title = 'Undo this turn\'s AI changes and rewind conversation';
       }
     }
   });
@@ -2400,39 +3505,149 @@ export function appendMessage(
   isHistory = false,
   messageId?: string,
   checkpointId?: string,
-  affectedFiles?: string[]
+  affectedFiles?: string[],
+  executionDurationMs?: number,
+  isAutoRetry = false,
+  userTypedText?: string,
+  attachments?: ChatInputAttachment[],
+  model?: string,
+  isIntermediateStep = false
 ) {
+  // Hide redundant Editor "✓ Applied: updated <file>" message cards
+  if (
+    content.includes('Applied: updated') ||
+    content.includes('✓ **Applied:**') ||
+    content.startsWith('✓ **Applied:**') ||
+    content.startsWith('✓ Applied:')
+  ) {
+    return;
+  }
+
   let displayContent = content;
-  if (role === 'user') {
-    if (content.includes('<!-- reviewer-feedback:start -->')) {
+  let reviewerFeedbackData: string | undefined;
+  const attachedFileNames: string[] = [];
+
+  if (role === 'user' && !isAutoRetry) {
+    const feedbackMatch = content.match(/<!-- reviewer-feedback:start -->[\s\S]*?\[Reviewer Feedback\]:\s*([\s\S]*?)<!-- reviewer-feedback:end -->/);
+    if (feedbackMatch) {
+      reviewerFeedbackData = feedbackMatch[1].trim();
       const stripped = content.replace(/<!-- reviewer-feedback:start -->[\s\S]*?<!-- reviewer-feedback:end -->\s*/g, '').trim();
       displayContent = stripped || 'Please address the attached reviewer feedback.';
     } else if (content.startsWith('[Reviewer Feedback]:')) {
       const parts = content.split('\n\n');
-      displayContent = parts.slice(1).join('\n\n').trim() || 'Please address the attached reviewer feedback.';
+      reviewerFeedbackData = parts.slice(1).join('\n\n').trim();
+      displayContent = parts[0].trim() || 'Please address the attached reviewer feedback.';
+    }
+
+    // Detect attached code/text files: ```filename.ext\n...```
+    const fileMatches = content.matchAll(/(?:^|\n)```([a-zA-Z0-9_.\-/\\]+\.[a-zA-Z0-9]+)\r?\n[\s\S]*?```/g);
+    for (const fm of fileMatches) {
+      const name = fm[1];
+      if (name && !['javascript', 'typescript', 'python', 'bash', 'cmd', 'powershell', 'json', 'html', 'css', 'plan', 'walkthrough'].includes(name.toLowerCase())) {
+        if (!attachedFileNames.includes(name)) {
+          attachedFileNames.push(name);
+        }
+      }
+    }
+
+    if (attachments && attachments.length > 0) {
+      attachments.forEach((att) => {
+        if (!att.isImage && !att.isQuote && !att.isReviewerFeedback && att.name) {
+          if (!attachedFileNames.includes(att.name)) {
+            attachedFileNames.push(att.name);
+          }
+        }
+      });
     }
   }
 
+  const isTerminalCard =
+    content.includes('Ran in terminal') ||
+    content.startsWith('🔄 Terminal command') ||
+    content.startsWith('⚠️ Terminal command');
+  const isEditorCard =
+    content.includes('Applied:') ||
+    content.startsWith('⚠️ Failed to auto-apply') ||
+    content.startsWith('⚠️ This edit was not applied');
+
   const msgEl = document.createElement('div');
-  msgEl.className = `message ${role}`;
+  msgEl.className = isAutoRetry
+    ? `message ${role} auto-retry-message`
+    : isTerminalCard
+    ? `message ${role} terminal-message`
+    : isEditorCard
+    ? `message ${role} editor-message`
+    : `message ${role}`;
   msgEl.dataset.rawContent = content;
   if (messageId) {
     msgEl.id = `msg-${messageId}`;
+  }
+
+  if (role === 'user' && !isAutoRetry) {
+    if (userTypedText !== undefined) {
+      msgEl.dataset.userTypedText = userTypedText;
+    }
+    if (attachments && attachments.length > 0) {
+      msgEl.dataset.attachments = JSON.stringify(attachments);
+      if (messageId) {
+        messageAttachmentsMap.set(messageId, { typedText: userTypedText || '', attachments });
+      }
+    } else if (messageId && messageAttachmentsMap.has(messageId)) {
+      const saved = messageAttachmentsMap.get(messageId)!;
+      msgEl.dataset.userTypedText = saved.typedText;
+      msgEl.dataset.attachments = JSON.stringify(saved.attachments);
+    } else {
+      const parsed = extractAttachmentsAndPrompt(content, images);
+      if (parsed.attachments.length > 0 || (userTypedText === undefined && parsed.cleanText !== content)) {
+        if (userTypedText === undefined) {
+          msgEl.dataset.userTypedText = parsed.cleanText;
+        }
+        msgEl.dataset.attachments = JSON.stringify(parsed.attachments);
+        if (messageId) {
+          messageAttachmentsMap.set(messageId, { typedText: userTypedText !== undefined ? userTypedText : parsed.cleanText, attachments: parsed.attachments });
+        }
+      }
+    }
   }
 
   const headerEl = document.createElement('div');
   headerEl.className = 'message-header';
 
   const roleTag = document.createElement('div');
-  roleTag.className = 'role-tag';
-  roleTag.textContent = role === 'user' ? 'You' : 'OpenRouter';
+  if (isAutoRetry) {
+    roleTag.className = 'role-tag auto-retry';
+    roleTag.textContent = '🔄 Auto-Healing Diagnosis';
+  } else if (role === 'user') {
+    roleTag.className = 'role-tag';
+    roleTag.textContent = 'You';
+  } else if (isTerminalCard) {
+    roleTag.className = 'role-tag terminal';
+    roleTag.textContent = 'Terminal';
+  } else if (isEditorCard) {
+    roleTag.className = 'role-tag editor';
+    roleTag.textContent = 'Editor';
+  } else if (role === 'system') {
+    roleTag.className = 'role-tag system';
+    roleTag.textContent = 'System';
+  } else {
+    roleTag.className = 'role-tag model-tag';
+    const effectiveModelId = model || currentModelId;
+    roleTag.textContent = getModelDisplayName(effectiveModelId);
+    if (effectiveModelId) {
+      roleTag.title = effectiveModelId;
+      roleTag.dataset.modelId = effectiveModelId;
+    }
+  }
   headerEl.appendChild(roleTag);
 
   const headerActions = document.createElement('div');
   headerActions.className = 'message-header-actions';
 
-  // Add "Clarify" quote button for assistant messages
-  if (role === 'assistant') {
+  // Add "Clarify" quote button for assistant model messages (not terminal/editor cards)
+  if (role === 'assistant' && !isTerminalCard && !isEditorCard) {
+    if (executionDurationMs) {
+      headerActions.appendChild(createDurationBadge(executionDurationMs));
+    }
     const quoteBtn = document.createElement('button');
     quoteBtn.className = 'msg-quote-btn';
     quoteBtn.title = 'Quote / Ask for clarification';
@@ -2469,9 +3684,9 @@ export function appendMessage(
   });
   headerActions.appendChild(copyBtn);
 
-  // Always-visible Undo safety net on every user message.
+  // Always-visible Undo safety net on every user message (omitted for automated retries).
   // Becomes active once that user message has received an AI response (something to undo).
-  if (role === 'user') {
+  if (role === 'user' && !isAutoRetry) {
     const undoBtn = document.createElement('button');
     undoBtn.className = 'msg-undo-btn';
     if (messageId) {
@@ -2482,8 +3697,8 @@ export function appendMessage(
       undoBtn.dataset.checkpointId = checkpointId;
       undoBtn.dataset.affectedFiles = JSON.stringify(affectedFiles ?? []);
     }
-    undoBtn.disabled = true;
-    undoBtn.title = 'No subsequent messages or AI response to undo';
+    undoBtn.disabled = false;
+    undoBtn.title = 'Undo this turn\'s AI changes and rewind conversation';
     undoBtn.innerHTML = `
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="9 14 4 9 9 4"></polyline>
@@ -2502,16 +3717,12 @@ export function appendMessage(
       if (idx === -1) return;
       const subsequent = allMessages.slice(idx + 1);
       console.log('[undo] subsequent count:', subsequent.length);
-      if (subsequent.length === 0) {
-        console.log('[undo] subsequent is 0, safe no-op');
-        return;
-      }
 
       const files: string[] = undoBtn.dataset.affectedFiles
         ? JSON.parse(undoBtn.dataset.affectedFiles)
         : [];
       const cpId = undoBtn.dataset.checkpointId || '';
-      const msgId = undoBtn.id.replace('msg-undo-', '') || '';
+      const msgId = undoBtn.id.replace('msg-undo-', '') || currentMsgEl.id.replace('msg-', '') || '';
 
       undoBtn.disabled = true;
       const span = undoBtn.querySelector('span');
@@ -2532,6 +3743,76 @@ export function appendMessage(
 
   const bodyEl = document.createElement('div');
   bodyEl.className = 'message-body';
+
+  // Render attachment capsules on user message
+  if (role === 'user' && (reviewerFeedbackData || attachedFileNames.length > 0)) {
+    const attachmentsBar = document.createElement('div');
+    attachmentsBar.className = 'message-attachments-bar';
+
+    if (reviewerFeedbackData) {
+      const capsule = document.createElement('div');
+      capsule.className = 'message-attachment-capsule reviewer-capsule';
+
+      const headerBar = document.createElement('div');
+      headerBar.className = 'attachment-capsule-bar';
+
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'attachment-capsule-icon';
+      iconSpan.innerHTML = `
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+      `;
+
+      const titleSpan = document.createElement('span');
+      titleSpan.className = 'attachment-capsule-title';
+      titleSpan.textContent = 'Reviewer Feedback attached';
+
+      const previewBtn = document.createElement('button');
+      previewBtn.className = 'attachment-capsule-btn';
+      previewBtn.type = 'button';
+      previewBtn.textContent = 'Preview';
+
+      headerBar.appendChild(iconSpan);
+      headerBar.appendChild(titleSpan);
+      headerBar.appendChild(previewBtn);
+      capsule.appendChild(headerBar);
+
+      const previewBox = document.createElement('div');
+      previewBox.className = 'attachment-capsule-preview hidden';
+      previewBox.innerHTML = `<pre>${escapeHtml(reviewerFeedbackData)}</pre>`;
+      capsule.appendChild(previewBox);
+
+      previewBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isHidden = previewBox.classList.contains('hidden');
+        if (isHidden) {
+          previewBox.classList.remove('hidden');
+          previewBtn.textContent = 'Hide';
+        } else {
+          previewBox.classList.add('hidden');
+          previewBtn.textContent = 'Preview';
+        }
+      });
+
+      attachmentsBar.appendChild(capsule);
+    }
+
+    attachedFileNames.forEach((fileName) => {
+      const fileCapsule = document.createElement('div');
+      fileCapsule.className = 'message-attachment-capsule file-capsule';
+      fileCapsule.innerHTML = `
+        <div class="attachment-capsule-bar">
+          <span class="attachment-capsule-icon">📄</span>
+          <span class="attachment-capsule-title">${escapeHtml(fileName)}</span>
+        </div>
+      `;
+      attachmentsBar.appendChild(fileCapsule);
+    });
+
+    bodyEl.appendChild(attachmentsBar);
+  }
 
   if (images && images.length > 0) {
     images.forEach((img) => {
@@ -2612,8 +3893,10 @@ export function appendMessage(
 
     wrapper.appendChild(contentContainer);
     bodyEl.appendChild(wrapper);
+  } else if (isTerminalCard) {
+    renderTerminalCardContent(displayContent, bodyEl);
   } else {
-    renderFormattedContent(displayContent, bodyEl, role);
+    renderFormattedContent(displayContent, bodyEl, role, isHistory, messageId);
   }
 
   msgEl.appendChild(headerEl);
@@ -2622,9 +3905,14 @@ export function appendMessage(
 
   if (role === 'assistant') {
     parseAndRenderActions(content, msgEl, isHistory);
+    if (isIntermediateStep) {
+      collapseIntermediateStepDetails(msgEl, bodyEl);
+    }
+    mainScrollController.scrollToBottomIfAtBottom();
+  } else {
+    mainScrollController.scrollToBottom(true);
   }
 
-  messagesContainer.scrollTop = messagesContainer.scrollHeight;
   updateAllUndoButtonsAvailability();
 }
 
@@ -2651,12 +3939,13 @@ mainChatInputController = createChatInputController({
 
 function sendMessage() {
   const userTypedText = mainChatInputController.getValue().trim();
+  const currentAttachments = mainChatInputController.getAttachments();
   let promptToSend = userTypedText;
   const currentImages: Array<{ name: string; dataUrl: string }> = [];
   const quoteAttachments: string[] = [];
   const reviewerAttachments: string[] = [];
 
-  mainChatInputController.getAttachments().forEach((att) => {
+  currentAttachments.forEach((att) => {
     if (att.isImage) {
       currentImages.push({ name: att.name, dataUrl: att.data });
     } else if (att.isQuote) {
@@ -2709,11 +3998,11 @@ function sendMessage() {
   // so the undo button ID written here matches the ID the host will use to tagTurnCheckpoint.
   const userMessageId = `${Date.now()}-user`;
 
-  // Read latest selected reasoning effort directly from select element if visible
+  // Read latest selected reasoning effort directly from select element if visible, or fallback to currentReasoningEffort
   const effortToSend =
-    reasoningEffortContainer && !reasoningEffortContainer.classList.contains('hidden') && reasoningEffortSelect
+    reasoningEffortContainer && !reasoningEffortContainer.classList.contains('hidden') && reasoningEffortSelect?.value
       ? reasoningEffortSelect.value
-      : undefined;
+      : currentReasoningEffort;
 
   lastSentMessage = {
     content: promptToSend,
@@ -2722,10 +4011,24 @@ function sendMessage() {
     reasoningEffort: effortToSend,
   };
 
-  // The reviewer attachment is NOT rendered in the chat message bubble
-  const displayContent = userTypedText || (reviewerAttachments.length > 0 ? 'Please address the attached reviewer feedback.' : promptToSend);
+  messageAttachmentsMap.set(userMessageId, {
+    typedText: userTypedText,
+    attachments: [...currentAttachments],
+  });
 
-  appendMessage('user', displayContent, currentImages, false, userMessageId);
+  appendMessage(
+    'user',
+    promptToSend,
+    currentImages,
+    false,
+    userMessageId,
+    undefined,
+    undefined,
+    undefined,
+    false,
+    userTypedText,
+    currentAttachments
+  );
   mainChatInputController.clearAttachments();
   mainChatInputController.setValue('');
   mainChatInputController.resetHeight();
@@ -2736,6 +4039,8 @@ function sendMessage() {
     modelId: currentModelId,
     images: currentImages,
     reasoningEffort: effortToSend,
+    userTypedText,
+    attachments: currentAttachments,
   });
 }
 
@@ -3105,28 +4410,39 @@ function filterAndRenderTable() {
       cost = '$0.00';
     } else if (r.type === 'reviewer') {
       typePill = '<span class="type-pill reviewer">🔍 Reviewer</span>';
-      target = escapeHtml(r.model || 'unknown');
+      target = r.model || 'unknown';
       inputTokens = `${(r.promptTokens || 0).toLocaleString()}`;
       outputTokens = `${(r.completionTokens || 0).toLocaleString()}`;
       cost = formatCurrency(r.cost || 0);
     } else if (r.type === 'summarization') {
       typePill = '<span class="type-pill chat">📝 Summary</span>';
-      target = escapeHtml(r.model || 'unknown');
+      target = r.model || 'unknown';
       inputTokens = `${(r.promptTokens || 0).toLocaleString()}`;
       outputTokens = `${(r.completionTokens || 0).toLocaleString()}`;
       cost = formatCurrency(r.cost || 0);
     } else {
       typePill = '<span class="type-pill chat">💬 Chat</span>';
-      target = escapeHtml(r.model || 'unknown');
+      target = r.model || 'unknown';
       inputTokens = `${(r.promptTokens || 0).toLocaleString()}`;
       outputTokens = `${(r.completionTokens || 0).toLocaleString()}`;
       cost = formatCurrency(r.cost || 0);
     }
 
+    let cellContent = escapeHtml(target);
+    if (r.type !== 'terminal_command') {
+      // Check for reasoning effort in r.reasoningEffort or formatted in target e.g. "openai/o3-mini (Medium)"
+      const effortMatch = (r.reasoningEffort || target).match(/\b(low|medium|high)\b/i);
+      if (effortMatch) {
+        const effortLabel = effortMatch[1].charAt(0).toUpperCase() + effortMatch[1].slice(1).toLowerCase();
+        const cleanBaseModel = target.replace(/\s*\((Low|Medium|High)\)$/i, '');
+        cellContent = `${escapeHtml(cleanBaseModel)}<span class="effort-badge">${effortLabel}</span>`;
+      }
+    }
+
     tr.innerHTML = `
       <td style="opacity:0.8;">${timeStr}</td>
       <td>${typePill}</td>
-      <td style="font-family:monospace; max-width:140px; overflow:hidden; text-overflow:ellipsis;" title="${target}">${target}</td>
+      <td style="font-family:monospace; min-width:140px; max-width:260px; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtml(target)}">${cellContent}</td>
       <td style="font-family:monospace; opacity:0.85;" title="${inputTokens} prompt tokens">${inputTokens}</td>
       <td style="font-family:monospace; opacity:0.85;" title="${outputTokens} completion tokens">${outputTokens}</td>
       <td style="color:#7ee787; font-family:monospace;">${cost}</td>
@@ -3231,6 +4547,12 @@ if (settingsUpdateKeyBtn) {
 if (settingsClearHistoryBtn) {
   settingsClearHistoryBtn.addEventListener('click', () => {
     vscode.postMessage({ type: 'TRIGGER_CLEAR_HISTORY' });
+  });
+}
+
+if (settingsViewLogsBtn) {
+  settingsViewLogsBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'VIEW_LOGS' });
   });
 }
 
@@ -3443,7 +4765,7 @@ function openReviewerView(data: {
   messageId?: string;
   reviewerModel: string;
   reviewerReasoningEffort: string;
-  history: Array<{ role: 'user' | 'assistant'; content: string }>;
+  history: Array<{ role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }>;
   activeSessionId?: string;
 }) {
   currentReviewerArtifact = {
@@ -3458,6 +4780,7 @@ function openReviewerView(data: {
   viewSettings.classList.add('hidden');
   viewUsage.classList.add('hidden');
   viewReviewer.classList.remove('hidden');
+  flushReviewerStreamRender();
 
   activeReviewerSessionId = data.activeSessionId || '';
   activeReviewerModelId = data.reviewerModel || currentReviewerModelId || '';
@@ -3470,27 +4793,37 @@ function openReviewerView(data: {
   }
   updateReviewerPanelReasoningControl(activeReviewerModelId);
 
-  // Setup Artifact preview or hide if standalone
-  if (data.artifactType === 'standalone' || !data.artifactContent) {
-    if (reviewerArtifactSection) reviewerArtifactSection.classList.add('hidden');
-  } else {
-    if (reviewerArtifactSection) reviewerArtifactSection.classList.remove('hidden');
-    const isPlan = data.artifactType === 'plan';
-    if (reviewerArtifactLabel) {
-      reviewerArtifactLabel.textContent = isPlan ? 'Plan docs' : 'Results docs';
-    }
-    if (reviewerArtifactPreviewBody) {
-      reviewerArtifactPreviewBody.textContent = data.artifactContent;
-    }
+  // Keep top artifact preview hidden; file reference is embedded directly in chat messages
+  if (reviewerArtifactSection) {
+    reviewerArtifactSection.classList.add('hidden');
   }
 
   // Render messages
-  reviewerMessages.innerHTML = '';
-  reviewerChatInputController.clearAttachments();
-  reviewerChatInputController.setValue('');
-  data.history.forEach((m) => {
-    appendReviewerMessage(m.role as 'user' | 'assistant', m.content);
-  });
+  const isSameSessionStream = Boolean(
+    (activeReviewerAssistantEl || reviewerProgressManager) &&
+    (!data.activeSessionId || data.activeSessionId === activeReviewerSessionId)
+  );
+
+  if (isSameSessionStream) {
+    preserveStreamingElements(
+      reviewerMessages,
+      reviewerProgressManager?.getPillElement() ?? null,
+      activeReviewerAssistantEl,
+      () => {
+        data.history.forEach((m) => {
+          appendReviewerMessage(m.role as 'user' | 'assistant', m.content, false, m.attachedFile, m.executionDurationMs);
+        });
+      }
+    );
+    flushReviewerStreamRender();
+  } else {
+    reviewerMessages.innerHTML = '';
+    reviewerChatInputController.clearAttachments();
+    reviewerChatInputController.setValue('');
+    data.history.forEach((m) => {
+      appendReviewerMessage(m.role as 'user' | 'assistant', m.content, false, m.attachedFile, m.executionDurationMs);
+    });
+  }
 
   updateReviewerTokenMeter();
 }
@@ -3507,6 +4840,7 @@ function handleReviewerAttachArtifact(data: {
   viewSettings.classList.add('hidden');
   viewUsage.classList.add('hidden');
   viewReviewer.classList.remove('hidden');
+  flushReviewerStreamRender();
 
   currentReviewerArtifact = {
     type: data.artifactType,
@@ -3515,26 +4849,42 @@ function handleReviewerAttachArtifact(data: {
     messageId: data.messageId,
   };
 
-  if (reviewerArtifactSection) reviewerArtifactSection.classList.remove('hidden');
-  const isPlan = data.artifactType === 'plan';
-  if (reviewerArtifactLabel) {
-    reviewerArtifactLabel.textContent = isPlan ? 'Plan docs' : 'Results docs';
-  }
-  if (reviewerArtifactPreviewBody) {
-    reviewerArtifactPreviewBody.textContent = data.artifactContent;
+  // Keep top preview section hidden; the file will be referenced in the chat turn
+  if (reviewerArtifactSection) {
+    reviewerArtifactSection.classList.add('hidden');
   }
 
-  const chipName = data.artifactName || (isPlan ? 'Plan docs' : 'Results docs');
+  const chipName = data.artifactName || (data.artifactType === 'plan' ? 'Plan docs' : 'Results docs');
   if (reviewerChatInputController) {
     // If an artifact attachment is already present, clear previous artifact chip to prevent duplicate artifact context
     const currentAtts = reviewerChatInputController.getAttachments();
     if (currentAtts.some((a) => a.isArtifact)) {
       reviewerChatInputController.clearAttachments();
       currentAtts.filter((a) => !a.isArtifact).forEach((a) => {
-        reviewerChatInputController.addAttachment(a.name, a.data, a.isImage);
+        reviewerChatInputController.addAttachment(
+          a.name,
+          a.data,
+          a.isImage,
+          false,
+          undefined,
+          a.isQuote,
+          a.isReviewerFeedback,
+          a.uri,
+          a.filePath
+        );
       });
     }
-    reviewerChatInputController.addAttachment(chipName, data.artifactContent, false, true, data.artifactType);
+    reviewerChatInputController.addAttachment(
+      chipName,
+      data.artifactContent,
+      false,
+      true,
+      data.artifactType,
+      false,
+      false,
+      data.artifactUri,
+      data.artifactUri
+    );
   }
 
   if (reviewerPromptInput) {
@@ -3547,8 +4897,16 @@ function updateReviewerTokenMeter() {
   const currentModel = loadedModels.find((m) => m.id === activeReviewerModelId);
   const maxContext = currentModel?.context_length;
 
-  const totalChars = (reviewerMessages.textContent || '').length;
-  const tokens = Math.round(totalChars / 4);
+  // Chat messages (visible turns)
+  const chatChars = (reviewerMessages.textContent || '').length;
+  // Artifact content injected into system prompt on every turn
+  const artifactChars = currentReviewerArtifact?.content?.length ?? 0;
+  const tokens = Math.round((chatChars + artifactChars) / 4);
+
+  const artifactTokens = Math.round(artifactChars / 4);
+  const baseTooltip = artifactChars > 0
+    ? `Includes ~${artifactTokens.toLocaleString()} tokens from the active artifact document`
+    : 'Reviewer conversation tokens / model max context';
 
   if (maxContext && maxContext > 0) {
     const pct = ((tokens / maxContext) * 100).toFixed(1);
@@ -3563,17 +4921,18 @@ function updateReviewerTokenMeter() {
     const ratio = tokens / maxContext;
     if (ratio > 0.9) {
       reviewerTokenMeter.style.color = '#f85149';
-      reviewerTokenMeter.title = 'Reviewer context limit almost reached (>90%)';
+      reviewerTokenMeter.title = `Reviewer context limit almost reached (>90%). ${baseTooltip}`;
     } else if (ratio > 0.75) {
       reviewerTokenMeter.style.color = '#d29922';
-      reviewerTokenMeter.title = 'Approaching reviewer context limit (>75%)';
+      reviewerTokenMeter.title = `Approaching reviewer context limit (>75%). ${baseTooltip}`;
     } else {
       reviewerTokenMeter.style.color = '';
-      reviewerTokenMeter.title = 'Reviewer conversation tokens / model max context';
+      reviewerTokenMeter.title = baseTooltip;
     }
   } else {
     reviewerTokenMeter.textContent = `${tokens.toLocaleString()} tokens`;
     reviewerTokenMeter.style.color = '';
+    reviewerTokenMeter.title = baseTooltip;
   }
 }
 
@@ -3594,12 +4953,17 @@ function flushReviewerStreamRender() {
   if (activeReviewerAssistantContentEl) {
     activeReviewerAssistantContentEl.innerHTML = '';
     renderFormattedContent(accumulatedReviewerStream, activeReviewerAssistantContentEl, 'assistant');
-    reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+    reviewerScrollController.scrollToBottomIfAtBottom();
     reviewerLastRenderTime = Date.now();
   }
 }
 
 function scheduleReviewerStreamRender() {
+  if (viewReviewer && viewReviewer.classList.contains('hidden')) {
+    // If reviewer view is hidden in background, avoid requestAnimationFrame churn.
+    // The accumulated text is stored in memory and will be flushed immediately when the view is restored or finished.
+    return;
+  }
   const now = Date.now();
   const elapsed = now - reviewerLastRenderTime;
 
@@ -3612,7 +4976,7 @@ function scheduleReviewerStreamRender() {
       if (activeReviewerAssistantContentEl) {
         activeReviewerAssistantContentEl.innerHTML = '';
         renderFormattedContent(accumulatedReviewerStream, activeReviewerAssistantContentEl, 'assistant');
-        reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+        reviewerScrollController.scrollToBottomIfAtBottom();
         reviewerLastRenderTime = Date.now();
       }
     });
@@ -3647,7 +5011,13 @@ function quoteAspectToReviewerInput(aspectText: string) {
   reviewerPromptInput.focus();
 }
 
-function appendReviewerMessage(role: 'user' | 'assistant', content: string, isIncomplete = false): HTMLElement {
+function appendReviewerMessage(
+  role: 'user' | 'assistant',
+  content: string,
+  isIncomplete = false,
+  attachedFile?: AttachedFileRef,
+  executionDurationMs?: number
+): HTMLElement {
   const msgEl = document.createElement('div');
   msgEl.className = `message ${role}`;
   msgEl.dataset.rawContent = content;
@@ -3664,6 +5034,9 @@ function appendReviewerMessage(role: 'user' | 'assistant', content: string, isIn
   headerActions.className = 'message-header-actions';
 
   if (role === 'assistant') {
+    if (executionDurationMs) {
+      headerActions.appendChild(createDurationBadge(executionDurationMs));
+    }
     const quoteBtn = document.createElement('button');
     quoteBtn.className = 'msg-quote-btn';
     quoteBtn.title = 'Quote / Ask for clarification';
@@ -3703,11 +5076,108 @@ function appendReviewerMessage(role: 'user' | 'assistant', content: string, isIn
     });
   });
   headerActions.appendChild(copyBtn);
+
+  // Retry button on user messages — lets the user re-run this prompt when the reviewer gets stuck
+  if (role === 'user') {
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'msg-retry-btn';
+    retryBtn.title = 'Retry — re-run this prompt with the reviewer';
+    retryBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="1 4 1 10 7 10"></polyline>
+        <path d="M3.51 15a9 9 0 1 0 .49-3.51"></path>
+      </svg>
+      <span>Retry</span>
+    `;
+    retryBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'RETRY_REVIEWER_MESSAGE' });
+    });
+    headerActions.appendChild(retryBtn);
+  }
+
   headerEl.appendChild(headerActions);
   msgEl.appendChild(headerEl);
 
   const bodyEl = document.createElement('div');
   bodyEl.className = 'message-body';
+
+  if (attachedFile) {
+    const cardEl = document.createElement('div');
+    cardEl.className = 'reviewer-file-ref-card';
+    cardEl.tabIndex = 0;
+    cardEl.setAttribute('role', 'button');
+    cardEl.title = `Click to open ${attachedFile.name} in editor tab`;
+
+    const leftEl = document.createElement('div');
+    leftEl.className = 'reviewer-file-ref-left';
+
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'reviewer-file-ref-icon';
+    iconSpan.innerHTML = `
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+        <polyline points="14 2 14 8 20 8"></polyline>
+        <line x1="16" y1="13" x2="8" y2="13"></line>
+        <line x1="16" y1="17" x2="8" y2="17"></line>
+        <polyline points="10 9 9 9 8 9"></polyline>
+      </svg>
+    `;
+    leftEl.appendChild(iconSpan);
+
+    const metaEl = document.createElement('div');
+    metaEl.className = 'reviewer-file-ref-meta';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'reviewer-file-ref-name';
+    nameSpan.textContent = attachedFile.name;
+    metaEl.appendChild(nameSpan);
+
+    const badgeSpan = document.createElement('span');
+    badgeSpan.className = 'reviewer-file-ref-badge';
+    badgeSpan.textContent =
+      attachedFile.artifactType === 'plan'
+        ? 'Plan'
+        : attachedFile.artifactType === 'walkthrough'
+        ? 'Walkthrough'
+        : 'File';
+    metaEl.appendChild(badgeSpan);
+    leftEl.appendChild(metaEl);
+    cardEl.appendChild(leftEl);
+
+    const openBtn = document.createElement('button');
+    openBtn.className = 'reviewer-file-ref-open-btn';
+    openBtn.title = 'Open in VS Code editor tab';
+    openBtn.innerHTML = `
+      <span>Open in Tab</span>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+        <polyline points="15 3 21 3 21 9"></polyline>
+        <line x1="10" y1="14" x2="21" y2="3"></line>
+      </svg>
+    `;
+
+    const openAction = (e: Event) => {
+      e.stopPropagation();
+      const targetPath = attachedFile.uri || attachedFile.filePath || attachedFile.name;
+      vscode.postMessage({
+        type: 'OPEN_FILE',
+        filePath: targetPath,
+      });
+    };
+
+    openBtn.addEventListener('click', openAction);
+    cardEl.addEventListener('click', openAction);
+    cardEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openAction(e);
+      }
+    });
+
+    cardEl.appendChild(openBtn);
+    bodyEl.appendChild(cardEl);
+  }
+
   renderFormattedContent(content, bodyEl, role);
   msgEl.appendChild(bodyEl);
 
@@ -3743,17 +5213,30 @@ function appendReviewerMessage(role: 'user' | 'assistant', content: string, isIn
   }
 
   reviewerMessages.appendChild(msgEl);
-  reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+  if (role === 'user') {
+    reviewerScrollController.scrollToBottom(true);
+  } else {
+    reviewerScrollController.scrollToBottomIfAtBottom();
+  }
   updateReviewerTokenMeter();
   return msgEl;
 }
 
 function handleReviewerStreamStart() {
+  if (reviewerProgressManager) {
+    reviewerProgressManager.cleanupImmediate();
+    reviewerProgressManager = null;
+  }
   accumulatedReviewerStream = '';
   // Defer creating activeReviewerAssistantEl until first chunk arrives (to avoid blank shell on immediate failure)
   activeReviewerAssistantEl = null;
   activeReviewerAssistantContentEl = null;
   if (reviewerStatusText) reviewerStatusText.textContent = 'Reviewer thinking...';
+
+  // Mount reviewer progress pill immediately to eliminate the pre-token dead zone
+  reviewerProgressManager = new ReviewerProgressManager(reviewerMessages);
+  reviewerScrollController.scrollToBottom(true);
+  setReviewerActivityIndicator(true);
 }
 
 let accumulatedReviewerStream = '';
@@ -3821,19 +5304,42 @@ function handleReviewerStreamChunk(chunk: string) {
     activeReviewerAssistantEl.appendChild(activeReviewerAssistantContentEl);
 
     reviewerMessages.appendChild(activeReviewerAssistantEl);
+
+    if (reviewerProgressManager) {
+      reviewerProgressManager.attachBubble(activeReviewerAssistantEl);
+    }
   }
 
   accumulatedReviewerStream += chunk;
   if (activeReviewerAssistantEl) {
     activeReviewerAssistantEl.dataset.rawContent = accumulatedReviewerStream;
   }
+  if (reviewerProgressManager) {
+    reviewerProgressManager.onChunk(chunk);
+  }
   scheduleReviewerStreamRender();
   updateReviewerTokenMeter();
 }
 
 // Case 2: Full Stream Completed Successfully
-function handleReviewerStreamDone() {
+function handleReviewerStreamDone(executionDurationMs?: number) {
+  if (reviewerProgressManager) {
+    reviewerProgressManager.cleanupImmediate();
+    reviewerProgressManager = null;
+  }
   flushReviewerStreamRender();
+
+  if (activeReviewerAssistantEl && executionDurationMs) {
+    const headerActions = activeReviewerAssistantEl.querySelector('.message-header-actions');
+    if (headerActions && !headerActions.querySelector('.msg-duration-badge')) {
+      const quoteBtn = headerActions.querySelector('.msg-quote-btn');
+      if (quoteBtn) {
+        headerActions.insertBefore(createDurationBadge(executionDurationMs), quoteBtn);
+      } else {
+        headerActions.appendChild(createDurationBadge(executionDurationMs));
+      }
+    }
+  }
 
   const finalContent = accumulatedReviewerStream;
   if (activeReviewerAssistantEl) {
@@ -3865,6 +5371,7 @@ function handleReviewerStreamDone() {
   activeReviewerAssistantEl = null;
   activeReviewerAssistantContentEl = null;
   if (reviewerStatusText) reviewerStatusText.textContent = 'Ready';
+  setReviewerActivityIndicator(false);
   updateReviewerTokenMeter();
 }
 
@@ -3919,9 +5426,30 @@ function handleReviewerStreamError(errMsg: string, isPartial: boolean, canRetry 
     actionsDiv.appendChild(sendPartialBtn);
 
     interruptedBadge.appendChild(actionsDiv);
-    partialAssistantEl.appendChild(interruptedBadge);
+
+    // Teardown sequencing (Amendment):
+    // 1. Cancel activity timer & remove border glow immediately
+    // 2. Trigger pill fade-out (150ms)
+    // 3. Remove pill on transitionend
+    // 4. ONLY AFTER pill is fully removed from DOM, mount interrupted badge inside bubble
+    const renderBadge = () => {
+      partialAssistantEl.appendChild(interruptedBadge);
+      reviewerScrollController.scrollToBottomIfAtBottom();
+    };
+
+    if (reviewerProgressManager) {
+      const mgr = reviewerProgressManager;
+      reviewerProgressManager = null;
+      mgr.cleanupWithFade(renderBadge);
+    } else {
+      renderBadge();
+    }
   } else {
     // Case 1: Zero chunks received, clean error card with retry
+    if (reviewerProgressManager) {
+      reviewerProgressManager.cleanupImmediate();
+      reviewerProgressManager = null;
+    }
     if (activeReviewerAssistantEl?.parentNode) {
       activeReviewerAssistantEl.remove();
     }
@@ -3954,13 +5482,19 @@ function handleReviewerStreamError(errMsg: string, isPartial: boolean, canRetry 
     reviewerMessages.appendChild(errorCard);
   }
 
-  reviewerMessages.scrollTop = reviewerMessages.scrollHeight;
+  reviewerScrollController.scrollToBottomIfAtBottom();
   accumulatedReviewerStream = '';
   activeReviewerAssistantEl = null;
   activeReviewerAssistantContentEl = null;
+  setReviewerActivityIndicator(false);
 }
 
 function handleSetReviewerBusy(busy: boolean) {
+  setReviewerActivityIndicator(busy);
+  if (!busy && reviewerProgressManager) {
+    reviewerProgressManager.cleanupImmediate();
+    reviewerProgressManager = null;
+  }
   if (busy) {
     reviewerSendBtn.classList.add('hidden');
     reviewerStopBtn.classList.remove('hidden');
@@ -4006,10 +5540,31 @@ function sendFeedbackToMainChat(text: string) {
   }
 }
 
+function switchToReviewerView() {
+  viewChat.classList.add('hidden');
+  viewSettings.classList.add('hidden');
+  viewUsage.classList.add('hidden');
+  viewReviewer.classList.remove('hidden');
+  flushReviewerStreamRender();
+  reviewerScrollController.scrollToBottom(true);
+  if (reviewerPromptInput) {
+    reviewerChatInputController.focus();
+  }
+}
+
 // Direct Reviewer Toggle Button
 if (reviewerToggleBtn) {
   reviewerToggleBtn.addEventListener('click', () => {
-    vscode.postMessage({ type: 'OPEN_DIRECT_REVIEWER' });
+    const isDirect = shouldSwitchDirectToReviewer({
+      hasStreamingAssistant: Boolean(activeReviewerAssistantEl),
+      hasProgressManager: Boolean(reviewerProgressManager),
+      activeSessionId: activeReviewerSessionId,
+    });
+    if (isDirect) {
+      switchToReviewerView();
+    } else {
+      vscode.postMessage({ type: 'OPEN_DIRECT_REVIEWER' });
+    }
   });
 }
 
@@ -4065,19 +5620,34 @@ reviewerChatInputController = createChatInputController({
 function sendReviewerMessage() {
   let text = reviewerChatInputController.getValue().trim();
   const currentImages: Array<{ name: string; dataUrl: string }> = [];
-  let attachedArtifact: { content: string; type: 'plan' | 'walkthrough' } | undefined;
+  let attachedArtifact:
+    | { content: string; type: 'plan' | 'walkthrough'; name?: string; uri?: string; filePath?: string }
+    | undefined;
+  let attachedFile:
+    | { name: string; content: string; uri?: string; filePath?: string }
+    | undefined;
   const quoteAttachments: string[] = [];
 
   reviewerChatInputController.getAttachments().forEach((att) => {
     if (att.isImage) {
       currentImages.push({ name: att.name, dataUrl: att.data });
     } else if (att.isArtifact) {
-      attachedArtifact = { content: att.data, type: att.artifactType || 'plan' };
+      attachedArtifact = {
+        content: att.data,
+        type: att.artifactType || 'plan',
+        name: att.name,
+        uri: att.uri,
+        filePath: att.filePath,
+      };
     } else if (att.isQuote) {
       quoteAttachments.push(att.data);
     } else {
-      const formatted = `\n\`\`\`${att.name}\n${att.data}\n\`\`\`\n`;
-      text = text ? text.trimEnd() + formatted : formatted.trimStart();
+      attachedFile = {
+        name: att.name,
+        content: att.data,
+        uri: att.uri,
+        filePath: att.filePath,
+      };
     }
   });
 
@@ -4102,14 +5672,40 @@ function sendReviewerMessage() {
     }
   }
 
-  if ((!text && currentImages.length === 0 && !attachedArtifact) || reviewerSendBtn.disabled) return;
+  if ((!text && currentImages.length === 0 && !attachedArtifact && !attachedFile) || reviewerSendBtn.disabled) return;
 
-  const defaultPrompt = attachedArtifact
-    ? (attachedArtifact.type === 'walkthrough' ? 'Please review these Results docs.' : 'Please review these Plan docs.')
+  let attachedFileRef: AttachedFileRef | undefined;
+  let artifactContentToSend: string | undefined;
+  let artifactTypeToSend: 'plan' | 'walkthrough' | undefined;
+
+  if (attachedArtifact) {
+    artifactContentToSend = attachedArtifact.content;
+    artifactTypeToSend = attachedArtifact.type;
+    attachedFileRef = {
+      name: attachedArtifact.name || (attachedArtifact.type === 'walkthrough' ? 'Results docs' : 'Plan docs'),
+      uri: attachedArtifact.uri,
+      filePath: attachedArtifact.filePath || attachedArtifact.uri,
+      artifactType: attachedArtifact.type,
+    };
+  } else if (attachedFile) {
+    artifactContentToSend = attachedFile.content;
+    attachedFileRef = {
+      name: attachedFile.name,
+      uri: attachedFile.uri,
+      filePath: attachedFile.filePath || attachedFile.name,
+    };
+  }
+
+  const defaultPrompt = attachedFileRef
+    ? (attachedFileRef.artifactType === 'walkthrough'
+        ? 'Please review these Results docs.'
+        : attachedFileRef.artifactType === 'plan'
+        ? 'Please review these Plan docs.'
+        : `Please review ${attachedFileRef.name}.`)
     : '';
   const userVisibleText = text || defaultPrompt || 'Please review';
 
-  appendReviewerMessage('user', userVisibleText);
+  appendReviewerMessage('user', userVisibleText, false, attachedFileRef);
   reviewerChatInputController.clearAttachments();
   reviewerChatInputController.setValue('');
   reviewerChatInputController.resetHeight();
@@ -4124,8 +5720,17 @@ function sendReviewerMessage() {
     content: userVisibleText,
     modelId: activeReviewerModelId,
     reasoningEffort: effortToSend,
-    artifactContent: attachedArtifact?.content,
-    artifactType: attachedArtifact?.type,
+    artifactContent: artifactContentToSend,
+    artifactType: artifactTypeToSend,
+    attachedFile: attachedFileRef
+      ? {
+          name: attachedFileRef.name,
+          uri: attachedFileRef.uri,
+          filePath: attachedFileRef.filePath,
+          artifactType: attachedFileRef.artifactType,
+          content: artifactContentToSend,
+        }
+      : undefined,
   });
 }
 

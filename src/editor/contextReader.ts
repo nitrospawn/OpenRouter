@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as path from 'path';
 import { PermissionManager } from '../permissions/permissionManager';
+import { ArtifactDocumentManager } from './artifactDocumentManager';
 
 export interface EditorContext {
   hasContext: boolean;
@@ -8,6 +10,8 @@ export interface EditorContext {
   languageId?: string;
   selectedText?: string;
   fileContent?: string;
+  isArtifactDocument?: boolean;
+  artifactType?: 'plan' | 'walkthrough';
 }
 
 export class ContextReader {
@@ -17,12 +21,20 @@ export class ContextReader {
       return { hasContext: false };
     }
 
-    // Always prefer activeTextEditor, but if webview has focus, activeTextEditor can be undefined.
-    // Fall back to visibleTextEditors to get the user's open editor.
+    // Always prefer activeTextEditor, but if activeTextEditor is an artifact document or undefined,
+    // search for any visible workspace editor first.
     let editor = vscode.window.activeTextEditor;
-    if (!editor && vscode.window.visibleTextEditors && vscode.window.visibleTextEditors.length > 0) {
-      editor = vscode.window.visibleTextEditors.find((e) => e.document && e.document.uri && e.document.uri.scheme === 'file')
-        || vscode.window.visibleTextEditors[0];
+    if (editor && ArtifactDocumentManager.isArtifactUri(editor.document.uri)) {
+      const workspaceEditor = vscode.window.visibleTextEditors?.find(
+        (e) => e.document && e.document.uri && e.document.uri.scheme === 'file' && !ArtifactDocumentManager.isArtifactUri(e.document.uri)
+      );
+      if (workspaceEditor) {
+        editor = workspaceEditor;
+      }
+    } else if (!editor && vscode.window.visibleTextEditors && vscode.window.visibleTextEditors.length > 0) {
+      editor = vscode.window.visibleTextEditors.find(
+        (e) => e.document && e.document.uri && e.document.uri.scheme === 'file' && !ArtifactDocumentManager.isArtifactUri(e.document.uri)
+      ) || vscode.window.visibleTextEditors[0];
     }
 
     if (!editor || !editor.document) {
@@ -30,14 +42,31 @@ export class ContextReader {
     }
 
     const document = editor.document;
+    const isArtifact = ArtifactDocumentManager.isArtifactUri(document.uri);
+    const artifactType: 'plan' | 'walkthrough' | undefined = isArtifact
+      ? (document.fileName.includes('implementation_plan') ? 'plan' : 'walkthrough')
+      : undefined;
+
+    // Guard: Ignore internal extension files and files outside workspace
+    const isInternalLog = document.fileName.includes('globalStorage') ||
+      document.fileName.includes('log-today.txt') ||
+      document.fileName.includes('usage_audit_log.json');
+    if (isInternalLog) {
+      return { hasContext: false };
+    }
+
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
-    const relativePath = workspaceFolder
-      ? vscode.workspace.asRelativePath(document.uri)
-      : document.fileName;
+    if (!isArtifact && !workspaceFolder) {
+      return { hasContext: false };
+    }
+
+    const relativePath = isArtifact
+      ? undefined // Do NOT expose internal AppData path as an editable workspace path!
+      : vscode.workspace.asRelativePath(document.uri);
 
     const selection = editor.selection;
     const selectedText = selection && !selection.isEmpty ? document.getText(selection) : undefined;
-    // Read live in-editor buffer directly from document.getText() (reflects unsaved edits)
+    // Read live in-editor buffer directly from document.getText() (reflects unsaved edits, untruncated)
     const fileContent = document.getText();
 
     return {
@@ -45,13 +74,16 @@ export class ContextReader {
       relativePath,
       languageId: document.languageId,
       selectedText,
-      fileContent: fileContent.length > 25000 ? fileContent.slice(0, 25000) + '\n...[truncated]' : fileContent,
+      fileContent,
+      isArtifactDocument: isArtifact,
+      artifactType,
     };
   }
 
   /**
    * Reads workspace files or finds a file matching a query in the workspace.
-   * Checks open in-memory document buffers first before reading from disk to ensure dirty/unsaved edits are included.
+   * Checks open in-memory document buffers first before reading from disk to ensure dirty/unsaved edits
+   * are included and case-insensitive matching works seamlessly across platforms.
    */
   public static async findAndReadWorkspaceFile(
     fileNameQuery: string,
@@ -62,35 +94,107 @@ export class ContextReader {
       return null;
     }
 
-    const files = await vscode.workspace.findFiles(`**/${fileNameQuery}`, '**/node_modules/**', 1);
-    if (files.length === 0) {
+    const cleanQuery = fileNameQuery.trim().replace(/^['"]|['"]$/g, '');
+    if (!cleanQuery) {
       return null;
     }
+    const lowerQuery = cleanQuery.toLowerCase();
+    const queryBasename = path.basename(cleanQuery).toLowerCase();
 
-    const targetUri = files[0];
-    const relativePath = vscode.workspace.asRelativePath(targetUri);
-
-    // 1. Check if the file is currently open in an editor buffer (live unsaved edits)
+    // 1. Check open in-memory document buffers first (live unsaved edits & case-insensitive match)
     if (vscode.workspace.textDocuments && vscode.workspace.textDocuments.length > 0) {
-      const openDoc = vscode.workspace.textDocuments.find(
-        (doc) => doc.uri && (doc.uri.toString() === targetUri.toString() || doc.uri.fsPath === targetUri.fsPath)
+      // Prioritize exact match first
+      let openDoc = vscode.workspace.textDocuments.find(
+        (doc) => doc.uri && (
+          vscode.workspace.asRelativePath(doc.uri) === cleanQuery ||
+          path.basename(doc.uri.fsPath) === cleanQuery
+        )
       );
+      // Fall back to case-insensitive match (e.g. prd.md -> PRD.md)
+      if (!openDoc) {
+        openDoc = vscode.workspace.textDocuments.find(
+          (doc) => doc.uri && (
+            vscode.workspace.asRelativePath(doc.uri).toLowerCase() === lowerQuery ||
+            path.basename(doc.uri.fsPath).toLowerCase() === queryBasename
+          )
+        );
+      }
+      // If no extension was provided in query, search open documents by file stem
+      if (!openDoc && !cleanQuery.includes('.')) {
+        openDoc = vscode.workspace.textDocuments.find(
+          (doc) => doc.uri && (
+            path.parse(doc.uri.fsPath).name.toLowerCase() === lowerQuery ||
+            path.parse(vscode.workspace.asRelativePath(doc.uri)).name.toLowerCase() === lowerQuery
+          )
+        );
+      }
+
       if (openDoc) {
-        const liveContent = openDoc.getText();
         return {
-          relativePath,
-          content: liveContent.length > 25000 ? liveContent.slice(0, 25000) + '\n...[truncated]' : liveContent,
+          relativePath: vscode.workspace.asRelativePath(openDoc.uri),
+          content: openDoc.getText(),
         };
       }
     }
 
-    // 2. Fall back to reading from disk if not open in memory
+    // 2. Query workspace files via findFiles
+    let targetUri: vscode.Uri | undefined;
+    const hasExtension = cleanQuery.includes('.');
+    const globPattern = hasExtension ? `**/${cleanQuery}` : `**/${cleanQuery}.*`;
+    const files = await vscode.workspace.findFiles(globPattern, '**/node_modules/**', 5);
+    if (files && files.length > 0) {
+      targetUri = files.sort((a, b) => a.fsPath.length - b.fsPath.length)[0];
+    } else {
+      // 3. Fall back to search in workspace files list (with extension search fallback)
+      const allFiles = await this.listWorkspaceFiles(permissionManager);
+      let matchedRelPath = allFiles.find(
+        (f) => f.toLowerCase() === lowerQuery || path.basename(f).toLowerCase() === queryBasename
+      );
+      if (!matchedRelPath && !hasExtension) {
+        const stemMatches = allFiles.filter(
+          (f) => path.parse(f).name.toLowerCase() === lowerQuery
+        );
+        if (stemMatches.length > 0) {
+          matchedRelPath = stemMatches.sort((a, b) => a.length - b.length)[0];
+        }
+      }
+      if (matchedRelPath) {
+        const folders = vscode.workspace.workspaceFolders;
+        if (folders && folders.length > 0) {
+          targetUri = vscode.Uri.joinPath(folders[0].uri, matchedRelPath);
+        }
+      }
+    }
+
+    if (!targetUri) {
+      return null;
+    }
+
+    const relativePath = vscode.workspace.asRelativePath(targetUri);
+
+    // Double check open document for targetUri (in case URI casing differed)
+    if (vscode.workspace.textDocuments && vscode.workspace.textDocuments.length > 0) {
+      const openDoc = vscode.workspace.textDocuments.find(
+        (doc) => doc.uri && (
+          doc.uri.toString() === targetUri.toString() ||
+          doc.uri.fsPath.toLowerCase() === targetUri.fsPath.toLowerCase()
+        )
+      );
+      if (openDoc) {
+        return {
+          relativePath,
+          content: openDoc.getText(),
+        };
+      }
+    }
+
+    // 4. Fall back to reading from disk if not open in memory (untruncated)
     try {
       const data = await vscode.workspace.fs.readFile(targetUri);
       const content = new TextDecoder('utf-8').decode(data);
       return {
         relativePath,
-        content: content.length > 25000 ? content.slice(0, 25000) + '\n...[truncated]' : content,
+        content,
       };
     } catch {
       return null;

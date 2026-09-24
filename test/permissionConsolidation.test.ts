@@ -668,9 +668,10 @@ test('Ask Mode: does NOT auto-apply edits or auto-run terminal commands', async 
   const harness = setupProviderForTesting(manager);
   await harness.handleAutoExecution('```edit_file:src/manual.ts\nconst x = 1;\n```\n```bash\npytest\n```');
 
-  assert.strictEqual(harness.checkpointCalls.length, 0, 'No checkpoints under Ask mode');
+  // Optimistic apply in Ask mode creates a checkpoint before disk write so developer can inspect live and revert
+  assert.strictEqual(harness.checkpointCalls.length, 1, 'Optimistic checkpoint created under Ask mode');
   const autoApplied = harness.postedMessages.filter((m: any) => m.type === 'EDIT_APPLIED');
-  assert.strictEqual(autoApplied.length, 0, 'No automatic edit application under Ask mode');
+  assert.strictEqual(autoApplied.length, 0, 'No EDIT_APPLIED event posted to webview under Ask mode before user decision');
   const chatMsgs = harness.postedMessages.filter((m: any) => m.type === 'MESSAGE_RECEIVED');
   assert.strictEqual(chatMsgs.length, 0, 'No auto-execution chat summaries under Ask mode');
 });
@@ -698,9 +699,10 @@ test('Live Mid-Session Updates: loosening from ask to allow immediately affects 
   const manager = new PermissionManager(context);
   const harness = setupProviderForTesting(manager);
 
-  // Turn 1: applyEdit is 'ask' -> does NOT auto-apply
+  // Turn 1: applyEdit is 'ask' -> optimistically applies with checkpoint 1
   await harness.handleAutoExecution('```edit_file:src/turn1.ts\nconst t1 = 1;\n```');
-  assert.strictEqual(harness.checkpointCalls.length, 0);
+  assert.strictEqual(harness.checkpointCalls.length, 1);
+  assert.strictEqual(harness.postedMessages.filter((m: any) => m.type === 'EDIT_APPLIED').length, 0);
 
   // Mid-session update: user changes applyEdit to 'allow'
   // (TOGGLE_PERMISSION cycles: allow -> ask -> deny -> allow)
@@ -713,10 +715,11 @@ test('Live Mid-Session Updates: loosening from ask to allow immediately affects 
   assert.ok(settingsPushed);
   assert.strictEqual(settingsPushed.permissions.applyEdit, 'allow');
 
-  // Turn 2: in same active conversation, next action auto-applies immediately
+  // Turn 2: in same active conversation, next action auto-applies and emits EDIT_APPLIED
   await harness.handleAutoExecution('```edit_file:src/turn2.ts\nconst t2 = 2;\n```');
-  assert.strictEqual(harness.checkpointCalls.length, 1);
-  assert.strictEqual(harness.checkpointCalls[0].files[0], 'src/turn2.ts');
+  assert.strictEqual(harness.checkpointCalls.length, 2);
+  assert.strictEqual(harness.checkpointCalls[1].files[0], 'src/turn2.ts');
+  assert.strictEqual(harness.postedMessages.filter((m: any) => m.type === 'EDIT_APPLIED').length, 1);
 });
 
 test('Live Mid-Session Updates: tightening from allow to ask immediately pauses next action without reload', async () => {
@@ -725,17 +728,19 @@ test('Live Mid-Session Updates: tightening from allow to ask immediately pauses 
   await manager.setPermission('applyEdit', 'allow');
   const harness = setupProviderForTesting(manager);
 
-  // Turn 1: under allow -> auto-applies
+  // Turn 1: under allow -> auto-applies and emits EDIT_APPLIED
   await harness.handleAutoExecution('```edit_file:src/first.ts\nconst a = 1;\n```');
   assert.strictEqual(harness.checkpointCalls.length, 1);
+  assert.strictEqual(harness.postedMessages.filter((m: any) => m.type === 'EDIT_APPLIED').length, 1);
 
   // Mid-session update: user changes applyEdit to 'ask'
   await harness.sendMessage({ type: 'TOGGLE_PERMISSION', category: 'applyEdit' });
   assert.strictEqual(manager.getPermission('applyEdit'), 'ask');
 
-  // Turn 2: next action does NOT auto-apply
+  // Turn 2: under ask -> creates optimistic checkpoint 2 but does NOT emit EDIT_APPLIED (awaits user decision)
   await harness.handleAutoExecution('```edit_file:src/second.ts\nconst b = 2;\n```');
-  assert.strictEqual(harness.checkpointCalls.length, 1, 'No new checkpoints created under tightened Ask setting');
+  assert.strictEqual(harness.checkpointCalls.length, 2);
+  assert.strictEqual(harness.postedMessages.filter((m: any) => m.type === 'EDIT_APPLIED').length, 1);
 });
 
 test('Pending Edits Lifecycle on Mode Switch: already-pending edit remains pending and applies with zero dialog under Allow', async () => {

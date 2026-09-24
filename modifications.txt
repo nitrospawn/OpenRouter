@@ -61,6 +61,9 @@ send confirmation notification for apply or approval to telegram
 15. When the model writes a large code block, it's collapsed by default (crunched) to avoid excessive scrolling — showing just a snippet, with a summary visible since the full content is written to the file.
 16. Model selector supports High / Medium / Low reasoning-effort selection.
 17. Context refinement — the assistant resolves context and clarifies before acting, plans by default, searches efficiently, and verifies its own work.
+18. Plan execution continuity & non-blocking file edits — even when permissions are set to "ask", the model completes all required modifications during plan execution without stalling or pausing for approval; edits are checkpointed with shadow-git for full revert/undo capabilities, user execution intent matching is broadened ("continue", "please continue", "start", "carry on", "do it", "approved", "ok", "yes"), token limit cutoffs (finish_reason: "length") automatically resume, and plan checklists are reconciled before emitting the final walkthrough.✅
+19. Dynamic Model Capability Tier (`⚡ Agentic` vs `💬 Chat`) badge in webview header directly beside Tools icon, removal of redundant '⚠️ May Train' combobox badges & training warning popup banners (relocated strictly to Settings), and reinforced few-shot plan checklist progression (`- [ ]` -> `- [x]`) in system prompts.✅
+20. Extension-less workspace file search & auto-resolution — when a file is requested without an extension (e.g. "prd file", "to prd", "readme", "config file"), the system first searches workspace files by stem (`**/${cand}.*` and open buffers) to discover the exact extension and specific file (e.g. `PRD.md`), auto-injects its contents into context, and forbids models from asking users to manually open existing workspace files.✅
 
 ## Backlog — Bugs & Feature Requests to Address
 
@@ -91,7 +94,33 @@ send confirmation notification for apply or approval to telegram
    planning, generating, verifying — per Phase 9's multi-step flow), there 
    should be some visible indication in the chat UI of what step it's on 
    or that it's actively reasoning through something, rather than just a 
-   generic loading/streaming state with no insight into what's happening.
+   generic loading/streaming state with no insight into what's happening..✅
+
+
+
+
+
+
+Whats the timeout for the main chat incase it encoutters and issue or network issue?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -184,3 +213,45 @@ can the modeuluse tools like github app installatiion?
     Change reasoning mid-conversation: Adjust reasoning effort mid-conversation while preserving the original prompt prefix for caching.
 
 Get started
+### Backlog Note: Investigation into Plan Execution Mid-Task Halting & Proposed Fixes [COMPLETED ✅]
+1. **Auto-continue after Manual Apply / Run (Ask Mode):**
+   - In 'Ask' mode or when clicking 'Apply' / 'Run in Terminal', the extension currently breaks execution after applying the change. It needs an auto-continuation trigger once all pending edits/commands in that turn are accepted so the model doesn't freeze and wait for user prompts.
+2. **Loosen Approval Intent Matching (isExecutionIntent):**
+   - Expand regex in panelProvider.ts beyond rigid phrasing to match natural user affirmations ('start', 'do it', 'carry on', 'continue', 'yes please').
+3. **Auto-resume on Token Limit Cutoff (inish_reason: "length"):**
+   - Automatically prompt the model to continue when cut off mid-response by OpenRouter max_tokens limits.
+4. **Autonomous Execution Model (Speculative / Optimistic Buffer Execution):**
+   - Explore optimistic in-memory / checkpointed execution where edits apply continuously while letting the user 'Keep' or 'Revert', instead of blocking the model between every file turn.
+
+5. **CRITICAL REQUIREMENT - Non-Blocking File Edits in 'Ask' Mode:**
+   - Even when code edits permission is configured to 'Ask', the model MUST NOT halt or wait between individual file edits during plan execution.
+   - It must complete all required file modifications and tasks continuously without stopping to wait for user confirmation.
+   - The pending edit cards / 'Apply' controls act as a review/keep-or-revert interface for the user, rather than an execution blocker that halts the agent mid-task.
+
+6. **State Tracking & Plan Verification Checklist (Eliminating Execution Amnesia):**
+   - **Current State:** The model outputs a textual plan in Turn 1, but when execution begins across turns, it has no persistent programmatic checklist or state tracking of which tasks have been completed vs. remaining. It often loses track of remaining steps or assumes it's finished after modifying 1 or 2 files.
+   - **Proposed Architectural Solution:**
+     - Ground the model with a structured checklist (e.g., - [x] Step 1, - [ ] Step 2).
+     - In continuation turns, re-inject the active plan with updated checkmarks so the model explicitly checks off completed tasks and sees what remains.
+     - Before emitting the final walkthrough, instruct the model to do a reconciliation pass: compare all modifications made against the original plan checklist to ensure no planned files/changes were skipped.
+
+
+7. **Intermediate Execution Step Details Collapse (Option B) [COMPLETED ✅]:**
+   - **Problem:** During autonomous multi-step execution / self-verification turns (e.g. running terminal commands like type prd.md), the model often produces conversational observations or internal thinking aloud that was displayed as large standalone message bubbles, creating visual clutter and looking like 'thoughts spilling into chat'.
+   - **Solution:**
+     - Tagged automated follow-up turns with isIntermediateStep: true in historyStore and webview messages.
+     - In the chat UI, actions (terminal widgets, command code blocks, diff cards) remain prominent and interactive, while accompanying intermediate commentary is neatly wrapped in a native collapsible drawer (<details class='intermediate-step-details'>).
+     - The drawer displays Step Notes (or Step Notes (Attention Needed) if errors/warnings are detected, automatically opened).
+     - Direct user-initiated turns and final completion/walkthrough responses remain fully expanded as normal.
+     - Preserves 100% of underlying chat history and full model context.
+
+8. **Comprehensive User Action & File Operation Diagnostic Logging [COMPLETED ✅]:**
+   - **Requirement:** Ensure all user actions and file operations are explicitly captured in diagnostic logs (e.g., user accepted change to ..., writing to file ..., user ran terminal command ..., etc.).
+   - **Implemented:**
+     - Logged in DiffPreviewManager immediately before disk write: logger.info('FILE', Writing to file: );
+     - Logged on single & bulk edit accept: logger.info('USER', User accepted change to: ); and logger.info('FILE', Writing to file: );
+     - Logged on autonomous auto-apply: logger.info('FILE', Writing to file:  (auto-apply));
+     - Logged on reject & revert: logger.info('USER', User rejected change to: ...); and logger.info('FILE', Reverting file: ... from pre-edit snapshot);
+     - Logged on user terminal executions: logger.info('USER', User ran terminal command: );
+     - Logged on diff preview: logger.info('USER', User opened diff preview for: );
+     - Logged on session & settings actions: model selection, model refresh, new/switch/rename/delete sessions, clear history, and permission toggles.

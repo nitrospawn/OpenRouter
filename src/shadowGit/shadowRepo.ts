@@ -3,6 +3,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as path from 'path';
 import * as fs from 'fs';
+import { logger } from '../logger';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +24,7 @@ export class ShadowRepo {
 
     try {
       if (!fs.existsSync(this.gitDir)) {
+        logger.info('SHADOW_GIT', `Initializing shadow git repository at: ${this.gitDir} (worktree: ${this.workTree})`);
         fs.mkdirSync(this.gitDir, { recursive: true });
         // Initialize an isolated git repo without modifying the workspace directory
         await execFileAsync('git', ['--git-dir', this.gitDir, '--work-tree', this.workTree, 'init']);
@@ -32,10 +34,12 @@ export class ShadowRepo {
         await this.runGit(['config', 'user.email', 'shadow@openrouter.internal']);
         // Avoid core.autocrlf issues across platforms
         await this.runGit(['config', 'core.autocrlf', 'false']);
+        logger.info('SHADOW_GIT', 'Shadow git repository initialized successfully');
       }
       this.isInitialized = true;
       return true;
     } catch (err) {
+      logger.error('SHADOW_GIT', `Failed to initialize shadow git repository: ${err}`);
       console.error('[ShadowRepo] Failed to initialize shadow repo:', err);
       return false;
     }
@@ -57,10 +61,12 @@ export class ShadowRepo {
   public async clean(): Promise<void> {
     try {
       if (fs.existsSync(this.gitDir)) {
+        logger.info('SHADOW_GIT', `Cleaned shadow repository: ${this.gitDir}`);
         fs.rmSync(this.gitDir, { recursive: true, force: true });
       }
       this.isInitialized = false;
     } catch (err) {
+      logger.error('SHADOW_GIT', `Failed to clean shadow git: ${err}`);
       console.error('[ShadowRepo] Failed to clean shadow git:', err);
     }
   }

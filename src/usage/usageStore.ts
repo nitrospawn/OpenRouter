@@ -16,6 +16,7 @@ export interface UsageAuditRecord {
   cost?: number;
   command?: string;
   cwd?: string;
+  reasoningEffort?: string;
 }
 
 export interface SpendSummary {
@@ -49,11 +50,8 @@ export class UsageStore {
 
     try {
       if (fs.existsSync(this.logFilePath)) {
-        const raw = fs.readFileSync(this.logFilePath, 'utf8');
-        const parsed = JSON.parse(raw);
-        this.inMemoryLog = Array.isArray(parsed) ? parsed : [];
-      } else {
-        this.inMemoryLog = [];
+        const raw = await fs.promises.readFile(this.logFilePath, 'utf8');
+        this.inMemoryLog = JSON.parse(raw);
       }
     } catch {
       this.inMemoryLog = [];
@@ -68,10 +66,19 @@ export class UsageStore {
       await this.loadRecords();
     }
 
+    let effort = record.reasoningEffort;
+    if (!effort && record.model) {
+      const match = record.model.match(/\((Low|Medium|High)\)$/i);
+      if (match) {
+        effort = match[1];
+      }
+    }
+
     const fullRecord: UsageAuditRecord = {
       id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       timestamp: Date.now(),
       ...record,
+      reasoningEffort: effort,
     };
 
     this.inMemoryLog.unshift(fullRecord); // latest first

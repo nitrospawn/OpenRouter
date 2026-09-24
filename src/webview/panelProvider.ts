@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { SecretStore } from '../auth/secretStore';
 import { OpenRouterClient, OpenRouterModel, ChatMessageContentPart, ProviderRoutingOptions } from '../api/openrouterClient';
 import { detectModelCapabilities } from '../api/modelCapabilities';
@@ -13,14 +14,16 @@ import { CommandRunner } from '../terminal/commandRunner';
 import { ShadowRepo } from '../shadowGit/shadowRepo';
 import { CheckpointManager } from '../shadowGit/checkpoint';
 import { ScopedRestore } from '../shadowGit/restore';
-import { HostToWebviewMessage, WebviewToHostMessage } from './messages';
+import { HostToWebviewMessage, WebviewToHostMessage, AttachedFileRef } from './messages';
 import { SecretScanner } from '../privacy/secretScanner';
 import { DiagnosticManager, StructuredDiagnostic } from '../diagnostics/diagnosticManager';
+import { logger } from '../logger';
 
 import { UsageStore } from '../usage/usageStore';
 import { PricingCalculator } from '../api/pricing';
 import { ProjectResolver } from '../usage/projectResolver';
-import { buildSystemPrompt } from '../prompt/systemPrompt';
+import { buildSystemPrompt, FileBatchMetadata } from '../prompt/systemPrompt';
+import { ChunkManager } from '../editor/chunkManager';
 import { extractArtifacts } from '../prompt/responseParser';
 import { ArtifactDocumentManager } from '../editor/artifactDocumentManager';
 import { ReviewerCommentController } from '../comments/reviewerCommentController';
@@ -35,14 +38,253 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
   private _checkpointManager?: CheckpointManager;
   private _scopedRestore?: ScopedRestore;
   private _activeAbortController?: AbortController;
+  private _isUserCancelled: boolean = false;
   private _reviewerCommentController?: ReviewerCommentController;
-  private _reviewerHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  private _reviewerHistory: Array<{ role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }> = [];
   private _activeReviewerAbortController?: AbortController;
+  private _isReviewerUserCancelled: boolean = false;
   private _activeReviewerModelOverride?: string;
   private _activeReviewerReasoningEffortOverride?: string;
   private _lastReviewerUserPrompt?: string;
   private _activeReviewerArtifactContent?: string;
   private _activeReviewerArtifactType?: 'plan' | 'walkthrough';
+  private _activeReviewerArtifactName?: string;
+  private _activeReasoningEffort?: string;
+  private _currentTurnUserMessageId?: string;
+
+  private async _tagCurrentTurnCheckpoint(checkpointId: string, files: string[]): Promise<void> {
+    if (!checkpointId || !files || files.length === 0) return;
+    try {
+      const history = await this._historyStore.loadHistory();
+      let targetMsg = this._currentTurnUserMessageId
+        ? history.find((m) => m.id === this._currentTurnUserMessageId)
+        : undefined;
+
+      if (!targetMsg) {
+        targetMsg = [...history].reverse().find(
+          (m) => m.role === 'user' || m.id.endsWith('-user') || m.id.endsWith('-followup')
+        );
+      }
+
+      if (targetMsg) {
+        const existing = targetMsg.affectedFiles ?? [];
+        const merged = Array.from(new Set([...existing, ...files]));
+        await this._historyStore.tagTurnCheckpoint(targetMsg.id, checkpointId, merged);
+        logger.info(
+          'SHADOW_GIT',
+          `Tagged turn message ${targetMsg.id} with checkpoint ${checkpointId.substring(0, 7)} (files: [${merged.join(', ')}])`
+        );
+      }
+    } catch (err) {
+      console.warn('[panelProvider] Failed to tag turn checkpoint:', err);
+      logger.warn('SHADOW_GIT', `Failed to tag turn checkpoint ${checkpointId?.substring(0, 7)}: ${err}`);
+    }
+  }
+
+  private _appliedEditCheckpoints: Array<{
+    filePath: string;
+    normalizedPath: string;
+    checkpointId?: string;
+    originalContent: string;
+    editId?: string;
+    timestamp: number;
+  }> = [];
+
+  private _trackAppliedEdit(filePath: string, checkpointId: string | undefined, originalContent: string, editId?: string) {
+    const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+    this._appliedEditCheckpoints.push({
+      filePath,
+      normalizedPath: normalized,
+      checkpointId,
+      originalContent,
+      editId,
+      timestamp: Date.now(),
+    });
+    if (this._appliedEditCheckpoints.length > 50) {
+      this._appliedEditCheckpoints.shift();
+    }
+  }
+
+  private async _revertAppliedEdit(filePath?: string, editId?: string): Promise<boolean> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return false;
+    }
+
+    let idx = -1;
+    if (editId) {
+      for (let i = this._appliedEditCheckpoints.length - 1; i >= 0; i--) {
+        if (this._appliedEditCheckpoints[i].editId === editId) {
+          idx = i;
+          break;
+        }
+      }
+    }
+    if (idx === -1 && filePath) {
+      const norm = filePath.replace(/\\/g, '/').toLowerCase();
+      for (let i = this._appliedEditCheckpoints.length - 1; i >= 0; i--) {
+        const item = this._appliedEditCheckpoints[i];
+        if (item.normalizedPath === norm || item.normalizedPath.endsWith(norm) || norm.endsWith(item.normalizedPath)) {
+          idx = i;
+          break;
+        }
+      }
+    }
+
+    if (idx === -1) {
+      logger.warn('REVERT', `No pre-edit snapshot found for ${filePath || editId}`);
+      return false;
+    }
+
+    const tracked = this._appliedEditCheckpoints[idx];
+    this._appliedEditCheckpoints.splice(idx, 1);
+
+    const targetFilePath = tracked.filePath;
+    const fileUri = path.isAbsolute(targetFilePath)
+      ? vscode.Uri.file(targetFilePath)
+      : vscode.Uri.joinPath(workspaceFolders[0].uri, targetFilePath);
+
+    let restored = false;
+
+    // 1. Try scoped restore from shadow-git commit if available
+    if (tracked.checkpointId && this._scopedRestore) {
+      try {
+        const res = await this._scopedRestore.restore(tracked.checkpointId, [targetFilePath], true);
+        if (res.success) {
+          restored = true;
+          logger.info('REVERT', `Scoped restore successful for ${targetFilePath} from checkpoint ${tracked.checkpointId.substring(0, 7)}`);
+        }
+      } catch (err) {
+        logger.warn('REVERT', `Scoped restore failed, falling back to original content write: ${err}`);
+      }
+    }
+
+    // 2. Direct writeback of originalContent snapshot (fail-safe)
+    if (!restored) {
+      if (tracked.originalContent === '') {
+        try {
+          await vscode.workspace.fs.delete(fileUri, { useTrash: false });
+          restored = true;
+          logger.info('REVERT', `Deleted newly created file ${targetFilePath} on revert`);
+        } catch {
+          try {
+            const encoder = new TextEncoder();
+            await vscode.workspace.fs.writeFile(fileUri, encoder.encode(''));
+            restored = true;
+          } catch (err) {
+            logger.error('REVERT', `Failed to delete or empty ${targetFilePath}: ${err}`);
+          }
+        }
+      } else {
+        try {
+          const encoder = new TextEncoder();
+          await vscode.workspace.fs.writeFile(fileUri, encoder.encode(tracked.originalContent));
+          restored = true;
+          logger.info('REVERT', `Restored ${targetFilePath} directly from originalContent snapshot`);
+        } catch (err) {
+          logger.error('REVERT', `Failed to write back original content for ${targetFilePath}: ${err}`);
+        }
+      }
+    }
+
+    // 3. Sync live VS Code document buffer so the editor instantly reverts on screen
+    try {
+      const openDoc = vscode.workspace.textDocuments.find(
+        (d) => d.uri && d.uri.fsPath.toLowerCase() === fileUri.fsPath.toLowerCase()
+      );
+      if (openDoc) {
+        const edit = new vscode.WorkspaceEdit();
+        const fullRange = new vscode.Range(
+          openDoc.positionAt(0),
+          openDoc.positionAt(openDoc.getText().length)
+        );
+        edit.replace(openDoc.uri, fullRange, tracked.originalContent);
+        await vscode.workspace.applyEdit(edit);
+        await openDoc.save();
+      }
+    } catch {
+      // ignore
+    }
+
+    return restored;
+  }
+
+  private _extractFilesMutatedByCommand(command: string, workspaceRoot?: string): string[] {
+    const affected: string[] = [];
+
+    // 1. Redirections: > file, >> file (handling quotes and unquoted paths)
+    const redirRegex = /(?:>>|>)\s*(?:["']([^"'\r\n]+)["']|([^\s;&|"'`]+))/g;
+    let match;
+    while ((match = redirRegex.exec(command)) !== null) {
+      const rawPath = (match[1] || match[2] || '').trim();
+      if (rawPath && !['&1', '&2', 'nul', '/dev/null', 'con'].includes(rawPath.toLowerCase())) {
+        affected.push(rawPath);
+      }
+    }
+
+    // 2. PowerShell cmdlets: Set-Content, Out-File, Add-Content, sc, ac
+    const psRegex = /(?:Set-Content|Out-File|Add-Content|sc|ac)\s+(?:-(?:Path|FilePath|LiteralPath)\s+)?(?:["']([^"'\r\n]+)["']|([^\s;&|"'`]+))/gi;
+    while ((match = psRegex.exec(command)) !== null) {
+      const rawPath = (match[1] || match[2] || '').trim();
+      if (rawPath && !['&1', '&2', 'nul', '/dev/null', 'con'].includes(rawPath.toLowerCase())) {
+        affected.push(rawPath);
+      }
+    }
+
+    // 3. POSIX/Unix utilities: tee, touch
+    const posixRegex = /(?:tee(?:\s+-a)?|touch)\s+(?:["']([^"'\r\n]+)["']|([^\s;&|"'`]+))/gi;
+    while ((match = posixRegex.exec(command)) !== null) {
+      const rawPath = (match[1] || match[2] || '').trim();
+      if (rawPath && !['&1', '&2', 'nul', '/dev/null', 'con'].includes(rawPath.toLowerCase())) {
+        affected.push(rawPath);
+      }
+    }
+
+    // 4. sed -i
+    const sedRegex = /sed\s+(?:-i|--in-place)(?:[^\s;]+)?\s+["'].*?["']\s+(?:["']([^"'\r\n]+)["']|([^\s;&|"'`]+))/gi;
+    while ((match = sedRegex.exec(command)) !== null) {
+      const rawPath = (match[1] || match[2] || '').trim();
+      if (rawPath && !['&1', '&2', 'nul', '/dev/null', 'con'].includes(rawPath.toLowerCase())) {
+        affected.push(rawPath);
+      }
+    }
+
+    // Filter & sanitize
+    return Array.from(new Set(affected)).filter((f) => {
+      if (f.startsWith('..')) return false;
+      if (path.isAbsolute(f) && workspaceRoot && (path.relative(workspaceRoot, f).startsWith('..') || path.isAbsolute(path.relative(workspaceRoot, f)))) return false;
+      if (f.includes('globalStorage') || f.includes('log-today.txt') || f.includes('usage_audit_log.json')) return false;
+      return true;
+    });
+  }
+
+  private _formatTerminalExecutionSummary(
+    commands: Array<{ command: string; outcome: string; exitCode: number | null; output: string; timedOut?: boolean; cancelled?: boolean }>
+  ): string {
+    const total = commands.length;
+    const allOk = commands.every((c) => c.exitCode === 0 && !c.timedOut && !c.cancelled);
+    let summaryText = '';
+    if (total === 1) {
+      const c = commands[0];
+      const cmdShort = c.command.length > 40 ? c.command.slice(0, 37) + '...' : c.command;
+      summaryText = `Ran terminal command: \`${cmdShort}\` ${c.outcome}`;
+    } else {
+      const failedCount = commands.filter((c) => c.exitCode !== 0 || c.timedOut).length;
+      const outcomeText = allOk ? 'all completed, exit code: 0' : `${total - failedCount} completed, ${failedCount} failed`;
+      summaryText = `Ran ${total} terminal commands (${outcomeText})`;
+    }
+
+    let body = `<!-- terminal-run-summary:start -->\n`;
+    body += `✓ **Ran in terminal:** ${summaryText}\n`;
+    for (const c of commands) {
+      body += `\n$ ${c.command}\n`;
+      if (c.output) {
+        body += `\`\`\`\n${c.output}\n\`\`\`\n`;
+      }
+    }
+    body += `<!-- terminal-run-summary:end -->`;
+    return body;
+  }
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -102,6 +344,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         case 'SELECT_MODEL': {
+          logger.info('USER', `User selected model: ${data.modelId}`);
           await Configuration.setLastModel(data.modelId);
           const model = this._cachedModels.find((m) => m.id === data.modelId);
           const capabilities = detectModelCapabilities(model);
@@ -114,6 +357,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         case 'REFRESH_MODELS': {
+          logger.info('USER', 'User refreshed models list');
           const key = await this._secretStore.getApiKey();
           if (key) {
             this._cachedModels = [];
@@ -122,19 +366,63 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           break;
         }
 
-        case 'SEND_MESSAGE':
-          await this._handleSendMessage(data.content, data.modelId, data.images, data.messageId, data.reasoningEffort);
+        case 'SEND_MESSAGE': {
+          logger.info('USER', `User submitted prompt (${data.content?.length ?? 0} chars, model: ${data.modelId || 'default'}${data.attachments?.length ? `, ${data.attachments.length} attachments` : ''})`);
+          logger.info('CHAT', `User message sent — model: ${data.modelId || 'default'}, est tokens: ~${Math.round((data.content || '').length / 4)}`);
+          if (data.reasoningEffort) {
+            this._activeReasoningEffort = data.reasoningEffort;
+          }
+          const userText = (data.content || '').trim();
+          let isExecutionIntent = /^(?:proceed(?: with (?:the )?plan)?|continue(?: with (?:the )?plan)?|please continue|implement(?: the plan)?|execute(?: the plan)?|go ahead(?: and (?:proceed|execute|implement))?|carry on|start(?: (?:the )?plan)?|do it|approved?|apply (?:the )?plan|yes(?: please)?(?:,? (?:proceed|continue|go ahead|do it))?|ok(?:,? (?:proceed|continue|go ahead|do it))?)[.! ]*$/i.test(userText);
+
+          if (!isExecutionIntent && this._historyStore) {
+            try {
+              const hist = await this._historyStore.loadHistory();
+              const hasActivePlan = hist.some(
+                (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+              );
+              const lastAssistantMsg = [...hist].reverse().find((m) => m.role === 'assistant');
+              const hasWalkthrough = Boolean(
+                lastAssistantMsg?.walkthroughDocument || (lastAssistantMsg?.content && /```walkthrough/i.test(lastAssistantMsg.content))
+              );
+              if (hasActivePlan && !hasWalkthrough) {
+                if (/^(?:yes|yep|yeah|sure|ok|okay|next|continue|go|carry on|proceed|do this|start)[.! ]*$/i.test(userText)) {
+                  isExecutionIntent = true;
+                }
+              }
+            } catch {
+              // non-fatal
+            }
+          }
+
+          const initialRetryContext = isExecutionIntent
+            ? { retryCount: 0, failedCommands: new Set<string>(), autoTurnCount: 0, isAutoFollowUp: true }
+            : undefined;
+          await this._handleSendMessage(
+            data.content,
+            data.modelId,
+            data.images,
+            data.messageId,
+            data.reasoningEffort || this._activeReasoningEffort,
+            initialRetryContext,
+            data.isRetry,
+            data.userTypedText,
+            data.attachments
+          );
           break;
+        }
 
         case 'STOP_STREAM':
+          logger.info('USER', 'User stopped model stream mid-flight');
+          this._isUserCancelled = true;
           if (this._activeAbortController) {
             this._activeAbortController.abort();
-            this._activeAbortController = undefined;
           }
           this._postMessage({ type: 'SET_BUSY', busy: false });
           break;
 
         case 'PREVIEW_DIFF': {
+          logger.info('USER', `User opened diff preview for: ${data.filePath}`);
           const workspaceFolders = vscode.workspace.workspaceFolders;
           if (workspaceFolders && workspaceFolders.length > 0) {
             const fileUri = path.isAbsolute(data.filePath)
@@ -146,6 +434,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         case 'VIEW_ARTIFACT': {
+          logger.info('USER', `User opened artifact document: ${data.artifactType}${data.messageId ? ` (message: ${data.messageId})` : ''}`);
           await ArtifactDocumentManager.openArtifactDocument(
             this._historyStore,
             data.artifactType,
@@ -172,7 +461,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             data.modelId,
             data.reasoningEffort,
             data.artifactContent,
-            data.artifactType
+            data.artifactType,
+            data.attachedFile
           );
           break;
         }
@@ -195,7 +485,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
         case 'SWITCH_REVIEWER_SESSION': {
           const msgs = await this._historyStore.switchReviewerSession(data.sessionId);
-          this._reviewerHistory = msgs.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+          this._reviewerHistory = msgs.map((m) => ({
+            role: m.role as 'user' | 'assistant',
+            content: m.content,
+            attachedFile: m.attachedFile,
+            executionDurationMs: m.executionDurationMs,
+          }));
           await this._sendReviewerSessionsData();
           const { activeSession } = await this._historyStore.loadReviewerSessions();
           if (activeSession.artifactContent && (activeSession.artifactType === 'plan' || activeSession.artifactType === 'walkthrough')) {
@@ -232,24 +527,28 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         case 'RESET_REVIEWER_CONTEXT': {
-          // Manual "Start fresh from here": Clear current reviewer session turns
+          // Manual "Start fresh from here": Clear the active session's messages in-place
+          // rather than creating a new session, to avoid accumulating empty sessions.
           this._reviewerHistory = [];
-          const { activeSession } = await this._historyStore.loadReviewerSessions();
-          await this._historyStore.startNewReviewerSession('Review Session (Fresh)');
+          this._activeReviewerArtifactContent = undefined;
+          this._activeReviewerArtifactType = undefined;
+          this._activeReviewerArtifactName = undefined;
+          await this._historyStore.clearActiveReviewerSession();
           await this._handleOpenDirectReviewer();
           break;
         }
 
         case 'STOP_REVIEWER_STREAM': {
+          this._isReviewerUserCancelled = true;
           if (this._activeReviewerAbortController) {
             this._activeReviewerAbortController.abort();
-            this._activeReviewerAbortController = undefined;
           }
           this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
           break;
         }
 
         case 'ACCEPT_EDIT': {
+          logger.info('USER', `User accepted change to: ${data.filePath} (editId: ${data.editId})`);
           const workspaceFolders = vscode.workspace.workspaceFolders;
           if (workspaceFolders && workspaceFolders.length > 0) {
             const fileUri = path.isAbsolute(data.filePath)
@@ -264,6 +563,48 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
 
             const relativePath = vscode.workspace.asRelativePath(fileUri);
+
+            // Step 0: Check if this edit was already optimistically applied
+            const existingTracked = this._appliedEditCheckpoints.find(
+              (item) => item.editId === data.editId
+            );
+            let checkpointId: string | undefined = existingTracked?.checkpointId;
+
+            let currentContent = '';
+            if (fileExists) {
+              try {
+                const fileData = await vscode.workspace.fs.readFile(fileUri);
+                currentContent = new TextDecoder('utf-8').decode(fileData);
+              } catch {
+                // ignore
+              }
+            }
+
+            let resolvedContent = '';
+            try {
+              resolvedContent = DiffPreviewManager.resolveProposedContent(currentContent, data.newContent);
+            } catch {
+              resolvedContent = data.newContent;
+            }
+
+            const normalizedCurrent = currentContent.replace(/\r\n/g, '\n');
+            const normalizedResolved = resolvedContent.replace(/\r\n/g, '\n');
+            const isAlreadyApplied = Boolean(existingTracked) || (fileExists && normalizedCurrent === normalizedResolved);
+
+            if (isAlreadyApplied) {
+              logger.info('EDIT', `Edit ${data.editId} for ${relativePath} is already applied on disk (no-op write)`);
+              if (checkpointId) {
+                await this._tagCurrentTurnCheckpoint(checkpointId, [data.filePath]);
+              }
+              this._postMessage({
+                type: 'EDIT_APPLIED',
+                editId: data.editId,
+                success: true,
+                checkpointId,
+                filePath: data.filePath,
+              });
+              break;
+            }
 
             // Step 1: Gate with consolidated permission check BEFORE creating checkpoints or touching disk
             const permStatus = await this._permissionManager.checkApplyEditPermission(
@@ -281,7 +622,6 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
 
             // Step 2: Create a shadow-git checkpoint of the affected file before applying the edit
-            let checkpointId: string | undefined;
             if (this._checkpointManager) {
               const res = await this._checkpointManager.createCheckpoint(
                 [data.filePath],
@@ -292,6 +632,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               }
             }
 
+            let originalContent = '';
+            try {
+              const fileData = await vscode.workspace.fs.readFile(fileUri);
+              originalContent = new TextDecoder('utf-8').decode(fileData);
+            } catch {
+              // ignore
+            }
+
             // Step 3: Apply the workspace edit (skipPermissionCheck: true because already checked and approved above)
             const success = await DiffPreviewManager.applyEdit(
               fileUri,
@@ -300,16 +648,24 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               true
             );
 
-            // Step 4: Tag the most-recent user message with this checkpoint so the undo
+            // Step 4: Tag the current turn with this checkpoint so the undo
             // icon in the user message header is always-visible and scoped to this turn.
             if (checkpointId && success) {
-              const history = await this._historyStore.loadHistory();
-              const lastUserMsg = [...history].reverse().find((m) => m.role === 'user');
-              if (lastUserMsg) {
-                const existing = lastUserMsg.affectedFiles ?? [];
-                const merged = Array.from(new Set([...existing, data.filePath]));
-                await this._historyStore.tagTurnCheckpoint(lastUserMsg.id, checkpointId, merged);
+              await this._tagCurrentTurnCheckpoint(checkpointId, [data.filePath]);
+              this._trackAppliedEdit(data.filePath, checkpointId, originalContent, data.editId);
+            }
+
+            // Open edited file into independent editor tab with preserveFocus
+            if (success) {
+              logger.info('EDIT', `Applied ✓ ${relativePath}${checkpointId ? ` (checkpoint: ${checkpointId.substring(0, 7)})` : ''}`);
+              try {
+                const doc = await vscode.workspace.openTextDocument(fileUri);
+                await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true });
+              } catch {
+                // non-fatal
               }
+            } else {
+              logger.error('EDIT', `FAILED to apply edit: ${relativePath}`);
             }
 
             this._postMessage({
@@ -317,12 +673,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               editId: data.editId,
               success,
               checkpointId,
+              filePath: data.filePath,
             });
           }
           break;
         }
 
         case 'ACCEPT_ALL_EDITS': {
+          logger.info('USER', `User accepted all proposed edits (${data.edits?.length ?? 0} files)`);
           const workspaceFolders = vscode.workspace.workspaceFolders;
           if (workspaceFolders && workspaceFolders.length > 0 && data.edits.length > 0) {
             // Step 1: Check permissions upfront before checkpoint or file system operations
@@ -421,6 +779,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
             // Step 3: Apply each edit sequentially with skipPermissionCheck = true
             for (const item of resolvedEdits) {
+              logger.info('USER', `Applying bulk edit to: ${item.relativePath}`);
+              logger.info('FILE', `Writing to file: ${item.relativePath}`);
+              let origContent = '';
+              try {
+                const fileData = await vscode.workspace.fs.readFile(item.fileUri);
+                origContent = new TextDecoder('utf-8').decode(fileData);
+              } catch {
+                // ignore
+              }
+
               const success = await DiffPreviewManager.applyEdit(
                 item.fileUri,
                 item.edit.newContent,
@@ -428,20 +796,55 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
                 true
               );
 
+              if (success) {
+                this._trackAppliedEdit(item.edit.filePath, checkpointId, origContent, item.edit.editId);
+              }
+
               this._postMessage({
                 type: 'EDIT_APPLIED',
                 editId: item.edit.editId,
                 success,
                 checkpointId, // All edits share this common checkpointId for unified per-turn undo
+                filePath: item.edit.filePath,
               });
             }
 
-            // Step 4: Tag the most-recent user message with the unified checkpoint
+            // Step 4: Tag the current turn with the unified checkpoint
             if (checkpointId) {
-              const history = await this._historyStore.loadHistory();
-              const lastUserMsg = [...history].reverse().find((m) => m.role === 'user');
-              if (lastUserMsg) {
-                await this._historyStore.tagTurnCheckpoint(lastUserMsg.id, checkpointId, affectedFiles);
+              await this._tagCurrentTurnCheckpoint(checkpointId, affectedFiles);
+            }
+
+            // Auto-trigger continuation if an active plan is underway and not yet completed
+            if (this._historyStore) {
+              try {
+                const hist = await this._historyStore.loadHistory();
+                const hasActivePlan = hist.some(
+                  (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+                );
+                const lastAssistantMsg = [...hist].reverse().find((m) => m.role === 'assistant');
+                const hasWalkthrough = Boolean(
+                  lastAssistantMsg?.walkthroughDocument || (lastAssistantMsg?.content && /```walkthrough/i.test(lastAssistantMsg.content))
+                );
+                if (hasActivePlan && !hasWalkthrough && !this._activeAbortController?.signal.aborted) {
+                  const targetModel = Configuration.getLastModel() || 'openai/gpt-4o-mini';
+                  const fileNames = affectedFiles.map((f) => path.basename(f)).join(', ');
+                  const continuationPrompt = `Applied edits to ${fileNames} successfully. Please proceed directly with the next step in the implementation plan without pausing for confirmation, or provide the final walkthrough if all steps are complete.`;
+                  await this._handleSendMessage(
+                    continuationPrompt,
+                    targetModel,
+                    undefined,
+                    undefined,
+                    this._activeReasoningEffort,
+                    {
+                      retryCount: 0,
+                      failedCommands: new Set<string>(),
+                      autoTurnCount: 1,
+                      isAutoFollowUp: true,
+                    }
+                  );
+                }
+              } catch {
+                // non-fatal
               }
             }
           }
@@ -462,36 +865,37 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             break;
           }
 
-          // 1. Pre-flight & Confirmation
+          // 1. Look up target message in historyStore to resolve checkpointId & affectedFiles if missing from payload
+          const targetMsg = await this._historyStore.getMessageById(data.messageId);
+          let checkpointId = data.checkpointId || targetMsg?.checkpointId || '';
+
           const messagesAfter = await this._historyStore.getMessagesAfter(data.messageId);
           const n = messagesAfter.length;
           console.log('[panelProvider] getMessagesAfter returned count:', n, 'for target messageId:', data.messageId);
-          if (n === 0) {
-            console.log('[panelProvider] No subsequent history to undo (n === 0).');
-            // Nothing subsequent to clear or revert (safe no-op)
-            this._postMessage({
-              type: 'UNDO_RESULT',
-              checkpointId: data.checkpointId,
-              messageId: data.messageId,
-              success: false,
-              message: 'No subsequent history to undo.',
-            });
-            break;
-          }
 
-          // Gather affected files across the turn and any subsequent turns being rolled back
+          // Gather affected files across this turn and any subsequent turns being rolled back
           const affectedFilesSet = new Set<string>(data.affectedFiles || []);
+          if (targetMsg?.affectedFiles) {
+            for (const f of targetMsg.affectedFiles) {
+              affectedFilesSet.add(f);
+            }
+          }
           for (const m of messagesAfter) {
             if (m.affectedFiles) {
               for (const f of m.affectedFiles) {
                 affectedFilesSet.add(f);
               }
             }
+            if (!checkpointId && m.checkpointId) {
+              checkpointId = m.checkpointId;
+            }
           }
           const targetFiles = Array.from(affectedFilesSet);
 
-          // Confirmation dialog
-          const msgCountText = `${n} later message${n === 1 ? '' : 's'}`;
+          // Confirmation dialog (supports both turns with subsequent messages and turns stopped mid-flight)
+          const msgCountText = n > 0
+            ? `${n} later message${n === 1 ? '' : 's'}`
+            : 'this turn';
           const confirmChoice = await vscode.window.showWarningMessage(
             `This will undo this change and remove ${msgCountText} from this chat — this cannot be undone. Continue?`,
             { modal: true },
@@ -502,7 +906,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           if (confirmChoice !== 'Continue') {
             this._postMessage({
               type: 'UNDO_RESULT',
-              checkpointId: data.checkpointId,
+              checkpointId,
               messageId: data.messageId,
               success: false,
               message: 'Cancelled',
@@ -510,14 +914,20 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             break;
           }
 
+          // User activity logging
+          logger.info(
+            'USER',
+            `User triggered Undo on turn ${data.messageId}${checkpointId ? ` (checkpoint: ${checkpointId.substring(0, 7)})` : ''} - reverting ${targetFiles.length} file(s), removing ${n} subsequent message(s)`
+          );
+
           // 2. Drift Detection
           const filesSummary = targetFiles.length === 1
             ? targetFiles[0]
             : `${targetFiles.length} files (${targetFiles.join(', ')})`;
 
           let restoreSuccess = false;
-          if (targetFiles.length > 0 && data.checkpointId) {
-            const res = await this._scopedRestore.restore(data.checkpointId, targetFiles, false);
+          if (targetFiles.length > 0 && checkpointId) {
+            const res = await this._scopedRestore.restore(checkpointId, targetFiles, false);
             if (res.drifted) {
               const driftChoice = await vscode.window.showWarningMessage(
                 `One or more files (${filesSummary}) have been manually modified since this AI edit. Undo anyway and overwrite manual changes?`,
@@ -527,13 +937,13 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               );
 
               if (driftChoice === 'Undo Anyway') {
-                const forced = await this._scopedRestore.restore(data.checkpointId, targetFiles, true);
+                const forced = await this._scopedRestore.restore(checkpointId, targetFiles, true);
                 restoreSuccess = forced.success;
               } else {
                 // Cancelled drift warning — ABORT immediately without touching files or history
                 this._postMessage({
                   type: 'UNDO_RESULT',
-                  checkpointId: data.checkpointId,
+                  checkpointId,
                   messageId: data.messageId,
                   success: false,
                   message: 'Cancelled',
@@ -544,7 +954,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               restoreSuccess = res.success;
             }
           } else {
-            // Conversational-only turn (no files modified)
+            // Conversational-only turn or no modified files
             restoreSuccess = true;
           }
 
@@ -552,7 +962,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           if (!restoreSuccess) {
             this._postMessage({
               type: 'UNDO_RESULT',
-              checkpointId: data.checkpointId,
+              checkpointId,
               messageId: data.messageId,
               success: false,
               message: 'Failed to revert workspace files.',
@@ -561,23 +971,30 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           }
 
           // 4. Update shadow repo HEAD ref to target checkpoint
-          if (this._shadowRepo && data.checkpointId) {
+          if (this._shadowRepo && checkpointId) {
             try {
-              await this._shadowRepo.runGit(['update-ref', 'HEAD', data.checkpointId]);
+              await this._shadowRepo.runGit(['update-ref', 'HEAD', checkpointId]);
+              logger.info('SHADOW_GIT', `Updated shadow repo HEAD to checkpoint ${checkpointId.substring(0, 7)}`);
             } catch (err) {
               console.warn('[PanelProvider] Could not update shadow git HEAD:', err);
+              logger.warn('SHADOW_GIT', `Failed to update shadow repo HEAD to ${checkpointId.substring(0, 7)}: ${err}`);
             }
           }
+          logger.info(
+            'SHADOW_GIT',
+            `Undo turn completed: reverted ${targetFiles.length} file(s) to checkpoint ${checkpointId.substring(0, 7)}`
+          );
 
-          // 5. Only NOW truncate historyStore
-          await this._historyStore.truncateAfter(data.messageId);
+          // 5. Only NOW truncate historyStore (removes data.messageId itself and any subsequent messages)
+          const truncResult = await this._historyStore.truncateAfter(data.messageId);
 
           // 6. Post success to Webview UI
           this._postMessage({
             type: 'UNDO_RESULT',
-            checkpointId: data.checkpointId,
+            checkpointId,
             messageId: data.messageId,
             truncatedAfterId: data.messageId,
+            remainingTokens: truncResult.remainingTokens ?? 0,
             success: true,
             message: 'Reverted and chat truncated',
           });
@@ -586,26 +1003,361 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
 
         case 'OPEN_FILE': {
-          const workspaceFolders = vscode.workspace.workspaceFolders;
-          if (workspaceFolders && workspaceFolders.length > 0) {
-            const fileUri = vscode.Uri.joinPath(workspaceFolders[0].uri, data.filePath);
+          logger.info('USER', `User opened file: ${data.filePath}`);
+          let targetPath = (data.filePath || '').trim().replace(/^["']|["']$/g, '');
+          if (!targetPath) break;
+
+          // Extract optional line / column suffix (e.g. file.ts:42, file.ts:42:5, file.ts#L42)
+          let targetLine: number | undefined;
+          let targetCol: number | undefined;
+          const lineMatch = targetPath.match(/(?::(\d+)(?::(\d+))?|#L(\d+))$/i);
+          if (lineMatch) {
+            targetLine = parseInt(lineMatch[1] || lineMatch[3], 10);
+            if (lineMatch[2]) targetCol = parseInt(lineMatch[2], 10);
+            targetPath = targetPath.slice(0, lineMatch.index);
+          }
+
+          let fileUri: vscode.Uri | undefined;
+
+          // 1. Handle file:// URI
+          if (targetPath.startsWith('file://')) {
             try {
-              const doc = await vscode.workspace.openTextDocument(fileUri);
-              await vscode.window.showTextDocument(doc, { preview: false });
-            } catch (err) {
-              vscode.window.showErrorMessage(`Could not open file: ${data.filePath}`);
+              fileUri = vscode.Uri.parse(targetPath);
+            } catch {
+              fileUri = undefined;
             }
+          } else if (path.isAbsolute(targetPath)) {
+            // 2. Absolute path on disk
+            const normalized = path.normalize(targetPath);
+            if (fs.existsSync(normalized)) {
+              fileUri = vscode.Uri.file(normalized);
+            }
+          }
+
+          const workspaceFolders = vscode.workspace.workspaceFolders || [];
+
+          // 3. Check direct resolution against workspace roots
+          if (!fileUri && workspaceFolders.length > 0) {
+            for (const folder of workspaceFolders) {
+              const candidate = path.resolve(folder.uri.fsPath, targetPath);
+              if (fs.existsSync(candidate)) {
+                fileUri = vscode.Uri.file(candidate);
+                break;
+              }
+            }
+          }
+
+          // 4. Windows path missing drive letter (e.g. Users\HP\...)
+          if (!fileUri && process.platform === 'win32' && /^[\\/]?[uU]sers[\\/]/.test(targetPath)) {
+            const withDrive = 'C:\\' + targetPath.replace(/^[\\/]/, '');
+            if (fs.existsSync(withDrive)) {
+              fileUri = vscode.Uri.file(withDrive);
+            }
+          }
+
+          // 5. Search workspace files if relative or bare filename
+          if (!fileUri && workspaceFolders.length > 0) {
+            const baseName = path.basename(targetPath);
+            if (baseName && baseName.length > 1) {
+              try {
+                const matches = await vscode.workspace.findFiles(`**/${baseName}`, '**/node_modules/**', 20);
+                if (matches.length === 1) {
+                  fileUri = matches[0];
+                } else if (matches.length > 1) {
+                  // If targetPath has directory segments, try to find exact suffix match first
+                  const normalizedTarget = targetPath.replace(/\\/g, '/').toLowerCase();
+                  const exactSuffixMatch = matches.filter((u) =>
+                    u.fsPath.replace(/\\/g, '/').toLowerCase().endsWith(normalizedTarget)
+                  );
+                  if (exactSuffixMatch.length === 1) {
+                    fileUri = exactSuffixMatch[0];
+                  } else {
+                    // Multiple files match! Prompt user with QuickPick to disambiguate
+                    const items = (exactSuffixMatch.length > 0 ? exactSuffixMatch : matches).map((u) => {
+                      const relPath = vscode.workspace.asRelativePath(u);
+                      return {
+                        label: `$(file) ${path.basename(u.fsPath)}`,
+                        description: relPath,
+                        uri: u,
+                      };
+                    });
+                    const selected = await vscode.window.showQuickPick(items, {
+                      placeHolder: `Multiple files named "${baseName}" found. Select which to open:`,
+                    });
+                    if (selected) {
+                      fileUri = selected.uri;
+                    } else {
+                      // User cancelled the picker
+                      break;
+                    }
+                  }
+                }
+              } catch {
+                // non-fatal
+              }
+            }
+          }
+
+          // 6. If target path was absolute but didn't exist directly on disk:
+          if (!fileUri && path.isAbsolute(targetPath)) {
+            fileUri = vscode.Uri.file(targetPath);
+          }
+
+          // 7. Verify existence and open or warn
+          if (fileUri && fs.existsSync(fileUri.fsPath)) {
+            try {
+              const stat = fs.statSync(fileUri.fsPath);
+              if (stat.isDirectory()) {
+                await vscode.commands.executeCommand('revealInExplorer', fileUri);
+                vscode.window.setStatusBarMessage(`Folder revealed in Explorer: ${path.basename(fileUri.fsPath)}`, 3500);
+              } else {
+                const showOptions: vscode.TextDocumentShowOptions = {
+                  preview: false,
+                  preserveFocus: false,
+                };
+                if (targetLine && targetLine > 0) {
+                  const pos = new vscode.Position(targetLine - 1, targetCol ? Math.max(0, targetCol - 1) : 0);
+                  showOptions.selection = new vscode.Range(pos, pos);
+                }
+                await vscode.commands.executeCommand('vscode.open', fileUri, showOptions);
+              }
+            } catch (err) {
+              try {
+                const doc = await vscode.workspace.openTextDocument(fileUri);
+                await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: false });
+              } catch {
+                vscode.window.showErrorMessage(`Could not open file: ${targetPath}`);
+              }
+            }
+          } else {
+            vscode.window.showWarningMessage(`File does not exist: ${targetPath}`);
           }
           break;
         }
 
-        case 'REJECT_EDIT':
-          // Silently handle rejection without popping up an intrusive notification toast
-          break;
+        case 'REJECT_EDIT': {
+          logger.info('USER', `User rejected change to: ${data.filePath || 'file'} (editId: ${data.editId})`);
+          const targetPath = data.filePath || '';
+          logger.info('FILE', `Reverting file: ${targetPath || 'file'} from pre-edit snapshot`);
+          const reverted = await this._revertAppliedEdit(targetPath, data.editId);
 
-        case 'RUN_TERMINAL':
-          await CommandRunner.executeCommand(data.command, this._permissionManager, this._usageStore);
+          const fileName = targetPath ? path.basename(targetPath) : 'file';
+          if (reverted) {
+            const revertedMsg = {
+              id: `${Date.now()}-reverted-${data.editId}`,
+              role: 'assistant' as const,
+              content: `↩️ **Reverted:** undone changes to \`${fileName}\``,
+              timestamp: Date.now(),
+            };
+            if (this._historyStore?.appendMessage) {
+              await this._historyStore.appendMessage(revertedMsg);
+            }
+            this._postMessage({
+              type: 'MESSAGE_RECEIVED',
+              message: revertedMsg,
+            });
+            vscode.window.setStatusBarMessage(`Reverted changes to ${fileName}`, 4000);
+          }
+
+          this._postMessage({
+            type: 'EDIT_REVERTED',
+            editId: data.editId,
+            filePath: data.filePath,
+          });
           break;
+        }
+
+        case 'RUN_TERMINAL': {
+          logger.info('USER', `User ran terminal command: ${data.command}`);
+          const terminalAbort = new AbortController();
+          this._activeAbortController = terminalAbort;
+          this._postMessage({
+            type: 'SET_BUSY',
+            busy: true,
+            statusText: `Running in terminal: ${data.command.length > 35 ? data.command.slice(0, 32) + '...' : data.command}`,
+          });
+          this._postMessage({ type: 'TERMINAL_RUNNING', command: data.command });
+          let shouldTriggerContinuation = false;
+          let followUpPrompt = '';
+
+          const isReadOnlyCmd = CommandRunner.isReadOnly(data.command);
+          let cmdCheckpointId: string | null = null;
+          let cmdAffectedFiles: string[] = [];
+          const workspaceFolders = vscode.workspace.workspaceFolders;
+          const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : '';
+          const preCommandSnapshots: Map<string, { uri: vscode.Uri; existed: boolean; content: string }> = new Map();
+
+          if (!isReadOnlyCmd) {
+            cmdAffectedFiles = this._extractFilesMutatedByCommand(data.command, root);
+            if (workspaceFolders && workspaceFolders.length > 0) {
+              for (const f of cmdAffectedFiles) {
+                const fileUri = path.isAbsolute(f) ? vscode.Uri.file(f) : vscode.Uri.joinPath(workspaceFolders[0].uri, f);
+                let existed = false;
+                let content = '';
+                try {
+                  const fileBytes = await vscode.workspace.fs.readFile(fileUri);
+                  content = new TextDecoder('utf-8').decode(fileBytes);
+                  existed = true;
+                } catch {
+                  existed = false;
+                }
+                preCommandSnapshots.set(f, { uri: fileUri, existed, content });
+              }
+            }
+
+            if (cmdAffectedFiles.length > 0 && this._checkpointManager) {
+              cmdCheckpointId = await this._checkpointManager.createCheckpoint(
+                cmdAffectedFiles,
+                `Before terminal command: ${data.command.slice(0, 40)}`
+              );
+              if (cmdCheckpointId) {
+                await this._tagCurrentTurnCheckpoint(cmdCheckpointId, cmdAffectedFiles);
+              }
+            }
+          }
+
+          try {
+            const result = await CommandRunner.executeCommand(
+              data.command,
+              this._permissionManager,
+              this._usageStore,
+              {
+                interactiveInTerminal: (data as any).interactive,
+                abortSignal: terminalAbort.signal,
+              }
+            );
+            this._postMessage({
+              type: 'TERMINAL_RESULT',
+              command: data.command,
+              exitCode: result.exitCode ?? null,
+              stdout: result.stdout ?? '',
+              stderr: result.stderr ?? '',
+              executed: result.executed,
+              cancelled: result.cancelled,
+              timedOut: result.timedOut,
+              error: result.error,
+            });
+
+            if (!result.cancelled) {
+              const applyEditPerm = this._permissionManager.getPermission('applyEdit');
+              if (cmdAffectedFiles.length > 0 && preCommandSnapshots.size > 0) {
+                let fileIdx = 0;
+                for (const [filePath, snap] of preCommandSnapshots.entries()) {
+                  fileIdx++;
+                  let existsNow = false;
+                  let currentContent = '';
+                  try {
+                    const dataBytes = await vscode.workspace.fs.readFile(snap.uri);
+                    currentContent = new TextDecoder('utf-8').decode(dataBytes);
+                    existsNow = true;
+                  } catch {
+                    existsNow = false;
+                  }
+
+                  const wasMutated = (!snap.existed && existsNow) ||
+                    (snap.existed && !existsNow) ||
+                    (snap.existed && existsNow && currentContent !== snap.content);
+
+                  if (wasMutated) {
+                    const editId = `term-edit-${Date.now()}-${fileIdx}`;
+                    this._trackAppliedEdit(filePath, cmdCheckpointId ?? undefined, snap.content, editId);
+                    if (cmdCheckpointId) {
+                      await this._tagCurrentTurnCheckpoint(cmdCheckpointId, [filePath]);
+                    }
+
+                    if (applyEditPerm === 'ask') {
+                      this._postMessage({
+                        type: 'PROPOSE_EDIT',
+                        editId,
+                        edit: {
+                          filePath,
+                          newContent: currentContent,
+                          diffExplanation: `Modified via terminal command: ${data.command.slice(0, 50)}`,
+                        },
+                      });
+                    } else if (applyEditPerm === 'allow' || applyEditPerm === 'allow_session') {
+                      this._postMessage({
+                        type: 'EDIT_APPLIED',
+                        editId,
+                        success: true,
+                        checkpointId: cmdCheckpointId ?? undefined,
+                        filePath,
+                      });
+                    }
+                  }
+                }
+              }
+
+              let outcome = '(failed)';
+              if (result.timedOut) {
+                outcome = '(timed out after 120s)';
+              } else if (result.executed) {
+                outcome = result.exitCode === 0
+                  ? '(completed, exit code: 0)'
+                  : `(failed with exit code: ${result.exitCode ?? 'unknown'})`;
+              }
+
+              const rawSnippet = (result.stdout || result.stderr || result.error || '').trim();
+              const truncatedSnippet = rawSnippet.length > 1500
+                ? rawSnippet.substring(0, 1500) + '\n... [output truncated]'
+                : rawSnippet;
+
+              const snippetBlock = truncatedSnippet
+                ? `\n\`\`\`\n${truncatedSnippet}\n\`\`\``
+                : '';
+
+              const termMsgContent = data.command.includes('\n')
+                ? `✓ **Ran in terminal:** ${outcome}\n${data.command}${snippetBlock}`
+                : `✓ **Ran in terminal:** \`${data.command}\` ${outcome}${snippetBlock}`;
+
+              const termMsg = {
+                id: `${Date.now()}-term-manual`,
+                role: 'system' as const,
+                content: termMsgContent,
+                timestamp: Date.now(),
+              };
+              if (this._historyStore?.appendMessage) {
+                await this._historyStore.appendMessage(termMsg);
+              }
+              this._postMessage({
+                type: 'MESSAGE_RECEIVED',
+                message: termMsg,
+              });
+
+              if (result.exitCode === 0 && !result.timedOut) {
+                followUpPrompt = `The terminal command \`${data.command}\` was executed with output:\n\`\`\`\n${truncatedSnippet}\n\`\`\`\nPlease proceed with the next step in the implementation plan, or provide the final walkthrough if all steps are complete.`;
+              } else {
+                followUpPrompt = `The terminal command \`${data.command}\` failed (${outcome}).\nOutput:\n\`\`\`\n${truncatedSnippet}\n\`\`\`\nPlease diagnose this error, generate necessary file edits to fix it, or provide a corrected command.`;
+              }
+              shouldTriggerContinuation = true;
+            }
+          } finally {
+            if (!shouldTriggerContinuation) {
+              if (this._activeAbortController === terminalAbort) {
+                this._activeAbortController = undefined;
+              }
+              this._postMessage({ type: 'SET_BUSY', busy: false });
+            }
+          }
+
+          if (shouldTriggerContinuation && followUpPrompt) {
+            const targetModel = Configuration.getLastModel() || 'openai/gpt-4o-mini';
+            await this._handleSendMessage(
+              followUpPrompt,
+              targetModel,
+              undefined,
+              undefined,
+              this._activeReasoningEffort,
+              {
+                retryCount: 0,
+                failedCommands: new Set<string>(),
+                autoTurnCount: 1,
+                isAutoFollowUp: true,
+              }
+            );
+          }
+          break;
+        }
 
         case 'GET_USAGE_REPORT':
           await this._sendUsageReportData();
@@ -661,12 +1413,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         case 'TOGGLE_PERMISSION': {
           const current = this._permissionManager.getPermission(data.category as any);
           const next = current === 'allow' ? 'ask' : current === 'ask' ? 'deny' : 'allow';
+          logger.info('USER', `User changed permission for ${data.category} to: ${next}`);
           await this._permissionManager.setPermission(data.category as any, next);
           await this._sendSettingsData();
           break;
         }
 
         case 'RESET_PERMISSIONS':
+          logger.info('USER', 'User reset all permissions to default');
           this._permissionManager.resetAll();
           await this._sendSettingsData();
           vscode.window.showInformationMessage('All permissions reset to default.');
@@ -728,11 +1482,17 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           await vscode.commands.executeCommand('openrouter.clearHistory');
           break;
 
+        case 'VIEW_LOGS':
+          logger.info('USER', 'User opened diagnostic logs');
+          await vscode.commands.executeCommand('openrouter.openDiagnosticLog');
+          break;
+
         case 'OPEN_SETTINGS':
           await this._sendSettingsData();
           break;
 
         case 'CLEAR_HISTORY':
+          logger.info('USER', 'User cleared chat history');
           await this._historyStore.clearHistory();
           await this._loadChatHistory();
           await this._sendSessionsData();
@@ -748,23 +1508,27 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           break;
 
         case 'NEW_SESSION':
+          logger.info('USER', 'User started a new chat session');
           await this._historyStore.startNewSession();
           await this._loadChatHistory();
           await this._sendSessionsData();
           break;
 
         case 'SWITCH_SESSION':
+          logger.info('USER', `User switched to chat session: ${data.sessionId}`);
           await this._historyStore.switchSession(data.sessionId);
           await this._loadChatHistory();
           await this._sendSessionsData();
           break;
 
         case 'RENAME_SESSION':
+          logger.info('USER', `User renamed session ${data.sessionId} to: "${data.newTitle}"`);
           await this._historyStore.renameSession(data.sessionId, data.newTitle);
           await this._sendSessionsData();
           break;
 
         case 'DELETE_SESSION':
+          logger.info('USER', `User deleted chat session: ${data.sessionId}`);
           await this._historyStore.deleteSession(data.sessionId);
           await this._loadChatHistory();
           await this._sendSessionsData();
@@ -857,17 +1621,28 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     this._postMessage({
       type: 'HISTORY_LOADED',
       activeSessionId: activeSession.id,
-      messages: activeSession.messages.map((h) => ({
-        id: h.id,
-        role: h.role,
-        content: h.content,
-        images: h.images,
-        timestamp: h.timestamp,
-        checkpointId: h.checkpointId,
-        affectedFiles: h.affectedFiles,
-        planDocument: h.planDocument,
-        walkthroughDocument: h.walkthroughDocument,
-      })),
+      lastTotalTokens: activeSession.lastTotalTokens,
+      messages: activeSession.messages
+        .filter((h) => !h.isAutoFollowUp && !(h.role === 'system' && typeof h.content === 'string' && h.content.startsWith('✓ **Ran in terminal:')))
+        .map((h) => ({
+          id: h.id,
+          role: h.role,
+          content: h.content,
+          images: h.images,
+          timestamp: h.timestamp,
+          executionDurationMs: h.executionDurationMs,
+          checkpointId: h.checkpointId,
+          affectedFiles: h.affectedFiles,
+          planDocument: h.planDocument,
+          walkthroughDocument: h.walkthroughDocument,
+          totalTokens: h.totalTokens,
+          model: h.model,
+          isAutoRetry: h.isAutoRetry,
+          isAutoFollowUp: h.isAutoFollowUp,
+          isIntermediateStep: h.isIntermediateStep,
+          userTypedText: h.userTypedText,
+          attachments: h.attachments,
+        })),
     });
   }
 
@@ -958,12 +1733,38 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     modelId: string,
     images?: Array<{ name: string; dataUrl: string }>,
     clientMessageId?: string,
-    reasoningEffort?: string
+    reasoningEffort?: string,
+    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number },
+    isRetry?: boolean,
+    userTypedText?: string,
+    attachments?: any[]
   ) {
     const apiKey = await this._secretStore.getApiKey();
     if (!apiKey) {
       vscode.window.showErrorMessage('No OpenRouter API key found. Please save your key first.');
       return;
+    }
+
+    const isNewUserTurn = !retryContext?.isAutoFollowUp && (retryContext?.retryCount ?? 0) === 0;
+    if (isNewUserTurn) {
+      // Genuine user-initiated turn: reset the cancel flag and arm a fresh controller.
+      this._isUserCancelled = false;
+      this._activeAbortController = new AbortController();
+    } else {
+      // Auto-follow-up / retry turn: honour a stop that arrived before we got here.
+      if (this._isUserCancelled || this._activeAbortController?.signal.aborted) {
+        this._postMessage({ type: 'SET_BUSY', busy: false });
+        return;
+      }
+      // Create the new controller first, then immediately check whether Stop arrived
+      // in the tiny window between the flag check above and now (race condition fix).
+      this._activeAbortController = new AbortController();
+      if (this._isUserCancelled) {
+        // Stop fired between the flag check and controller swap — abort the new one too.
+        this._activeAbortController.abort();
+        this._postMessage({ type: 'SET_BUSY', busy: false });
+        return;
+      }
     }
 
     const selectedModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
@@ -1045,52 +1846,248 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const editorCtx = ContextReader.getActiveEditorContext(this._permissionManager);
 
     // Save user message (stores the user's visible text in history)
-    await this._historyStore.appendMessage({
-      id: clientMessageId || `${Date.now()}-user`,
-      role: 'user',
+    const isAutoRetry = Boolean(retryContext && retryContext.retryCount > 0);
+    const isAutoFollowUp = Boolean(retryContext?.isAutoFollowUp);
+    const userMsgRecord = {
+      id: clientMessageId || `${Date.now()}-${isAutoRetry ? 'retry' : isAutoFollowUp ? 'followup' : 'user'}`,
+      role: (isAutoRetry || isAutoFollowUp) ? ('system' as const) : ('user' as const),
       content: processedContent,
       images,
       model: selectedModel,
       timestamp: Date.now(),
-    });
+      isAutoRetry,
+      isAutoFollowUp,
+      userTypedText,
+      attachments,
+    };
+    this._currentTurnUserMessageId = userMsgRecord.id;
+
+    if (!isRetry) {
+      await this._historyStore.appendMessage(userMsgRecord);
+
+      if (!clientMessageId && !isAutoFollowUp) {
+        this._postMessage({
+          type: 'MESSAGE_RECEIVED',
+          message: userMsgRecord,
+        });
+      }
+    }
 
     const assistantMessageId = `${Date.now()}-assistant`;
-    this._postMessage({ type: 'SET_BUSY', busy: true });
-    this._postMessage({ type: 'MESSAGE_STREAM_START', messageId: assistantMessageId });
-
+    this._postMessage({ type: 'SET_BUSY', busy: true, statusText: 'Loading workspace files...' });
+    this._postMessage({ type: 'MESSAGE_STREAM_START', messageId: assistantMessageId, model: selectedModel });
+    this._postMessage({ type: 'AGENT_PROGRESS', phase: 'loading', label: 'Loading workspace files' });
     // Build context-aware prompt messages
     const history = await this._historyStore.loadHistory();
+    const currentModelObj = this._cachedModels.find((m) => m.id === selectedModel);
+    const modelContextLimit = currentModelObj?.context_length || 128000;
+
     const chatMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string | ChatMessageContentPart[] }> = [];
 
     // Workspace file tree injection so the assistant knows about all files in the project
     const workspaceFiles = await ContextReader.listWorkspaceFiles(this._permissionManager);
-    let referencedFileResult: { relativePath: string; content: string } | null = null;
 
-    // Auto-detect if user is asking about a specific file (e.g. "what's in test.py" or "check main.ts")
-    const fileMentionMatch = processedContent.match(/([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)/);
-    if (fileMentionMatch) {
-      const mentionedName = fileMentionMatch[1];
-      const matched = await ContextReader.findAndReadWorkspaceFile(mentionedName, this._permissionManager);
-      if (matched && matched.relativePath !== editorCtx.relativePath) {
-        referencedFileResult = matched;
+    // Dynamic model context window calculation & token budgeting
+    const historyTokenEstimate = history.reduce(
+      (acc, h) => {
+        let count = typeof h.content === 'string' ? ChunkManager.estimateTokens(h.content) : 0;
+        if (h.planDocument) {
+          count += ChunkManager.estimateTokens(h.planDocument);
+        }
+        if (h.walkthroughDocument) {
+          count += ChunkManager.estimateTokens(h.walkthroughDocument);
+        }
+        return acc + count;
+      },
+      0
+    );
+    const availableFileTokens = ChunkManager.calculateAvailableFileTokens(
+      modelContextLimit,
+      historyTokenEstimate
+    );
+
+    logger.info('AGENT', `Turn start — model: ${selectedModel}`);
+    logger.info('AGENT', `Context budget — history: ~${historyTokenEstimate} tokens, model limit: ${modelContextLimit.toLocaleString()}`);
+
+    // Active editor file handling (100% full file if it fits; dynamic batching if exceeding context limit)
+    if (editorCtx.hasContext && editorCtx.relativePath) {
+      const activeBase = path.basename(editorCtx.relativePath);
+      logger.info('FILE', `Reading active file: ${activeBase}`);
+      this._postMessage({
+        type: 'AGENT_PROGRESS',
+        phase: 'reading',
+        label: 'Reading active file',
+        detail: activeBase,
+      });
+      this._postMessage({
+        type: 'SET_BUSY',
+        busy: true,
+        statusText: `Reading file: ${activeBase}...`,
+      });
+    }
+    let activeFileContent = editorCtx.fileContent;
+    let activeFileBatch: FileBatchMetadata | undefined;
+    if (activeFileContent && !ChunkManager.fitsWithinContext(activeFileContent, availableFileTokens)) {
+      const batches = ChunkManager.createFileBatches(activeFileContent, availableFileTokens);
+      const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent, editorCtx.selectedText);
+      activeFileContent = chosenBatch.content;
+      activeFileBatch = {
+        batchIndex: chosenBatch.batchIndex,
+        totalBatches: chosenBatch.totalBatches,
+        startLine: chosenBatch.startLine,
+        endLine: chosenBatch.endLine,
+        totalLines: chosenBatch.totalLines,
+      };
+    }
+
+    const referencedFileResults: Array<{ relativePath: string; content: string; batch?: FileBatchMetadata }> = [];
+    let missingReferencedFile: string | undefined;
+
+    // Discover all workspace files mentioned in the prompt, reviewer feedback, or attachments
+    const mentionedFiles: string[] = [];
+    const lowerPrompt = processedContent.toLowerCase();
+
+    // 1. Check every known workspace file path against prompt and attached feedback text
+    for (const wf of workspaceFiles) {
+      if (wf === editorCtx.relativePath) continue;
+      const normalizedWf = wf.replace(/\\/g, '/').toLowerCase();
+      const baseName = path.basename(normalizedWf).toLowerCase();
+      const stem = path.parse(normalizedWf).name.toLowerCase();
+
+      // Check full relative path match or distinctive basename
+      const pathMatched = lowerPrompt.includes(normalizedWf);
+      const isDistinctive = baseName.length > 3 && !['main.dart', 'index.ts', 'index.js', 'app.dart'].includes(baseName);
+      const baseMatched = isDistinctive && (
+        lowerPrompt.includes(`/${baseName}`) ||
+        lowerPrompt.includes(`\\${baseName}`) ||
+        lowerPrompt.includes(`\`${baseName}\``) ||
+        lowerPrompt.includes(`"${baseName}"`) ||
+        lowerPrompt.includes(`'${baseName}'`) ||
+        new RegExp(`\\b${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(lowerPrompt)
+      );
+
+      // Check extension-less file mention (e.g. "prd file", "to prd", "in prd", "edit prd", "file prd")
+      const isDistinctiveStem = stem.length >= 2 && !['main', 'index', 'app', 'test', 'temp'].includes(stem);
+      const stemMatched = isDistinctiveStem && (
+        new RegExp(`\\b(?:to|in|at|check|open|update|edit|modify|add to|on)\\s+(?:the\\s+)?${stem}(?:\\s+file)?\\b`, 'i').test(lowerPrompt) ||
+        new RegExp(`\\b${stem}\\s+file\\b`, 'i').test(lowerPrompt) ||
+        new RegExp(`\\bfile\\s+${stem}\\b`, 'i').test(lowerPrompt)
+      );
+
+      if (pathMatched || baseMatched || stemMatched) {
+        if (!mentionedFiles.includes(wf)) {
+          mentionedFiles.push(wf);
+        }
+      }
+    }
+
+    // 2. Also check regex pattern for explicitly named file mentions (e.g. "file foo.dart" or "in lib/main.dart")
+    const fileMentionRegex = /(?:file\s+|in\s+|at\s+|to\s+|check\s+|open\s+|update\s+|edit\s+)?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)/gi;
+    let fm;
+    while ((fm = fileMentionRegex.exec(processedContent)) !== null) {
+      const raw = fm[1].trim();
+      const matchedWf = workspaceFiles.find(
+        (wf) => wf.toLowerCase() === raw.toLowerCase() || wf.replace(/\\/g, '/').toLowerCase().endsWith(raw.toLowerCase())
+      );
+      if (matchedWf && matchedWf !== editorCtx.relativePath && !mentionedFiles.includes(matchedWf)) {
+        mentionedFiles.push(matchedWf);
+      } else if (!matchedWf && /\b(?:file|to|in|edit|update)\s+([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)\b/i.test(fm[0])) {
+        missingReferencedFile = raw;
+      }
+    }
+
+    // 2b. Extract file mentions without extension (e.g. "to prd file", "in auth file", "open config file")
+    const extensionlessRegex = /\b(?:(?:to|in|at|check|open|update|edit|modify|add to|on)\s+(?:the\s+)?)?([a-zA-Z0-9_\-]+)\s+file\b|\bfile\s+([a-zA-Z0-9_\-]+)\b/gi;
+    let efm;
+    while ((efm = extensionlessRegex.exec(processedContent)) !== null) {
+      const cand = (efm[1] || efm[2] || '').trim().toLowerCase();
+      if (!cand || ['a', 'the', 'this', 'that', 'new', 'old', 'next', 'each', 'any', 'my', 'our'].includes(cand)) continue;
+      // Search workspace files to get the extension and specific file
+      const matches = workspaceFiles.filter((wf) => {
+        const wfStem = path.parse(wf).name.toLowerCase();
+        return wfStem === cand;
+      });
+      if (matches.length > 0) {
+        // Pick root-level or shortest match
+        const bestMatch = matches.sort((a, b) => a.length - b.length)[0];
+        if (bestMatch !== editorCtx.relativePath && !mentionedFiles.includes(bestMatch)) {
+          mentionedFiles.push(bestMatch);
+        }
+      }
+    }
+
+    // Allocate token budget across mentioned files (up to availableFileTokens or 30,000 tokens)
+    let remainingRefTokens = Math.min(availableFileTokens, 30000);
+    for (const wf of mentionedFiles.slice(0, 8)) {
+      if (remainingRefTokens <= 1000) break;
+      const baseName = path.basename(wf);
+      this._postMessage({
+        type: 'AGENT_PROGRESS',
+        phase: 'reading',
+        label: 'Reading file',
+        detail: baseName,
+      });
+      this._postMessage({
+        type: 'SET_BUSY',
+        busy: true,
+        statusText: `Reading file: ${baseName}...`,
+      });
+      const matched = await ContextReader.findAndReadWorkspaceFile(wf, this._permissionManager);
+      if (matched) {
+        let refContent = matched.content;
+        let refBatch: FileBatchMetadata | undefined;
+        if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
+          const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
+          const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
+          refContent = chosenBatch.content;
+          refBatch = {
+            batchIndex: chosenBatch.batchIndex,
+            totalBatches: chosenBatch.totalBatches,
+            startLine: chosenBatch.startLine,
+            endLine: chosenBatch.endLine,
+            totalLines: chosenBatch.totalLines,
+          };
+        }
+        const tokensUsed = ChunkManager.estimateTokens(refContent);
+        remainingRefTokens -= tokensUsed;
+        referencedFileResults.push({
+          relativePath: matched.relativePath,
+          content: refContent,
+          batch: refBatch,
+        });
       }
     }
 
     const terminalOutputs = TerminalOutputTracker.getRecentOutputsFormatted();
 
+    const platform = process.platform;
+    const isWindows = platform === 'win32';
+    const shell = isWindows
+      ? (process.env.ComSpec ? path.basename(process.env.ComSpec) : 'cmd.exe')
+      : (process.env.SHELL ? path.basename(process.env.SHELL) : 'bash');
+
     const systemPrompt = buildSystemPrompt({
-      activeFile: editorCtx.hasContext && editorCtx.relativePath ? {
-        relativePath: editorCtx.relativePath,
+      activeFile: editorCtx.hasContext && (editorCtx.relativePath || editorCtx.isArtifactDocument) ? {
+        relativePath: editorCtx.relativePath || '',
         languageId: editorCtx.languageId,
         selectedText: editorCtx.selectedText,
-        fileContent: editorCtx.fileContent,
+        fileContent: activeFileContent,
+        batch: activeFileBatch,
+        isArtifactDocument: editorCtx.isArtifactDocument,
+        artifactType: editorCtx.artifactType,
       } : undefined,
       workspaceFiles,
-      referencedFile: referencedFileResult || undefined,
+      referencedFile: referencedFileResults[0] || undefined,
+      referencedFiles: referencedFileResults,
+      missingReferencedFile,
       terminalOutputs: terminalOutputs || undefined,
       permissions: {
         applyEdit: this._permissionManager.getPermission('applyEdit'),
         runTerminalCommand: this._permissionManager.getPermission('runTerminalCommand'),
+      },
+      environment: {
+        platform,
+        shell,
       },
     });
 
@@ -1125,9 +2122,20 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
     history.forEach((h, idx) => {
       // For the most recent user turn (current turn), use redacted content
-      const msgContent = (idx === history.length - 1 && h.role === 'user')
+      let msgContent = (idx === history.length - 1 && h.role === 'user')
         ? contentRedacted.sanitized
         : (SecretScanner.redact(h.content).sanitized);
+
+      if (h.role === 'assistant') {
+        if (h.planDocument && !msgContent.includes(h.planDocument)) {
+          const redactedPlan = SecretScanner.redact(h.planDocument).sanitized;
+          msgContent = `${msgContent}\n\n\`\`\`plan\n${redactedPlan}\n\`\`\``;
+        }
+        if (h.walkthroughDocument && !msgContent.includes(h.walkthroughDocument)) {
+          const redactedWalkthrough = SecretScanner.redact(h.walkthroughDocument).sanitized;
+          msgContent = `${msgContent}\n\n\`\`\`walkthrough\n${redactedWalkthrough}\n\`\`\``;
+        }
+      }
 
       if (h.images && h.images.length > 0) {
         const parts: ChatMessageContentPart[] = [{ type: 'text', text: msgContent || ' ' }];
@@ -1158,12 +2166,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     this._postMessage({
       type: 'CONTEXT_PREVIEW_UPDATE',
       preview: {
-        activeFile: editorCtx.relativePath,
+        activeFile: editorCtx.isArtifactDocument
+          ? (editorCtx.artifactType === 'walkthrough' ? 'Results Walkthrough (viewing)' : 'Implementation Plan (viewing)')
+          : editorCtx.relativePath,
         lineRange: editorCtx.selectedText ? 'Selection' : (editorCtx.hasContext ? 'Whole file' : undefined),
         contentSnippet,
-        referencedFile: referencedFileResult ? {
-          path: referencedFileResult.relativePath,
-          contentSnippet: referencedFileResult.content.slice(0, 1000),
+        referencedFile: referencedFileResults.length > 0 ? {
+          path: referencedFileResults.map(r => r.relativePath).join(', '),
+          contentSnippet: referencedFileResults[0].content.slice(0, 1000),
         } : undefined,
         terminalOutputs: terminalOutputs ? terminalOutputs.slice(0, 500) : undefined,
         imageCount: images?.length || 0,
@@ -1180,14 +2190,57 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     }
 
     let accumulatedContent = '';
-    this._activeAbortController = new AbortController();
-    let effectiveReasoningEffort = reasoningEffort;
+    if (!this._activeAbortController || this._activeAbortController.signal.aborted) {
+      if (this._isUserCancelled) {
+        this._postMessage({ type: 'SET_BUSY', busy: false });
+        return;
+      }
+      this._activeAbortController = new AbortController();
+    }
+    if (this._isUserCancelled || this._activeAbortController.signal.aborted) {
+      this._postMessage({ type: 'SET_BUSY', busy: false });
+      return;
+    }
+
+    let effectiveReasoningEffort = reasoningEffort || this._activeReasoningEffort;
+    if (effectiveReasoningEffort) {
+      this._activeReasoningEffort = effectiveReasoningEffort;
+    }
+    const modelDisplayName = currentModelObj?.name || selectedModel;
+    this._postMessage({
+      type: 'AGENT_PROGRESS',
+      phase: 'connecting',
+      label: 'Connecting to model',
+      detail: modelDisplayName,
+    });
+    this._postMessage({
+      type: 'SET_BUSY',
+      busy: true,
+      statusText: `Connecting to ${modelDisplayName}...`,
+    });
+
+    let hasEmittedFirstChunk = false;
+    let hasEmittedThinking = false;
+    const streamStartTime = Date.now();
 
     await OpenRouterClient.sendChatCompletionStream(
       apiKey,
       selectedModel,
       chatMessages,
       (chunk) => {
+        if (!hasEmittedFirstChunk) {
+          hasEmittedFirstChunk = true;
+          this._postMessage({
+            type: 'AGENT_PROGRESS',
+            phase: 'writing',
+            label: 'Writing',
+          });
+          this._postMessage({
+            type: 'SET_BUSY',
+            busy: true,
+            statusText: 'Writing...',
+          });
+        }
         accumulatedContent += chunk;
         this._postMessage({
           type: 'MESSAGE_STREAM_CHUNK',
@@ -1195,11 +2248,57 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           chunk,
         });
       },
-      async (usage) => {
-        this._activeAbortController = undefined;
+      async (usage, finishReason) => {
+        const executionDurationMs = Date.now() - streamStartTime;
+
+        if (this._isUserCancelled || this._activeAbortController?.signal.aborted) {
+          if (accumulatedContent.trim().length > 0) {
+            const { planDocument, walkthroughDocument, chatSummary } = extractArtifacts(accumulatedContent);
+            const stoppedSummary = `${chatSummary}\n\n[Generation stopped by user]`;
+            await this._historyStore.appendMessage({
+              id: assistantMessageId,
+              role: 'assistant',
+              content: stoppedSummary,
+              planDocument,
+              walkthroughDocument,
+              model: selectedModel,
+              timestamp: Date.now(),
+              executionDurationMs,
+            });
+            this._postMessage({
+              type: 'MESSAGE_STREAM_DONE',
+              messageId: assistantMessageId,
+              model: selectedModel,
+              usage,
+              chatSummary: stoppedSummary,
+              planDocument,
+              walkthroughDocument,
+              executionDurationMs,
+            });
+          }
+          this._activeAbortController = undefined;
+          this._postMessage({ type: 'SET_BUSY', busy: false });
+          return;
+        }
+
+        // If the model returned an empty completion (often due to upstream timeout or token limits)
+        let finalContent = accumulatedContent;
+        const isEmptyResponse = finalContent.trim() === '' && !this._activeAbortController?.signal.aborted;
+        if (isEmptyResponse) {
+          logger.warn('AGENT', `Empty response from ${selectedModel} — possible upstream timeout, context limit, or provider issue`);
+          finalContent = '⚠️ The model returned an empty response. This usually occurs when the upstream provider times out or encounters a context limit. You can click "↻ Retry" or send a follow-up prompt to continue.';
+        }
 
         // Extract two-tier artifacts (plan / walkthrough) from the raw model response
-        const { planDocument, walkthroughDocument, chatSummary } = extractArtifacts(accumulatedContent);
+        const { planDocument, walkthroughDocument, chatSummary } = extractArtifacts(finalContent);
+
+        // Check if this turn is an intermediate step:
+        // An automated follow-up turn (isAutoFollowUp or autoTurnCount > 0 or retryCount > 0)
+        // that does NOT contain a walkthrough document is an intermediate execution step.
+        const isIntermediateStep = Boolean(
+          (retryContext?.isAutoFollowUp || (retryContext?.autoTurnCount ?? 0) > 0 || (retryContext?.retryCount ?? 0) > 0) &&
+          !walkthroughDocument
+        );
 
         await this._historyStore.appendMessage({
           id: assistantMessageId,
@@ -1209,7 +2308,39 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           walkthroughDocument,
           model: selectedModel,
           timestamp: Date.now(),
+          executionDurationMs,
+          totalTokens: usage?.total_tokens,
+          isIntermediateStep,
+          isAutoFollowUp: retryContext?.isAutoFollowUp,
         });
+
+        // Proactively persist artifact .md files to disk immediately upon generation
+        if (planDocument) {
+          try {
+            await ArtifactDocumentManager.prepareArtifactFile(
+              this._historyStore,
+              'plan',
+              assistantMessageId,
+              planDocument,
+              this._storageUri
+            );
+          } catch {
+            // non-fatal
+          }
+        }
+        if (walkthroughDocument) {
+          try {
+            await ArtifactDocumentManager.prepareArtifactFile(
+              this._historyStore,
+              'walkthrough',
+              assistantMessageId,
+              walkthroughDocument,
+              this._storageUri
+            );
+          } catch {
+            // non-fatal
+          }
+        }
 
         // Compute cost and log to UsageStore
         if (usage) {
@@ -1222,9 +2353,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
           // If reasoning effort was used, log Model (Effort)
           let loggedModelName = selectedModel;
-          if (effectiveReasoningEffort) {
+          const effortForLogging = effectiveReasoningEffort || this._activeReasoningEffort;
+          if (effortForLogging) {
             const formattedEffort =
-              effectiveReasoningEffort.charAt(0).toUpperCase() + effectiveReasoningEffort.slice(1).toLowerCase();
+              effortForLogging.charAt(0).toUpperCase() + effortForLogging.slice(1).toLowerCase();
             loggedModelName = `${selectedModel} (${formattedEffort})`;
           }
 
@@ -1232,25 +2364,98 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             type: 'chat_completion',
             project: ProjectResolver.getActiveProjectName(),
             model: loggedModelName,
+            reasoningEffort: effortForLogging,
             promptTokens: usage.prompt_tokens,
             completionTokens: usage.completion_tokens,
             totalTokens: usage.total_tokens,
             cost,
           });
+          logger.info('COST', `Request cost — model: ${loggedModelName}, cost: $${cost?.toFixed(6) ?? '?'} (in: ${usage.prompt_tokens ?? '?'} out: ${usage.completion_tokens ?? '?'} tokens)`);
         }
 
         this._postMessage({
           type: 'MESSAGE_STREAM_DONE',
           messageId: assistantMessageId,
+          model: selectedModel,
           usage,
           chatSummary,
           planDocument,
           walkthroughDocument,
+          executionDurationMs,
+          isIntermediateStep,
         });
-        this._postMessage({ type: 'SET_BUSY', busy: false });
 
         // Auto-execution under Allow = Zero Manual Interaction
-        await this._handleAutoExecution(accumulatedContent);
+        let triggeredFollowUp = false;
+        try {
+          if (isEmptyResponse && (retryContext?.isAutoFollowUp || (retryContext?.retryCount ?? 0) > 0) && (retryContext?.emptyRetryCount ?? 0) < 1) {
+            const targetModel = selectedModel || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+            triggeredFollowUp = true;
+            await this._handleSendMessage(
+              'The previous request returned an empty completion. Please continue executing the plan and verify results.',
+              targetModel,
+              undefined,
+              undefined,
+              this._activeReasoningEffort,
+              {
+                retryCount: retryContext?.retryCount ?? 0,
+                failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+                autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
+                isAutoFollowUp: true,
+                emptyRetryCount: (retryContext?.emptyRetryCount ?? 0) + 1,
+              }
+            );
+          } else {
+            triggeredFollowUp = await this._handleAutoExecution(
+              accumulatedContent,
+              selectedModel,
+              retryContext,
+              walkthroughDocument,
+              planDocument,
+              assistantMessageId
+            );
+
+            // If the model was cut off mid-response due to token limits (finish_reason === 'length')
+            // and auto-execution hasn't already scheduled a follow-up, resume generation automatically
+            if (!triggeredFollowUp && finishReason === 'length' && !this._isUserCancelled && !this._activeAbortController?.signal.aborted) {
+              let isExecActive = Boolean(retryContext?.isAutoFollowUp || (retryContext?.retryCount ?? 0) > 0);
+              if (!isExecActive && this._historyStore) {
+                try {
+                  const hist = await this._historyStore.loadHistory();
+                  isExecActive = hist.some((m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content)));
+                } catch {
+                  // non-fatal
+                }
+              }
+              const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
+              const MAX_AUTO_FOLLOWUPS = 5;
+
+              if (isExecActive && currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
+                logger.info('AGENT', 'Model response cut off by token limit (finish_reason === "length"). Auto-resuming generation...');
+                const targetModel = selectedModel || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+                triggeredFollowUp = true;
+                await this._handleSendMessage(
+                  'Your previous response reached the maximum output token limit and was cut off mid-generation. Please continue directly from the exact point where you stopped, completing all remaining planned modifications, tasks, and verifications.',
+                  targetModel,
+                  undefined,
+                  undefined,
+                  this._activeReasoningEffort,
+                  {
+                    retryCount: retryContext?.retryCount ?? 0,
+                    failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+                    autoTurnCount: currentAutoTurns + 1,
+                    isAutoFollowUp: true,
+                  }
+                );
+              }
+            }
+          }
+        } finally {
+          if (!triggeredFollowUp) {
+            this._activeAbortController = undefined;
+            this._postMessage({ type: 'SET_BUSY', busy: false });
+          }
+        }
       },
       (err) => {
         this._activeAbortController = undefined;
@@ -1274,6 +2479,28 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         vscode.window.showWarningMessage(
           "This model doesn't support the selected reasoning effort level — retrying without it."
         );
+      },
+      (reasoningChunk) => {
+        if (!hasEmittedThinking && !hasEmittedFirstChunk) {
+          hasEmittedThinking = true;
+          this._postMessage({
+            type: 'AGENT_PROGRESS',
+            phase: 'thinking',
+            label: 'Thinking',
+          });
+          this._postMessage({
+            type: 'SET_BUSY',
+            busy: true,
+            statusText: 'Model is thinking...',
+          });
+        }
+      },
+      (status) => {
+        this._postMessage({
+          type: 'SET_BUSY',
+          busy: true,
+          statusText: status,
+        });
       }
     );
   }
@@ -1295,22 +2522,57 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async _handleAutoExecution(content: string): Promise<void> {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders || workspaceFolders.length === 0) {
-      return;
+  private async _handleAutoExecution(
+    content: string,
+    modelId?: string,
+    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number },
+    walkthroughDocument?: string,
+    planDocument?: string,
+    assistantMessageId?: string
+  ): Promise<boolean> {
+    // 0. Safeguard: if user cancelled or aborted, stop immediately
+    if (this._isUserCancelled || this._activeAbortController?.signal.aborted) {
+      return false;
     }
 
-    const fileActionRegex = /```(?:create_file|edit_file|file):([^\r\n]+)\r?\n([\s\S]*?)```/gi;
+    // 1. Critical Safeguard: If an Implementation Plan was generated, ALWAYS STOP!
+    // An implementation plan is a mandatory review checkpoint.
+    // The user must inspect the plan and explicitly click "Proceed" before execution begins.
+    const hasPlan = Boolean(planDocument && planDocument.trim().length > 0);
+    const hasPlanApprovalQuestion = /(?:would you like me to proceed with this plan|shall i proceed with (?:this|the) plan|review or make adjustments first|proceed with this plan\?)/i.test(content);
+    if (hasPlan || hasPlanApprovalQuestion) {
+      return false;
+    }
+
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return false;
+    }
+
+    const isExecutionActive = Boolean(retryContext?.isAutoFollowUp || (retryContext?.retryCount ?? 0) > 0);
+    const historyForPlanCheck = this._historyStore ? await this._historyStore.loadHistory() : [];
+    const activePlanExists = historyForPlanCheck.some(
+      (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+    );
+
+    const successfullyEditedFiles: string[] = [];
+    const failedEdits: Array<{ filePath: string; relativePath: string; error: string; editCount: number }> = [];
+    const fileActionRegex = /(?:```|````)(?:create_file|edit_file|file|create|edit|patch|(?!plan|walkthrough)[a-zA-Z0-9_-]+):([^\r\n]+)\r?\n((?:[\s\S]*?<<<< SEARCH[\s\S]*?\n>>>>[^\r\n]*|[\s\S]*?))\r?\n(?:```|````)/gi;
     const applyEditPerm = this._permissionManager.getPermission('applyEdit');
+    const isApplyEditAllowed = applyEditPerm === 'allow' || applyEditPerm === 'allow_session';
+    const isAskMode = applyEditPerm === 'ask';
+    const shouldApplyEdits = isApplyEditAllowed || isAskMode;
 
     if (applyEditPerm === 'deny') {
       const matches: { filePath: string; fileName: string; editId: string }[] = [];
       let fileMatch;
       let editCount = 0;
       while ((fileMatch = fileActionRegex.exec(content)) !== null) {
-        editCount++;
         let filePath = fileMatch[1].trim();
+        if (!filePath.includes('.') && !filePath.includes('/') && !filePath.includes('\\')) {
+          continue;
+        }
+        editCount++;
         const lastColon = filePath.lastIndexOf(':');
         if (lastColon > 1) {
           const afterColon = filePath.substring(lastColon + 1).trim();
@@ -1349,12 +2611,26 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           success: false,
         });
       }
-    } else if (applyEditPerm === 'allow') {
+    } else if (shouldApplyEdits) {
+      const hasEdits = /(?:```|````)(?:create_file|edit_file|file|create|edit|patch|(?!plan|walkthrough)[a-zA-Z0-9_-]+):/i.test(content);
+      if (hasEdits) {
+        this._postMessage({
+          type: 'SET_BUSY',
+          busy: true,
+          statusText: 'Applying file edits...',
+        });
+      }
       let fileMatch;
       let editCount = 0;
       while ((fileMatch = fileActionRegex.exec(content)) !== null) {
-        editCount++;
+        if (this._activeAbortController?.signal.aborted) {
+          break;
+        }
         let filePath = fileMatch[1].trim();
+        if (!filePath.includes('.') && !filePath.includes('/') && !filePath.includes('\\')) {
+          continue;
+        }
+        editCount++;
         const lastColon = filePath.lastIndexOf(':');
         if (lastColon > 1) {
           const afterColon = filePath.substring(lastColon + 1).trim();
@@ -1363,7 +2639,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           }
         }
         const newContent = fileMatch[2];
-        const editId = `${Date.now()}-${editCount}`;
+        const editId = assistantMessageId
+          ? `${assistantMessageId}-edit-${editCount}`
+          : `${Date.now()}-${editCount}`;
 
         const fileUri = path.isAbsolute(filePath)
           ? vscode.Uri.file(filePath)
@@ -1379,13 +2657,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         const relativePath = vscode.workspace.asRelativePath(fileUri);
 
         try {
-          // Check permission (for new file, verifies createDeleteFiles)
-          const permStatus = await this._permissionManager.checkApplyEditPermission(
-            relativePath,
-            !fileExists
-          );
+          // Check permission
+          let permAllowed = true;
+          if (isAskMode) {
+            // Optimistic apply in 'ask' mode: respect explicit 'deny' on file creation if new file
+            if (!fileExists && this._permissionManager.getPermission('createDeleteFiles') === 'deny') {
+              permAllowed = false;
+            }
+          }
 
-          if (permStatus === 'denied') {
+          if (!permAllowed) {
             const deniedMsg = {
               id: `${Date.now()}-error-${editCount}`,
               role: 'assistant' as const,
@@ -1424,7 +2705,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           if (this._checkpointManager) {
             const res = await this._checkpointManager.createCheckpoint(
               [filePath],
-              `Auto-apply edit to ${filePath}`
+              `Before edit ${editId}`
             );
             if (res) {
               checkpointId = res;
@@ -1432,6 +2713,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           }
 
           // Apply edit (skipPermissionCheck = true because checked above)
+          logger.info('FILE', `Writing to file: ${filePath}${isAskMode ? ' (optimistic apply)' : ' (auto-apply)'}`);
           const success = await DiffPreviewManager.applyEdit(
             fileUri,
             newContent,
@@ -1440,39 +2722,58 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           );
 
           if (success) {
+            successfullyEditedFiles.push(filePath);
             // Tag turn checkpoint
             if (checkpointId) {
-              const history = await this._historyStore.loadHistory();
-              const lastUserMsg = [...history].reverse().find((m) => m.role === 'user');
-              if (lastUserMsg) {
-                const existing = lastUserMsg.affectedFiles ?? [];
-                const merged = Array.from(new Set([...existing, filePath]));
-                await this._historyStore.tagTurnCheckpoint(lastUserMsg.id, checkpointId, merged);
+              await this._tagCurrentTurnCheckpoint(checkpointId, [filePath]);
+            }
+            this._trackAppliedEdit(filePath, checkpointId, originalContent, editId);
+
+            // Open edited file into independent editor tab with preserveFocus
+            try {
+              const doc = await vscode.workspace.openTextDocument(fileUri);
+              await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true });
+            } catch {
+              // non-fatal
+            }
+
+            if (isApplyEditAllowed) {
+              const fileName = path.basename(filePath);
+              const appliedMsg = {
+                id: `${Date.now()}-applied-${editCount}`,
+                role: 'assistant' as const,
+                content: `✓ **Applied:** updated \`${fileName}\``,
+                timestamp: Date.now(),
+              };
+              if (this._historyStore?.appendMessage) {
+                await this._historyStore.appendMessage(appliedMsg);
               }
-            }
+              this._postMessage({
+                type: 'MESSAGE_RECEIVED',
+                message: appliedMsg,
+              });
 
-            const fileName = path.basename(filePath);
-            const appliedMsg = {
-              id: `${Date.now()}-applied-${editCount}`,
-              role: 'assistant' as const,
-              content: `✓ **Applied:** updated \`${fileName}\``,
-              timestamp: Date.now(),
-            };
-            if (this._historyStore?.appendMessage) {
-              await this._historyStore.appendMessage(appliedMsg);
+              this._postMessage({
+                type: 'EDIT_APPLIED',
+                editId,
+                success: true,
+                checkpointId,
+                filePath,
+              });
+            } else {
+              // In 'Ask' mode: The file is written to disk and checkpointed optimistically.
+              // We do NOT send EDIT_APPLIED yet! The UI keeps the card in "Pending" state
+              // with active "Apply" / "Accept" and "Reject" buttons so the user can inspect
+              // the live change in VS Code before deciding.
+              logger.info('EDIT', `Optimistically applied ${relativePath}${checkpointId ? ` (checkpoint: ${checkpointId.substring(0, 7)})` : ''}, awaiting user decision`);
             }
-            this._postMessage({
-              type: 'MESSAGE_RECEIVED',
-              message: appliedMsg,
-            });
-
-            this._postMessage({
-              type: 'EDIT_APPLIED',
-              editId,
-              success: true,
-              checkpointId,
-            });
           } else {
+            failedEdits.push({
+              filePath,
+              relativePath,
+              error: 'Edit could not be applied to file',
+              editCount,
+            });
             const failMsg = {
               id: `${Date.now()}-fail-${editCount}`,
               role: 'assistant' as const,
@@ -1493,6 +2794,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             });
           }
         } catch (err: any) {
+          failedEdits.push({
+            filePath,
+            relativePath,
+            error: err.message || 'Malformed search/replace block or write error',
+            editCount,
+          });
           // Malformed search/replace or write error: fail safely with clear chat error message
           const errMsg = {
             id: `${Date.now()}-fail-${editCount}`,
@@ -1516,37 +2823,403 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // 2. Auto-run proposed terminal commands if runTerminalCommand === 'allow'
+    const currentRetryCount = retryContext?.retryCount ?? 0;
+    const MAX_RETRIES = 5;
+
+    // Self-Healing Auto-Retry for Failed File Edits:
+    // If an edit failed due to search-block drift or formatting error, feed the real file content back to model
+    if (
+      failedEdits.length > 0 &&
+      currentRetryCount < MAX_RETRIES &&
+      !this._activeAbortController?.signal.aborted
+    ) {
+      const firstFailed = failedEdits[0];
+      const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+
+      const fileUri = path.isAbsolute(firstFailed.filePath)
+        ? vscode.Uri.file(firstFailed.filePath)
+        : vscode.Uri.joinPath(workspaceFolders[0].uri, firstFailed.filePath);
+
+      let currentFileContent = '';
+      try {
+        const fileBytes = await vscode.workspace.fs.readFile(fileUri);
+        currentFileContent = new TextDecoder('utf-8').decode(fileBytes);
+      } catch {
+        // non-fatal if file doesn't exist yet
+      }
+
+      const retryNotice = {
+        id: `${Date.now()}-edit-retry-${firstFailed.editCount}`,
+        role: 'system' as const,
+        content: `🔄 File edit to \`${firstFailed.relativePath}\` failed (${firstFailed.error}). Initiating self-healing retry (${currentRetryCount + 1}/${MAX_RETRIES})...`,
+        timestamp: Date.now(),
+      };
+      if (this._historyStore?.appendMessage) {
+        await this._historyStore.appendMessage(retryNotice);
+      }
+      this._postMessage({
+        type: 'MESSAGE_RECEIVED',
+        message: retryNotice,
+      });
+
+      const truncatedFile = currentFileContent.length > 5000
+        ? currentFileContent.substring(0, 5000) + '\n... [truncated]'
+        : currentFileContent;
+
+      const retryPrompt = `The proposed edit to \`${firstFailed.relativePath}\` could not be applied.\nReason: ${firstFailed.error}\n\nHere is the current content of \`${firstFailed.relativePath}\`:\n\`\`\`\n${truncatedFile}\n\`\`\`\n\nPlease output a corrected \`\`\`edit_file:${firstFailed.relativePath} block where the <<<< SEARCH block matches the lines from the file above exactly. Continue executing until all tasks and verifications succeed.`;
+
+      await this._handleSendMessage(
+        retryPrompt,
+        targetModel,
+        undefined,
+        undefined,
+        this._activeReasoningEffort,
+        {
+          retryCount: currentRetryCount + 1,
+          failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+          autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
+          isAutoFollowUp: true,
+        }
+      );
+      return true;
+    }
+
+    // 2. Auto-run proposed terminal commands if runTerminalCommand is allowed
     const runTerminalPerm = this._permissionManager.getPermission('runTerminalCommand');
-    if (runTerminalPerm === 'allow') {
+    const isRunTerminalAllowed = runTerminalPerm === 'allow' || runTerminalPerm === 'allow_session';
+    const successfulCommands: Array<{ command: string; output: string }> = [];
+    let executedCommandsSummary: Array<{
+      command: string;
+      outcome: string;
+      exitCode: number | null;
+      output: string;
+      timedOut?: boolean;
+      cancelled?: boolean;
+    }> = [];
+
+    const flushExecutedTerminalSummary = async () => {
+      if (executedCommandsSummary.length === 0) return;
+      const summaryContent = this._formatTerminalExecutionSummary(executedCommandsSummary);
+      const termMsg = {
+        id: `${Date.now()}-term-summary`,
+        role: 'system' as const,
+        content: summaryContent,
+        timestamp: Date.now(),
+      };
+      executedCommandsSummary = [];
+      if (this._historyStore?.appendMessage) {
+        await this._historyStore.appendMessage(termMsg);
+      }
+      this._postMessage({
+        type: 'MESSAGE_RECEIVED',
+        message: termMsg,
+      });
+    };
+
+    if (runTerminalPerm !== 'deny') {
       const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
       let match;
       let cmdCount = 0;
+      const MAX_TERMINAL_RETRIES = 5;
+
+      // If file edits were successfully applied in this turn, reset failedCommands
+      // because workspace files changed, so repeating a verification command is testing new code
+      if (successfullyEditedFiles.length > 0 && retryContext?.failedCommands) {
+        retryContext.failedCommands.clear();
+      }
+
       while ((match = bashRegex.exec(content)) !== null) {
+        if (this._activeAbortController?.signal.aborted) {
+          break;
+        }
         const command = match[1].trim();
         if (command) {
-          cmdCount++;
-          const result = await CommandRunner.executeCommand(command, this._permissionManager);
-          const outcome = result.executed
-            ? `(completed)`
-            : result.cancelled
-            ? `(cancelled)`
-            : `(failed)`;
-          const termMsg = {
-            id: `${Date.now()}-term-${cmdCount}`,
-            role: 'assistant' as const,
-            content: `✓ **Ran in terminal:** \`${command}\` ${outcome}`,
-            timestamp: Date.now(),
-          };
-          if (this._historyStore?.appendMessage) {
-            await this._historyStore.appendMessage(termMsg);
+          const isReadOnlyCmd = CommandRunner.isReadOnly(command);
+          // Side-effecting commands require explicit allow/allow_session to auto-run.
+          // In 'ask' mode, side-effecting commands render interactive UI cards for user approval.
+          if (!isReadOnlyCmd && !isRunTerminalAllowed) {
+            continue;
           }
+
+          cmdCount++;
+          const statusDesc = isReadOnlyCmd
+            ? CommandRunner.getInspectionDescription(command)
+            : `Running in terminal: ${command.length > 35 ? command.slice(0, 32) + '...' : command}`;
+
           this._postMessage({
-            type: 'MESSAGE_RECEIVED',
-            message: termMsg,
+            type: 'SET_BUSY',
+            busy: true,
+            statusText: statusDesc,
           });
+
+          if (!isReadOnlyCmd) {
+            this._postMessage({ type: 'TERMINAL_RUNNING', command });
+          }
+
+          let cmdCheckpointId: string | null = null;
+          let cmdAffectedFiles: string[] = [];
+          const workspaceFolders = vscode.workspace.workspaceFolders;
+          const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : '';
+          const preCommandSnapshots: Map<string, { uri: vscode.Uri; existed: boolean; content: string }> = new Map();
+
+          if (!isReadOnlyCmd) {
+            cmdAffectedFiles = this._extractFilesMutatedByCommand(command, root);
+            if (workspaceFolders && workspaceFolders.length > 0) {
+              for (const f of cmdAffectedFiles) {
+                const fileUri = path.isAbsolute(f) ? vscode.Uri.file(f) : vscode.Uri.joinPath(workspaceFolders[0].uri, f);
+                let existed = false;
+                let content = '';
+                try {
+                  const fileBytes = await vscode.workspace.fs.readFile(fileUri);
+                  content = new TextDecoder('utf-8').decode(fileBytes);
+                  existed = true;
+                } catch {
+                  existed = false;
+                }
+                preCommandSnapshots.set(f, { uri: fileUri, existed, content });
+              }
+            }
+
+            if (cmdAffectedFiles.length > 0 && this._checkpointManager) {
+              cmdCheckpointId = await this._checkpointManager.createCheckpoint(
+                cmdAffectedFiles,
+                `Before terminal command: ${command.slice(0, 40)}`
+              );
+              if (cmdCheckpointId) {
+                await this._tagCurrentTurnCheckpoint(cmdCheckpointId, cmdAffectedFiles);
+              }
+            }
+          }
+
+          const result = await CommandRunner.executeCommand(
+            command,
+            this._permissionManager,
+            this._usageStore,
+            { abortSignal: this._activeAbortController?.signal }
+          );
+
+          if (!isReadOnlyCmd) {
+            this._postMessage({
+              type: 'TERMINAL_RESULT',
+              command,
+              exitCode: result.exitCode ?? null,
+              stdout: result.stdout ?? '',
+              stderr: result.stderr ?? '',
+              executed: result.executed,
+              cancelled: result.cancelled,
+              timedOut: result.timedOut,
+              error: result.error,
+            });
+
+            if (!result.cancelled) {
+              const applyEditPerm = this._permissionManager.getPermission('applyEdit');
+              if (cmdAffectedFiles.length > 0 && preCommandSnapshots.size > 0) {
+                let fileIdx = 0;
+                for (const [filePath, snap] of preCommandSnapshots.entries()) {
+                  fileIdx++;
+                  let existsNow = false;
+                  let currentContent = '';
+                  try {
+                    const dataBytes = await vscode.workspace.fs.readFile(snap.uri);
+                    currentContent = new TextDecoder('utf-8').decode(dataBytes);
+                    existsNow = true;
+                  } catch {
+                    existsNow = false;
+                  }
+
+                  const wasMutated = (!snap.existed && existsNow) ||
+                    (snap.existed && !existsNow) ||
+                    (snap.existed && existsNow && currentContent !== snap.content);
+
+                  if (wasMutated) {
+                    const editId = `term-edit-${Date.now()}-${cmdCount}-${fileIdx}`;
+                    this._trackAppliedEdit(filePath, cmdCheckpointId ?? undefined, snap.content, editId);
+                    if (cmdCheckpointId) {
+                      await this._tagCurrentTurnCheckpoint(cmdCheckpointId, [filePath]);
+                    }
+
+                    if (applyEditPerm === 'ask') {
+                      // Process-Agnostic File Mutation Guard: Prompt to Accept / Reject (Non-blocking: AI continues execution)
+                      this._postMessage({
+                        type: 'PROPOSE_EDIT',
+                        editId,
+                        edit: {
+                          filePath,
+                          newContent: currentContent,
+                          diffExplanation: `Modified via terminal command: ${command.length > 50 ? command.slice(0, 47) + '...' : command}`,
+                        },
+                      });
+                    } else if (applyEditPerm === 'allow' || applyEditPerm === 'allow_session') {
+                      this._postMessage({
+                        type: 'EDIT_APPLIED',
+                        editId,
+                        success: true,
+                        checkpointId: cmdCheckpointId ?? undefined,
+                        filePath,
+                      });
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          let outcome = '(failed)';
+          if (result.cancelled) {
+            outcome = '(cancelled)';
+          } else if (result.timedOut) {
+            outcome = '(timed out after 120s)';
+          } else if (result.executed) {
+            outcome = result.exitCode === 0
+              ? '(completed, exit code: 0)'
+              : `(failed with exit code: ${result.exitCode ?? 'unknown'})`;
+          }
+
+          const rawSnippet = (result.stdout || result.stderr || result.error || '').trim();
+          const truncatedSnippet = rawSnippet.length > 1500
+            ? rawSnippet.substring(0, 1500) + '\n... [output truncated]'
+            : rawSnippet;
+
+          // Tier 1 (Read-Only / Inspection): Run silently without chat card or message pollution
+          // Tier 2 (Side-Effecting): Collect into executedCommandsSummary for a single consolidated 1-line dropdown
+          if (!isReadOnlyCmd) {
+            executedCommandsSummary.push({
+              command,
+              outcome,
+              exitCode: result.exitCode ?? null,
+              output: truncatedSnippet,
+              timedOut: result.timedOut,
+              cancelled: result.cancelled,
+            });
+          }
+
+          // Track successful commands for automatic continuation response
+          if (result.executed && result.exitCode === 0 && !result.cancelled && !result.timedOut) {
+            successfulCommands.push({
+              command,
+              output: rawSnippet,
+            });
+          }
+
+          // Self-Healing Auto-Retry with Loop Protection (including timeouts)
+          const isFailed = (result.executed && result.exitCode !== 0) || (result.timedOut && !result.cancelled);
+          if (isFailed && !result.cancelled) {
+            const currentRetryCount = retryContext?.retryCount ?? 0;
+            const failedCommands = retryContext?.failedCommands ?? new Set<string>();
+
+            // Safeguard 1: Abort if user cancelled the stream/session
+            if (this._activeAbortController?.signal.aborted) {
+              break;
+            }
+
+            // Safeguard 2: Duplicate failing command detection (infinite loop breaker)
+            // If no files were edited and the identical command failed again, halt
+            if (failedCommands.has(command) && successfullyEditedFiles.length === 0) {
+              await flushExecutedTerminalSummary();
+              if (!isReadOnlyCmd) {
+                const loopMsg = {
+                  id: `${Date.now()}-term-loop-${cmdCount}`,
+                  role: 'assistant' as const,
+                  content: `⚠️ Model proposed identical failing command \`${command}\` without file modifications. Halting self-healing retry to prevent infinite execution.`,
+                  timestamp: Date.now(),
+                };
+                if (this._historyStore?.appendMessage) {
+                  await this._historyStore.appendMessage(loopMsg);
+                }
+                this._postMessage({
+                  type: 'MESSAGE_RECEIVED',
+                  message: loopMsg,
+                });
+              }
+              break;
+            }
+
+            // Safeguard 3: Hard limit on attempts (MAX_TERMINAL_RETRIES = 5)
+            if (currentRetryCount >= MAX_TERMINAL_RETRIES) {
+              await flushExecutedTerminalSummary();
+              if (!isReadOnlyCmd) {
+                const maxMsg = {
+                  id: `${Date.now()}-term-max-${cmdCount}`,
+                  role: 'assistant' as const,
+                  content: `⚠️ Terminal auto-retry limit reached (${MAX_TERMINAL_RETRIES}/${MAX_TERMINAL_RETRIES} attempts). Halting self-healing loop.`,
+                  timestamp: Date.now(),
+                };
+                if (this._historyStore?.appendMessage) {
+                  await this._historyStore.appendMessage(maxMsg);
+                }
+                this._postMessage({
+                  type: 'MESSAGE_RECEIVED',
+                  message: maxMsg,
+                });
+              }
+              break;
+            }
+
+            // Eligible for self-healing retry only for side-effecting/build/test commands (NOT read-only inspection commands)
+            // If a read-only command (like git log, git status, dir, type, cat) fails, do NOT initiate self-healing or mutate workspace
+            if (isReadOnlyCmd) {
+              break;
+            }
+
+            failedCommands.add(command);
+
+            // Flush terminal execution summary before posting retry notice
+            await flushExecutedTerminalSummary();
+
+            const retryNotice = {
+              id: `${Date.now()}-term-retry-${cmdCount}`,
+              role: 'system' as const,
+              content: result.timedOut
+                ? `🔄 Terminal command \`${command}\` timed out after 120s. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`
+                : `🔄 Terminal command \`${command}\` failed with exit code ${result.exitCode}. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`,
+              timestamp: Date.now(),
+            };
+            if (this._historyStore?.appendMessage) {
+              await this._historyStore.appendMessage(retryNotice);
+            }
+            this._postMessage({
+              type: 'MESSAGE_RECEIVED',
+              message: retryNotice,
+            });
+
+            // Combine stdout, stderr, and error without short-circuiting so compiler/linter diagnostics are not lost
+            const outputParts: string[] = [];
+            if (result.stdout?.trim()) {
+              outputParts.push(result.stdout.trim());
+            }
+            if (result.stderr?.trim()) {
+              outputParts.push(result.stderr.trim());
+            }
+            if (outputParts.length === 0 && result.error?.trim()) {
+              outputParts.push(result.error.trim());
+            }
+            const fullOutput = outputParts.join('\n') || (result.timedOut ? 'Command timed out after 120s' : 'Command exited with non-zero status');
+            const truncatedError = fullOutput.length > 3000
+              ? fullOutput.substring(0, 3000) + '\n... [output truncated]'
+              : fullOutput;
+
+            const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+            const retryPrompt = result.timedOut
+              ? `The previous terminal command \`${command}\` timed out after 120s.\nOutput before timeout:\n\`\`\`\n${truncatedError}\n\`\`\`\nPlease diagnose why this command hung or timed out. If this is a long-running process or watch server, run with a non-blocking, non-interactive, or single-run flag (e.g. \`flutter test\`, \`npm test -- --watchAll=false\`). Continue autonomously until all tasks and verifications succeed.`
+              : `The previous terminal command \`${command}\` failed with exit code ${result.exitCode ?? 'unknown'}.\nError output:\n\`\`\`\n${truncatedError}\n\`\`\`\nPlease diagnose and resolve this failure:\n- If this is a compiler, analysis, test, or code error in the workspace: generate the necessary file edit(s) to fix the code, then re-run the verification command.\n- If this is a terminal command syntax or environment error: provide the corrected command.\nContinue autonomously until all tasks and verifications succeed.`;
+
+            // Trigger self-healing follow-up turn
+            await this._handleSendMessage(
+              retryPrompt,
+              targetModel,
+              undefined,
+              undefined,
+              this._activeReasoningEffort,
+              { retryCount: currentRetryCount + 1, failedCommands }
+            );
+
+            return true;
+          }
         }
       }
+
+      // Flush any completed commands from the loop into a single consolidated 1-line dropdown
+      await flushExecutedTerminalSummary();
     } else if (runTerminalPerm === 'deny') {
       const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
       let match;
@@ -1571,6 +3244,139 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
       }
     }
+
+    const MAX_AUTO_FOLLOWUPS = 10;
+
+    // 3. Auto-continue conversation with terminal outputs so the model can complete its response
+    if (
+      successfulCommands.length > 0 &&
+      !this._isUserCancelled &&
+      !this._activeAbortController?.signal.aborted
+    ) {
+      const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
+      if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
+        const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+
+        let continuationPrompt = `The following terminal command(s) executed successfully in the user's workspace:\n\n`;
+        for (const item of successfulCommands) {
+          const out = item.output.length > 3000
+            ? item.output.substring(0, 3000) + '\n... [output truncated]'
+            : item.output || '(No output produced)';
+          continuationPrompt += `Command: \`${item.command}\`\nOutput:\n\`\`\`\n${out}\n\`\`\`\n\n`;
+        }
+        if (successfullyEditedFiles.length > 0) {
+          continuationPrompt += `Applied file edits:\n${successfullyEditedFiles.map((f) => `- \`${f}\``).join('\n')}\n\n`;
+        }
+
+        // Check if an implementation plan already exists in history
+        const history = await this._historyStore.loadHistory();
+        const hasExistingPlan = history.some(
+          (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+        );
+
+        if (!hasExistingPlan) {
+          continuationPrompt += `Based on the terminal command results above, answer the user's question directly or continue your analysis of the workspace. If implementation or file modifications are required, formulate the implementation plan inside a \`\`\`plan block. If this was a status check or informational query, conclude with your direct answer without requesting further tasks.`;
+        } else {
+          continuationPrompt += `Based on the terminal command results and applied changes above, please continue executing the plan autonomously until all tasks are complete and verified. Conclude with the two-tier walkthrough document when done.`;
+        }
+
+        await this._handleSendMessage(
+          continuationPrompt,
+          targetModel,
+          undefined,
+          undefined,
+          this._activeReasoningEffort,
+          {
+            retryCount: retryContext?.retryCount ?? 0,
+            failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+            autoTurnCount: currentAutoTurns + 1,
+            isAutoFollowUp: true,
+          }
+        );
+        return true;
+      }
+    }
+
+    // 4. Autonomous Multi-Step Continuation after file edits:
+    // If file edits were applied, but no terminal commands were run,
+    // and no final walkthrough was emitted yet, auto-continue so the model executes the next step without pausing!
+    // (Only engage if NOT in 'ask' mode and an active multi-step plan is underway!)
+    if (
+      !isAskMode &&
+      isExecutionActive &&
+      successfulCommands.length === 0 &&
+      successfullyEditedFiles.length > 0 &&
+      !walkthroughDocument &&
+      !hasPlan &&
+      !hasPlanApprovalQuestion &&
+      !this._isUserCancelled &&
+      !this._activeAbortController?.signal.aborted
+    ) {
+      const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
+      if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
+        const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+        const continuationPrompt = `Applied the following edit(s) successfully:\n${successfullyEditedFiles.map((f) => `- \`${f}\``).join('\n')}\n\nPlease proceed directly with the next step in the implementation plan without pausing for confirmation. Reconcile your planned task checklist, implement the next pending modification, or provide the final walkthrough if all implementation and verification steps are complete.`;
+
+        await this._handleSendMessage(
+          continuationPrompt,
+          targetModel,
+          undefined,
+          undefined,
+          this._activeReasoningEffort,
+          {
+            retryCount: retryContext?.retryCount ?? 0,
+            failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+            autoTurnCount: currentAutoTurns + 1,
+            isAutoFollowUp: true,
+          }
+        );
+        return true;
+      }
+    }
+
+    // 5. Autonomous Conversational Stall Recovery:
+    // Only engage if an active multi-step implementation plan is underway AND edits or commands were expected.
+    // NEVER engage for questions, status checks, or when no plan exists or no files were modified.
+    // Check if the model's message indicates completion or status check
+    const isExplicitlyComplete =
+      /\b(task is complete|check is complete|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree)\b/i.test(content);
+
+    if (
+      isExecutionActive &&
+      activePlanExists &&
+      !isExplicitlyComplete &&
+      successfullyEditedFiles.length === 0 &&
+      successfulCommands.length === 0 &&
+      failedEdits.length === 0 &&
+      !walkthroughDocument &&
+      !hasPlan &&
+      !hasPlanApprovalQuestion &&
+      !this._isUserCancelled &&
+      !this._activeAbortController?.signal.aborted
+    ) {
+      const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
+      if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
+        const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+        const continuationPrompt = `Please proceed directly with the implementation without pausing for confirmation. Reconcile your planned task checklist and emit the required file edits (\`\`\`edit_file:<path>) or terminal commands for the next step, or provide the final \`\`\`walkthrough block if all implementation and verification steps are complete.`;
+
+        await this._handleSendMessage(
+          continuationPrompt,
+          targetModel,
+          undefined,
+          undefined,
+          this._activeReasoningEffort,
+          {
+            retryCount: retryContext?.retryCount ?? 0,
+            failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+            autoTurnCount: currentAutoTurns + 1,
+            isAutoFollowUp: true,
+          }
+        );
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private async _handleOpenDirectReviewer(): Promise<void> {
@@ -1593,6 +3399,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     this._reviewerHistory = activeSession.messages.map((m) => ({
       role: m.role as 'user' | 'assistant',
       content: m.content,
+      attachedFile: m.attachedFile,
+      executionDurationMs: m.executionDurationMs,
     }));
 
     this._postMessage({
@@ -1627,9 +3435,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
+    let reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
     if (!reviewerModel) {
-      vscode.window.showWarningMessage('Please select a Reviewer Model in Settings before starting a review.');
+      reviewerModel = Configuration.getLastModel() || (this._cachedModels[0]?.id ?? '');
+    }
+    if (!reviewerModel) {
+      vscode.window.showWarningMessage('Please select a Model before starting a review.');
       return;
     }
 
@@ -1649,50 +3460,88 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
     const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
     const sessionTitle = `Review: ${artifactType === 'plan' ? 'Plan' : 'Walkthrough'}`;
+    const attachedFileRef: AttachedFileRef = {
+      name: artifactType === 'plan' ? 'Plan docs' : 'Results docs',
+      uri: prepared.uri.toString(),
+      filePath: prepared.uri.fsPath,
+      artifactType,
+    };
 
-    // Check if a reviewer session is already active/open
+    // Always load the persistent active reviewer session from disk to sync in-memory history.
+    // This prevents a new session from being created on every startup when _reviewerHistory
+    // hasn't been populated yet (e.g. user never opened the reviewer tab this session).
     const { activeSession } = await this._historyStore.loadReviewerSessions();
-    const isSessionActive =
-      (activeSession && activeSession.messages && activeSession.messages.length > 0) ||
-      (this._reviewerHistory && this._reviewerHistory.length > 0);
 
-    if (isSessionActive) {
-      // Repeat click while reviewer session is active:
+    // Sync in-memory history from the persisted active session if it hasn't been loaded yet.
+    if (this._reviewerHistory.length === 0 && activeSession.messages.length > 0) {
+      this._reviewerHistory = activeSession.messages.map((m) => ({
+        role: m.role as 'user' | 'assistant',
+        content: m.content,
+        attachedFile: m.attachedFile,
+        executionDurationMs: m.executionDurationMs,
+      }));
+      if (activeSession.artifactContent && (activeSession.artifactType === 'plan' || activeSession.artifactType === 'walkthrough')) {
+        this._activeReviewerArtifactContent = activeSession.artifactContent;
+        this._activeReviewerArtifactType = activeSession.artifactType;
+      }
+    }
+
+    const hasExistingMessages = activeSession.messages.length > 0 || this._reviewerHistory.length > 0;
+
+    if (hasExistingMessages) {
+      // Reviewer session already has a conversation — update artifact context and attach to input bar.
       // Do NOT create a new session, do NOT auto-send.
-      // Update the active artifact context and attach the artifact to the current session's input bar.
       this._activeReviewerArtifactContent = prepared.content;
       this._activeReviewerArtifactType = artifactType;
-      if (activeSession) {
-        activeSession.artifactContent = prepared.content;
-        activeSession.artifactType = artifactType;
-        activeSession.artifactMessageId = messageId;
-        await this._historyStore.saveReviewerSessions();
-      }
+      this._activeReviewerArtifactName = attachedFileRef.name;
+      activeSession.artifactContent = prepared.content;
+      activeSession.artifactType = artifactType;
+      activeSession.artifactMessageId = messageId;
+      await this._historyStore.saveReviewerSessions();
 
+      // Send REVIEWER_VIEW_DATA first so the panel fully initializes (history rendered,
+      // model name shown, reasoning effort control visible) even on a cold-start push
+      // where the reviewer tab was never opened this session.
+      this._postMessage({
+        type: 'REVIEWER_VIEW_DATA',
+        artifactType,
+        artifactContent: prepared.content,
+        artifactUri: prepared.uri.toString(),
+        messageId,
+        reviewerModel,
+        reviewerReasoningEffort,
+        history: [...this._reviewerHistory],
+        activeSessionId: activeSession.id,
+      });
+
+      // Then attach the newly pushed doc as a chip in the input bar so the user can
+      // ask follow-up questions about it immediately.
       this._postMessage({
         type: 'REVIEWER_ATTACH_ARTIFACT',
         artifactType,
         artifactContent: prepared.content,
-        artifactName: artifactType === 'plan' ? 'Plan docs' : 'Results docs',
+        artifactName: attachedFileRef.name,
         artifactUri: prepared.uri.toString(),
         messageId,
       });
       return;
     }
 
+    // Active session is empty (fresh or after a reset) — reuse it for this review instead of creating a new one.
     this._activeReviewerArtifactContent = prepared.content;
     this._activeReviewerArtifactType = artifactType;
+    this._activeReviewerArtifactName = attachedFileRef.name;
 
-    // No active session for this context: start a fresh reviewer session dedicated to this artifact
-    const newSession = await this._historyStore.startNewReviewerSession(sessionTitle, {
-      artifactType,
-      artifactMessageId: messageId,
-      artifactContent: prepared.content,
-    });
+    // Update the existing empty session's context in-place (avoids accumulating empty session entries).
+    activeSession.title = sessionTitle;
+    activeSession.artifactType = artifactType;
+    activeSession.artifactMessageId = messageId;
+    activeSession.artifactContent = prepared.content;
+    await this._historyStore.saveReviewerSessions();
 
-    // The initial user turn displays the configured Reviewer System Prompt so the user sees the exact critique instructions
+    // The initial user turn displays the configured Reviewer System Prompt so the user sees the exact critique instructions.
     const initialUserPrompt = reviewerSystemPrompt;
-    this._reviewerHistory = [{ role: 'user', content: initialUserPrompt }];
+    this._reviewerHistory = [{ role: 'user', content: initialUserPrompt, attachedFile: attachedFileRef }];
     this._lastReviewerUserPrompt = initialUserPrompt;
 
     await this._historyStore.appendReviewerMessage({
@@ -1700,6 +3549,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       role: 'user',
       content: initialUserPrompt,
       timestamp: Date.now(),
+      attachedFile: attachedFileRef,
     });
 
     // Inform webview to navigate to reviewer view
@@ -1712,7 +3562,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       reviewerModel,
       reviewerReasoningEffort,
       history: [...this._reviewerHistory],
-      activeSessionId: newSession.id,
+      activeSessionId: activeSession.id,
     });
     await this._sendReviewerSessionsData();
 
@@ -1725,7 +3575,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     modelOverride?: string,
     reasoningEffortOverride?: string,
     artifactContent?: string,
-    artifactType?: 'plan' | 'walkthrough'
+    artifactType?: 'plan' | 'walkthrough',
+    attachedFile?: AttachedFileRef & { content?: string }
   ): Promise<void> {
     const apiKey = await this._secretStore.getApiKey();
     if (!apiKey) {
@@ -1740,13 +3591,36 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       this._activeReviewerReasoningEffortOverride = reasoningEffortOverride;
     }
 
-    if (artifactContent) {
-      this._activeReviewerArtifactContent = artifactContent;
-      this._activeReviewerArtifactType = artifactType || 'plan';
+    let effectiveContent = artifactContent || attachedFile?.content;
+    if (!effectiveContent && attachedFile?.filePath) {
+      try {
+        const fileUri = attachedFile.filePath.startsWith('file://')
+          ? vscode.Uri.parse(attachedFile.filePath)
+          : path.isAbsolute(attachedFile.filePath)
+            ? vscode.Uri.file(attachedFile.filePath)
+            : vscode.workspace.workspaceFolders?.[0]
+              ? vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, attachedFile.filePath)
+              : undefined;
+        if (fileUri) {
+          const raw = await vscode.workspace.fs.readFile(fileUri);
+          effectiveContent = Buffer.from(raw).toString('utf8');
+        }
+      } catch (err) {
+        console.warn('Could not read attached file from workspace:', err);
+      }
+    }
+
+    if (effectiveContent) {
+      this._activeReviewerArtifactContent = effectiveContent;
+      this._activeReviewerArtifactType = artifactType || attachedFile?.artifactType || 'plan';
+      this._activeReviewerArtifactName =
+        attachedFile?.name ||
+        (this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs');
+
       const { activeSession } = await this._historyStore.loadReviewerSessions();
       if (activeSession) {
-        activeSession.artifactContent = artifactContent;
-        activeSession.artifactType = artifactType || 'plan';
+        activeSession.artifactContent = effectiveContent;
+        activeSession.artifactType = this._activeReviewerArtifactType;
         await this._historyStore.saveReviewerSessions();
       }
     }
@@ -1755,7 +3629,20 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
     const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
 
-    this._reviewerHistory.push({ role: 'user', content: userText });
+    const storedRef: AttachedFileRef | undefined = (attachedFile || effectiveContent)
+      ? {
+          name:
+            attachedFile?.name ||
+            this._activeReviewerArtifactName ||
+            (this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs'),
+          uri: attachedFile?.uri,
+          filePath: attachedFile?.filePath,
+          artifactType: attachedFile?.artifactType || this._activeReviewerArtifactType,
+          content: effectiveContent,
+        }
+      : undefined;
+
+    this._reviewerHistory.push({ role: 'user', content: userText, attachedFile: storedRef });
     this._lastReviewerUserPrompt = userText;
 
     await this._historyStore.appendReviewerMessage({
@@ -1763,6 +3650,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       role: 'user',
       content: userText,
       timestamp: Date.now(),
+      attachedFile: storedRef,
     });
 
     await this._streamReviewerResponse(reviewerModel, reviewerReasoningEffort, reviewerSystemPrompt);
@@ -1785,8 +3673,13 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const apiKey = await this._secretStore.getApiKey();
     if (!apiKey) return;
 
+    this._isReviewerUserCancelled = false;
     this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: true });
     this._postMessage({ type: 'REVIEWER_STREAM_START' });
+    const artifactTokenEst = this._activeReviewerArtifactContent
+      ? Math.round(this._activeReviewerArtifactContent.length / 4)
+      : 0;
+    logger.info('REVIEW', `Reviewer stream start — model: ${model}, artifact: ~${artifactTokenEst} tokens`);
 
     let accumulatedChunk = '';
     const abortController = new AbortController();
@@ -1795,13 +3688,23 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     let effectiveSystemPrompt = systemPrompt;
     if (this._activeReviewerArtifactContent) {
       const artifactLabel =
-        this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs';
+        this._activeReviewerArtifactName ||
+        (this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs');
       effectiveSystemPrompt = `${systemPrompt}\n\n# Document Under Review (${artifactLabel}):\n${this._activeReviewerArtifactContent}`;
     }
 
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       { role: 'system', content: effectiveSystemPrompt },
-      ...this._reviewerHistory,
+      ...this._reviewerHistory.map((m) => {
+        if (m.role === 'user' && m.attachedFile?.content) {
+          const docLabel =
+            m.attachedFile.name ||
+            (m.attachedFile.artifactType === 'walkthrough' ? 'Results docs' : 'Plan docs');
+          const augmentedContent = `${m.content}\n\n---\n# Attached Document Under Review (${docLabel}):\n${m.attachedFile.content}\n---`;
+          return { role: m.role, content: augmentedContent };
+        }
+        return { role: m.role, content: m.content };
+      }),
     ];
 
     const dataPolicy = Configuration.getDataCollectionPolicy();
@@ -1809,6 +3712,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       data_collection: dataPolicy,
       zdr: dataPolicy === 'deny',
     };
+    const reviewerStartTime = Date.now();
 
     await OpenRouterClient.sendChatCompletionStream(
       apiKey,
@@ -1822,8 +3726,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         });
       },
       async (usage) => {
+        if (this._isReviewerUserCancelled || abortController.signal.aborted) {
+          this._activeReviewerAbortController = undefined;
+          this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
+          return;
+        }
         this._activeReviewerAbortController = undefined;
-        this._reviewerHistory.push({ role: 'assistant', content: accumulatedChunk });
+        const executionDurationMs = Date.now() - reviewerStartTime;
+        this._reviewerHistory.push({ role: 'assistant', content: accumulatedChunk, executionDurationMs });
 
         await this._historyStore.appendReviewerMessage({
           id: `${Date.now()}-assistant`,
@@ -1831,6 +3741,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           content: accumulatedChunk,
           model,
           timestamp: Date.now(),
+          executionDurationMs,
         });
 
         if (usage) {
@@ -1862,6 +3773,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
         this._postMessage({
           type: 'REVIEWER_STREAM_DONE',
+          executionDurationMs,
           usage,
         });
         this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
@@ -1970,6 +3882,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           <span id="vision-badge" class="badge">👁️ Vision</span>
           <span id="audio-badge" class="badge">🎙️ Audio</span>
           <span id="tools-badge" class="badge">⚙️ Tools</span>
+          <span id="agentic-badge" class="badge agentic-badge" title="Model capability tier">⚡ Agentic</span>
         </div>
         <div id="capability-notice-banner" class="capability-notice-banner hidden">
           <span id="capability-notice-text"></span>
@@ -1982,7 +3895,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       </div>
 
       <!-- Messages feed -->
-      <div id="messages-container" class="chat-container"></div>
+      <div style="position:relative; flex:1; min-height:0; display:flex; flex-direction:column;">
+        <div id="messages-container" class="chat-container"></div>
+        <button id="main-scroll-bottom-btn" class="scroll-bottom-btn hidden" title="Scroll to bottom">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </button>
+      </div>
 
       <!-- Input Bar -->
       <div class="input-bar">
@@ -2276,7 +4196,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         <div class="settings-group-title">Usage data</div>
         <div class="settings-actions-row">
           <button id="settings-view-usage-btn" class="btn secondary">📊 View usage report</button>
-          <button id="settings-clear-history-btn" class="btn secondary danger-outline">Clear history</button>
+          <button id="settings-view-logs-btn" class="btn secondary">View logs</button>
+          <button id="settings-clear-history-btn" class="btn secondary danger-outline" style="margin-left: auto;">Clear history</button>
         </div>
       </div>
 
@@ -2314,23 +4235,6 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             </select>
           </div>
 
-          <!-- Reviewer Sessions Menu -->
-          <div class="session-dropdown-container">
-            <button id="reviewer-new-chat-btn" class="icon-btn" title="Reviewer Sessions / New Session" style="font-size:12px; padding:3px 6px;">➕</button>
-            <div id="reviewer-session-dropdown" class="session-dropdown hidden">
-              <div class="session-dropdown-header">
-                <span>Reviewer Sessions</span>
-              </div>
-              <div id="reviewer-session-item-new" class="session-menu-action">
-                <span class="action-icon">➕</span>
-                <span class="action-text">New Review Session</span>
-              </div>
-              <div class="session-dropdown-divider"></div>
-              <div class="session-history-title">Previous Reviews</div>
-              <div id="reviewer-session-history-list" class="session-history-list"></div>
-            </div>
-          </div>
-
           <!-- Start Fresh / Context Reset Action -->
           <button id="reviewer-reset-context-btn" class="icon-btn" title="Start fresh from here (reset reviewer context)" style="font-size:12px; padding:3px 6px;">🔄</button>
         </div>
@@ -2344,8 +4248,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
       <!-- Split Container: Artifact Preview on top / collapsible & Conversation below -->
       <div style="display:flex; flex-direction:column; flex:1; min-height:0; position:relative;">
-        <!-- Artifact Reference Header & Collapsible Document Preview -->
-        <div id="reviewer-artifact-section" class="reviewer-artifact-section" style="border-bottom:1px solid var(--border); background:rgba(0,0,0,0.15);">
+        <!-- Artifact Reference Header & Collapsible Document Preview (Deprecated in favor of in-chat file reference card) -->
+        <div id="reviewer-artifact-section" class="reviewer-artifact-section hidden" style="display:none; border-bottom:1px solid var(--border); background:rgba(0,0,0,0.15);">
           <div style="display:flex; justify-content:space-between; align-items:center; padding:6px 12px;">
             <div style="display:flex; align-items:center; gap:6px; font-size:11.5px; font-weight:500;">
               <span>📄</span>
@@ -2363,18 +4267,25 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           <div id="reviewer-artifact-preview-body" style="max-height:140px; overflow-y:auto; padding:6px 12px; font-size:11px; font-family:var(--vscode-editor-font-family, monospace); background:rgba(0,0,0,0.25); border-top:1px solid rgba(255,255,255,0.05); white-space:pre-wrap; word-break:break-word;"></div>
         </div>
 
-        <!-- Reviewer Conversation Thread -->
-        <div id="reviewer-messages" class="messages-container chat-container" style="flex:1; min-height:0; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:12px;"></div>
+        <!-- Reviewer Messages feed -->
+        <div style="position:relative; flex:1; min-height:0; display:flex; flex-direction:column;">
+          <div id="reviewer-messages" class="messages-container chat-container" style="flex:1; min-height:0; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:12px;"></div>
+          <button id="reviewer-scroll-bottom-btn" class="scroll-bottom-btn hidden" title="Scroll to bottom">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </button>
 
-        <!-- Floating Selection Toolbar for Selective Return to Main Model -->
-        <div id="reviewer-selection-toolbar" class="hidden" style="position:absolute; bottom:80px; left:50%; transform:translateX(-50%); background:#1f242c; border:1px solid var(--border); border-radius:6px; padding:4px 8px; box-shadow:0 4px 12px rgba(0,0,0,0.4); display:flex; align-items:center; gap:8px; z-index:100;">
-          <span style="font-size:11px; color:#8b949e;">Selected text</span>
-          <button id="reviewer-clarify-selection-btn" class="btn secondary" style="font-size:11px; padding:2px 8px;">
-            💬 Clarify Selection
-          </button>
-          <button id="reviewer-send-selection-btn" class="btn primary" style="font-size:11px; padding:2px 8px;">
-            ↵ Send to Main Model
-          </button>
+          <!-- Floating Selection Toolbar for Selective Return to Main Model -->
+          <div id="reviewer-selection-toolbar" class="hidden" style="position:absolute; bottom:20px; left:50%; transform:translateX(-50%); background:#1f242c; border:1px solid var(--border); border-radius:6px; padding:4px 8px; box-shadow:0 4px 12px rgba(0,0,0,0.4); display:flex; align-items:center; gap:8px; z-index:100;">
+            <span style="font-size:11px; color:#8b949e;">Selected text</span>
+            <button id="reviewer-clarify-selection-btn" class="btn secondary" style="font-size:11px; padding:2px 8px;">
+              💬 Clarify Selection
+            </button>
+            <button id="reviewer-send-selection-btn" class="btn primary" style="font-size:11px; padding:2px 8px;">
+              ↵ Send to Main Model
+            </button>
+          </div>
         </div>
 
         <!-- Shared-UX Reviewer Input Bar -->

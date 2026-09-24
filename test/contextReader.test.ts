@@ -123,3 +123,48 @@ test('ContextReader.findAndReadWorkspaceFile: prioritizes unsaved in-memory text
   // Must return memoryContent, NOT diskContent!
   assert.strictEqual(result?.content, memoryContent);
 });
+
+test('ContextReader.findAndReadWorkspaceFile: matches open documents case-insensitively (e.g. prd.md matches PRD.md)', async () => {
+  const permManager = createPermissionManager();
+  const prdContent = '# Product Requirements Document\nOffline-First Android Note-Taking App';
+  const prdUri = vscode.Uri.file('C:/mock/workspace/PRD.md');
+
+  const openDoc: any = {
+    uri: prdUri,
+    getText: () => prdContent,
+  };
+  (vscode.workspace as any).textDocuments = [openDoc];
+  (vscode.workspace as any).findFiles = async () => []; // findFiles fails (case sensitivity)
+
+  // Query in lowercase 'prd.md' while open document is 'PRD.md'
+  const result = await ContextReader.findAndReadWorkspaceFile('prd.md', permManager);
+  assert.ok(result, 'Should resolve PRD.md from lowercase query');
+  assert.strictEqual(result?.relativePath, 'PRD.md');
+  assert.strictEqual(result?.content, prdContent);
+});
+
+test('ContextReader.getActiveEditorContext: preserves full file content without arbitrary 25k truncation', () => {
+  const permManager = createPermissionManager();
+  // Create a 40,000 character string (exceeds old 25k limit)
+  const largeContent = 'A'.repeat(40000);
+  const largeDoc: any = {
+    uri: vscode.Uri.file('C:/mock/workspace/large.md'),
+    fileName: 'C:/mock/workspace/large.md',
+    languageId: 'markdown',
+    getText: () => largeContent,
+  };
+  const mockEditor: any = {
+    document: largeDoc,
+    selection: { isEmpty: true },
+  };
+
+  (vscode.window as any).activeTextEditor = mockEditor;
+  (vscode.window as any).visibleTextEditors = [mockEditor];
+  (vscode.workspace as any).textDocuments = [largeDoc];
+
+  const ctx = ContextReader.getActiveEditorContext(permManager);
+  assert.strictEqual(ctx.hasContext, true);
+  assert.strictEqual(ctx.fileContent?.length, 40000);
+  assert.strictEqual(ctx.fileContent?.includes('...[truncated]'), false);
+});
+

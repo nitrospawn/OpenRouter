@@ -7,10 +7,23 @@ export interface StoredChatMessage {
   images?: Array<{ name: string; dataUrl: string }>;
   model?: string;
   timestamp: number;
+  executionDurationMs?: number;
   checkpointId?: string;
   affectedFiles?: string[];
   planDocument?: string;
   walkthroughDocument?: string;
+  attachedFile?: {
+    name: string;
+    uri?: string;
+    filePath?: string;
+    artifactType?: 'plan' | 'walkthrough';
+  };
+  isAutoRetry?: boolean;
+  isAutoFollowUp?: boolean;
+  isIntermediateStep?: boolean;
+  userTypedText?: string;
+  attachments?: any[];
+  totalTokens?: number;
 }
 
 export interface ChatSessionMeta {
@@ -30,6 +43,7 @@ export interface ChatSession {
   artifactType?: 'plan' | 'walkthrough' | 'standalone';
   artifactMessageId?: string;
   artifactContent?: string;
+  lastTotalTokens?: number;
 }
 
 export class HistoryStore {
@@ -78,6 +92,16 @@ export class HistoryStore {
     if (!active) {
       active = this.sessions[0];
       this.activeSessionId = active.id;
+    }
+
+    if (active && active.lastTotalTokens === undefined && active.messages.length > 0) {
+      for (let i = active.messages.length - 1; i >= 0; i--) {
+        const t = active.messages[i].totalTokens;
+        if (typeof t === 'number' && t > 0) {
+          active.lastTotalTokens = t;
+          break;
+        }
+      }
     }
 
     const allSessions = this.sessions.map((s) => ({
@@ -163,6 +187,10 @@ export class HistoryStore {
       active.title = message.content.trim().slice(0, 32).replace(/[\r\n]+/g, ' ');
     }
 
+    if (typeof message.totalTokens === 'number' && message.totalTokens > 0) {
+      active.lastTotalTokens = message.totalTokens;
+    }
+
     active.messages.push(message);
     active.updatedAt = Date.now();
 
@@ -177,10 +205,17 @@ export class HistoryStore {
     const active = this.sessions.find((s) => s.id === this.activeSessionId);
     if (!active) return false;
 
-    const msg = active.messages.find((m) => m.id === messageId);
+    let msg = active.messages.find((m) => m.id === messageId);
+    if (!msg) {
+      const idx = this._findMessageIndex(active.messages, messageId);
+      if (idx !== -1) msg = active.messages[idx];
+    }
     if (msg) {
-      msg.checkpointId = checkpointId;
-      msg.affectedFiles = affectedFiles;
+      if (!msg.checkpointId) {
+        msg.checkpointId = checkpointId;
+      }
+      const existing = msg.affectedFiles ?? [];
+      msg.affectedFiles = Array.from(new Set([...existing, ...affectedFiles]));
       active.updatedAt = Date.now();
       await this._saveToDisk();
       return true;
@@ -192,8 +227,21 @@ export class HistoryStore {
     if (!this.hasLoaded) {
       await this.loadSessions();
     }
+    const active = this.sessions.find((s) => s.id === this.activeSessionId);
+    if (active) {
+      let found = active.messages.find((m) => m.id === messageId);
+      if (!found) {
+        const idx = this._findMessageIndex(active.messages, messageId);
+        if (idx !== -1) found = active.messages[idx];
+      }
+      if (found) return found;
+    }
     for (const session of this.sessions) {
-      const found = session.messages.find((m) => m.id === messageId);
+      let found = session.messages.find((m) => m.id === messageId);
+      if (!found) {
+        const idx = this._findMessageIndex(session.messages, messageId);
+        if (idx !== -1) found = session.messages[idx];
+      }
       if (found) return found;
     }
     return undefined;
@@ -224,24 +272,41 @@ export class HistoryStore {
     return active.messages.slice(idx + 1);
   }
 
-  public async truncateAfter(messageId: string): Promise<{ success: boolean; removedCount: number }> {
+  public async truncateAfter(messageId: string): Promise<{ success: boolean; removedCount: number; remainingTokens: number }> {
     if (!this.hasLoaded) {
       await this.loadSessions();
     }
     const active = this.sessions.find((s) => s.id === this.activeSessionId);
-    if (!active) return { success: false, removedCount: 0 };
+    if (!active) return { success: false, removedCount: 0, remainingTokens: 0 };
     const idx = this._findMessageIndex(active.messages, messageId);
     if (idx === -1) {
-      return { success: false, removedCount: 0 };
+      return { success: false, removedCount: 0, remainingTokens: active.lastTotalTokens ?? 0 };
     }
     const removedCount = active.messages.length - idx;
     if (removedCount <= 0) {
-      return { success: true, removedCount: 0 };
+      return { success: true, removedCount: 0, remainingTokens: active.lastTotalTokens ?? 0 };
     }
     active.messages = active.messages.slice(0, idx);
     active.updatedAt = Date.now();
+
+    // Recompute remaining tokens for this session
+    let remainingTokens = 0;
+    if (active.messages.length > 0) {
+      for (let i = active.messages.length - 1; i >= 0; i--) {
+        if (typeof active.messages[i].totalTokens === 'number' && active.messages[i].totalTokens! > 0) {
+          remainingTokens = active.messages[i].totalTokens!;
+          break;
+        }
+      }
+      if (remainingTokens === 0) {
+        const totalChars = active.messages.reduce((sum, m) => sum + (m.content || '').length, 0);
+        remainingTokens = Math.round(totalChars / 4);
+      }
+    }
+    active.lastTotalTokens = remainingTokens;
+
     await this._saveToDisk();
-    return { success: true, removedCount };
+    return { success: true, removedCount, remainingTokens };
   }
 
   public async renameSession(sessionId: string, newTitle: string): Promise<boolean> {
@@ -433,6 +498,27 @@ export class HistoryStore {
     await this._saveReviewerToDisk();
   }
 
+  /**
+   * Clears the active reviewer session's messages and artifact context in-place.
+   * Unlike startNewReviewerSession, this reuses the existing session entry so that
+   * the sessions list does not accumulate empty entries on every reset.
+   */
+  public async clearActiveReviewerSession(): Promise<void> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+    const active = this.reviewerSessions.find((s) => s.id === this.activeReviewerSessionId);
+    if (active) {
+      active.messages = [];
+      active.title = 'Review Session';
+      active.artifactContent = undefined;
+      active.artifactType = undefined;
+      active.artifactMessageId = undefined;
+      active.updatedAt = Date.now();
+    }
+    await this._saveReviewerToDisk();
+  }
+
   public async appendReviewerMessage(message: StoredChatMessage): Promise<void> {
     if (!this.hasLoadedReviewer) {
       await this.loadReviewerSessions();
@@ -446,6 +532,10 @@ export class HistoryStore {
     // Auto-update title from first user message if still default generic title
     if (active.title === 'Review Session' && message.role === 'user' && message.content.trim()) {
       active.title = message.content.trim().slice(0, 32).replace(/[\r\n]+/g, ' ');
+    }
+
+    if (typeof message.totalTokens === 'number' && message.totalTokens > 0) {
+      active.lastTotalTokens = message.totalTokens;
     }
 
     active.messages.push(message);

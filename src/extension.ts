@@ -1,14 +1,19 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { SecretStore } from './auth/secretStore';
 import { HistoryStore } from './conversation/historyStore';
 import { PermissionManager, PermissionCategory } from './permissions/permissionManager';
 import { DiffPreviewManager } from './editor/diffPreview';
 import { OpenRouterPanelProvider } from './webview/panelProvider';
 import { DiagnosticManager } from './diagnostics/diagnosticManager';
-
+import { logger } from './logger';
 import { UsageStore } from './usage/usageStore';
 
 export function activate(context: vscode.ExtensionContext) {
+  // Initialize diagnostic logger first so all subsequent code can use it
+  logger.initialize(context.globalStorageUri);
+  logger.info('EXT', 'Extension activating');
+
   const secretStore = new SecretStore(context);
   const historyStore = new HistoryStore(context.storageUri);
   const permissionManager = new PermissionManager(context);
@@ -269,6 +274,45 @@ export function activate(context: vscode.ExtensionContext) {
       }
     })
   );
+
+  // Diagnostic Logs commands
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openrouter.copyDiagnosticLogs', async () => {
+      const text = logger.getTodayFileLogsText();
+      await vscode.env.clipboard.writeText(text);
+      vscode.window.showInformationMessage(
+        'OpenRouter: Diagnostic logs copied to clipboard! Paste them into an email or message to share.',
+        'Open Log File'
+      ).then((choice) => {
+        if (choice === 'Open Log File') {
+          vscode.commands.executeCommand('openrouter.openDiagnosticLog');
+        }
+      });
+      logger.info('CMD', 'Diagnostic logs copied to clipboard');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openrouter.openDiagnosticLog', async () => {
+      const logPath = logger.getTodayLogFilePath();
+      if (!logPath) {
+        vscode.window.showWarningMessage('OpenRouter: Log file not found.');
+        return;
+      }
+      try {
+        if (!fs.existsSync(logPath)) {
+          fs.writeFileSync(logPath, logger.getSessionLogsText(), 'utf8');
+        }
+      } catch {}
+      const uri = vscode.Uri.file(logPath);
+      await vscode.window.showTextDocument(uri, { preview: false });
+      logger.info('CMD', 'Diagnostic log file opened in editor');
+    })
+  );
+
+  logger.info('EXT', 'Extension activated successfully');
 }
 
-export function deactivate() {}
+export function deactivate() {
+  logger.info('EXT', 'Extension deactivating / shutting down');
+}

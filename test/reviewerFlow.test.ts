@@ -1438,6 +1438,22 @@ test('Reviewer Session Continuity: Repeat Review click attaches artifact without
       'Follow-up send must inject plan into system-role context'
     );
 
+    const outgoingUserMsgsTurn2 = lastCapturedOutgoingMessages.filter((m) => m.role === 'user');
+    const turn2OutgoingUserMsg = outgoingUserMsgsTurn2[outgoingUserMsgsTurn2.length - 1];
+    assert.ok(turn2OutgoingUserMsg);
+    assert.ok(
+      turn2OutgoingUserMsg.content.includes('check again'),
+      'Outgoing user message must contain the user text'
+    );
+    assert.ok(
+      turn2OutgoingUserMsg.content.includes(planMarkdown),
+      'Outgoing user message dispatched to model must include the attached plan document context'
+    );
+    assert.ok(
+      turn2OutgoingUserMsg.content.includes('# Attached Document Under Review (Plan docs):'),
+      'Outgoing user message must include the structured document header'
+    );
+
     // --- Part 4: Second Review click from a DIFFERENT artifact (Walkthrough) while session is active ---
     // Must NOT create a new session, must NOT auto-send, and must attach new artifact
     const walkthroughMsgId = 'msg-walkthrough-continuity';
@@ -1493,6 +1509,22 @@ test('Reviewer Session Continuity: Repeat Review click attaches artifact without
     assert.ok(
       turn3SystemMsg.content.includes(walkthroughMarkdown),
       'Walkthrough content must be injected into system-role context'
+    );
+
+    const outgoingUserMsgsTurn3 = lastCapturedOutgoingMessages.filter((m) => m.role === 'user');
+    const turn3OutgoingUserMsg = outgoingUserMsgsTurn3[outgoingUserMsgsTurn3.length - 1];
+    assert.ok(turn3OutgoingUserMsg);
+    assert.ok(
+      turn3OutgoingUserMsg.content.includes('inspect edge cases'),
+      'Outgoing user message must contain user text'
+    );
+    assert.ok(
+      turn3OutgoingUserMsg.content.includes(walkthroughMarkdown),
+      'Outgoing user message dispatched to model must include attached walkthrough document'
+    );
+    assert.ok(
+      turn3OutgoingUserMsg.content.includes('# Attached Document Under Review (Results docs):'),
+      'Outgoing user message must include structured walkthrough header'
     );
   } finally {
     OpenRouterClient.sendChatCompletionStream = originalSendChatCompletionStream;
@@ -1723,6 +1755,115 @@ test('Reviewer Walkthrough Review: Initial user turn uses configured Reviewer Sy
     OpenRouterClient.sendChatCompletionStream = originalSendChatCompletionStream;
   }
 });
+
+test('Reviewer Phase 21: Follow-up user turn with attached plan grounds document directly in outgoing user message while preserving clean stored turn in historyStore', async () => {
+  const { OpenRouterPanelProvider } = require('../src/webview/panelProvider');
+  const { OpenRouterClient } = require('../src/api/openrouterClient');
+  const historyStore = new HistoryStore();
+  const secretStore = { getApiKey: async () => 'test-api-key' } as any;
+  const permissionManager = {} as any;
+  const usageStore = new UsageStore();
+  const storageUri = vscode.Uri.file('C:/mock/storage');
+
+  (vscode.workspace as any)._currentWorkspaceKey = 'reviewer-phase21-grounding';
+  await Configuration.setReviewerEnabled(true);
+  await Configuration.setReviewerModel('google/gemini-2.5-flash');
+  await Configuration.setReviewerSystemPrompt('You are an expert reviewer model.');
+
+  const originalSendChatCompletionStream = OpenRouterClient.sendChatCompletionStream;
+  let capturedOutgoingMessages: Array<{ role: string; content: string }> = [];
+
+  OpenRouterClient.sendChatCompletionStream = async (
+    _key: string,
+    _model: string,
+    messages: Array<{ role: string; content: string }>,
+    onChunk: (c: string) => void,
+    onDone: (u: any) => void
+  ) => {
+    capturedOutgoingMessages = [...messages];
+    onChunk('Plan review feedback: All 5 priority items verified.');
+    onDone({ prompt_tokens: 150, completion_tokens: 30, total_tokens: 180 });
+  };
+
+  const provider = new OpenRouterPanelProvider(
+    vscode.Uri.file('c:/mock/extension') as any,
+    secretStore,
+    historyStore,
+    permissionManager,
+    usageStore,
+    storageUri
+  );
+
+  const initialPlanMarkdown = '# Architecture Plan v1\n1. Initial database schema';
+  const updatedPlanMarkdown = '# Architecture Plan v2 (Revised)\n1. SQLCipher key lifecycle\n2. G-6 durability CI gate\n3. Zero-loss autosave';
+
+  try {
+    // 1. Start initial review
+    const session = await historyStore.startNewReviewerSession('Plan Review', {
+      artifactType: 'plan',
+      artifactContent: initialPlanMarkdown,
+    });
+    await historyStore.appendReviewerMessage({
+      id: 'turn1-user',
+      role: 'user',
+      content: 'You are an expert reviewer model.',
+      timestamp: Date.now(),
+      attachedFile: { name: 'Plan docs', artifactType: 'plan' },
+    });
+    await historyStore.appendReviewerMessage({
+      id: 'turn1-assistant',
+      role: 'assistant',
+      content: 'Previous Critique: 5 priority items must be resolved.',
+      timestamp: Date.now(),
+    });
+
+    await provider._handleOpenDirectReviewer();
+
+    // 2. User sends follow-up with updated plan attached: "review this new one"
+    await (provider as any)._handleSendReviewerMessage(
+      'review this new one',
+      undefined,
+      undefined,
+      updatedPlanMarkdown,
+      'plan',
+      {
+        name: 'Plan docs',
+        artifactType: 'plan',
+        content: updatedPlanMarkdown,
+      }
+    );
+
+    // 3. In HistoryStore: stored user message must be clean user text (no raw markdown flooding chat bubble)
+    const { activeSession } = await historyStore.loadReviewerSessions();
+    assert.strictEqual(activeSession.messages.length, 4, 'Session must now have 4 messages');
+    const storedFollowUp = activeSession.messages[2];
+    assert.strictEqual(storedFollowUp.role, 'user');
+    assert.strictEqual(storedFollowUp.content, 'review this new one', 'Stored content must remain clean user note');
+    assert.strictEqual(storedFollowUp.content.includes(updatedPlanMarkdown), false, 'Raw plan must not be in stored message content');
+    assert.ok(storedFollowUp.attachedFile, 'Stored message must retain attachedFile metadata');
+    assert.strictEqual(storedFollowUp.attachedFile?.name, 'Plan docs');
+    assert.strictEqual(storedFollowUp.attachedFile?.content, updatedPlanMarkdown, 'Stored attachedFile must retain content');
+
+    // 4. In outgoing messages sent to model: user turn must be augmented with attached document context
+    const outgoingUserMsgs = capturedOutgoingMessages.filter((m) => m.role === 'user');
+    const lastOutgoingUserMsg = outgoingUserMsgs[outgoingUserMsgs.length - 1];
+    assert.ok(lastOutgoingUserMsg, 'Must have outgoing user message');
+    assert.ok(lastOutgoingUserMsg.content.includes('review this new one'), 'Outgoing user turn must include user text');
+    assert.ok(lastOutgoingUserMsg.content.includes(updatedPlanMarkdown), 'Outgoing user turn must include updated plan document');
+    assert.ok(
+      lastOutgoingUserMsg.content.includes('# Attached Document Under Review (Plan docs):'),
+      'Outgoing user turn must include structured attachment header'
+    );
+
+    // 5. System prompt must also retain effective system context
+    const systemMsg = capturedOutgoingMessages.find((m) => m.role === 'system');
+    assert.ok(systemMsg);
+    assert.ok(systemMsg.content.includes(updatedPlanMarkdown));
+  } finally {
+    OpenRouterClient.sendChatCompletionStream = originalSendChatCompletionStream;
+  }
+});
+
 
 
 

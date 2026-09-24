@@ -455,3 +455,103 @@ test('ScopedRestore: deletes newly created files that did not exist in the check
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('UNDO_TURN: successfully undoes a turn when stream was stopped mid-flight (0 subsequent messages in history)', async () => {
+  const memoryFiles: Map<string, Uint8Array> = new Map();
+  (vscode.workspace.fs as any).readFile = async (uri: any) => {
+    const key = uri.fsPath || uri.path;
+    if (memoryFiles.has(key)) return memoryFiles.get(key);
+    throw new Error('File not found');
+  };
+  (vscode.workspace.fs as any).writeFile = async (uri: any, content: Uint8Array) => {
+    const key = uri.fsPath || uri.path;
+    memoryFiles.set(key, content);
+  };
+  (vscode.workspace.fs as any).createDirectory = async () => {};
+
+  const storageUri = vscode.Uri.file('C:/mock/storage-undo-zero-subsequent');
+  const historyStore = new HistoryStore(storageUri as any);
+  await historyStore.loadSessions();
+
+  // Turn was submitted by user, but aborted/stopped before assistant replied:
+  await historyStore.appendMessage({
+    id: 'msg-u-stopped',
+    role: 'user',
+    content: 'User prompt that got stopped mid flight',
+    timestamp: 2000,
+    checkpointId: 'cp-stopped',
+    affectedFiles: ['src/stopped.ts'],
+  });
+
+  let history = await historyStore.loadHistory();
+  assert.strictEqual(history.length, 1);
+
+  let onMessageListener: ((data: WebviewToHostMessage) => Promise<void>) | undefined;
+  const postedMessages: HostToWebviewMessage[] = [];
+
+  const mockWebview: any = {
+    options: {},
+    html: '',
+    asWebviewUri: (uri: any) => uri,
+    cspSource: 'mock-csp',
+    onDidReceiveMessage: (listener: any) => {
+      onMessageListener = listener;
+    },
+    postMessage: (msg: any) => {
+      postedMessages.push(msg);
+    },
+  };
+
+  const dummySecretStore: any = { getApiKey: async () => 'key' };
+  const dummyPermissionManager: any = {};
+  const dummyUsageStore: any = {};
+  const extensionUri = vscode.Uri.file('C:/mock/extension');
+
+  const provider = new OpenRouterPanelProvider(
+    extensionUri as any,
+    dummySecretStore,
+    historyStore,
+    dummyPermissionManager,
+    dummyUsageStore,
+    storageUri as any
+  );
+
+  provider.resolveWebviewView({ webview: mockWebview } as any, {} as any, {} as any);
+
+  let restoredFiles: string[] = [];
+  (provider as any)._scopedRestore = {
+    restore: async (_checkpointId: string, files: string[]) => {
+      restoredFiles = files;
+      return { success: true };
+    },
+  };
+  (provider as any)._checkpointManager = {
+    createCheckpoint: async () => 'cp-mock',
+  };
+  (provider as any)._shadowRepo = {
+    runGit: async () => ({ stdout: '', stderr: '' }),
+  };
+
+  (vscode.window as any).showWarningMessage = async (msg: string) => {
+    assert.ok(msg.includes('This will undo this change and remove'));
+    return 'Continue';
+  };
+
+  await onMessageListener!({
+    type: 'UNDO_TURN',
+    messageId: 'msg-u-stopped',
+    checkpointId: '',
+    affectedFiles: [],
+  });
+
+  const undoResult = postedMessages.find((m) => m.type === 'UNDO_RESULT');
+  assert.ok(undoResult, 'UNDO_RESULT must be posted');
+  assert.strictEqual(undoResult.success, true);
+  assert.strictEqual(undoResult.truncatedAfterId, 'msg-u-stopped');
+  assert.deepStrictEqual(restoredFiles, ['src/stopped.ts'], 'Target message affectedFiles resolved from historyStore');
+
+  // HistoryStore must now be completely empty
+  history = await historyStore.loadHistory();
+  assert.strictEqual(history.length, 0, 'Target message removed from historyStore so model context is completely wiped');
+});
+

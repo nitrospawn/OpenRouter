@@ -1,7 +1,7 @@
 # PRD: OpenRouter — Product Requirements Document (PRD)
 
 **Status:** Living Specification  
-**Version:** 0.2.0  
+**Version:** 0.4.0  
 **Name:** OpenRouter
 
 ## 1. Overview
@@ -41,7 +41,7 @@
 - Layout top to bottom:
   1. **Header bar** — model selector dropdown (searchable), reasoning-effort dropdown (conditionally visible, positioned strictly between model selector and "+" new chat button; order: model selector → reasoning-effort dropdown → "+" button → gear icon), capability icon badges (image icon / mic icon) shown live for the selected model, settings gear.
   2. **Conversation thread** — messages, streamed responses, inline diff previews for proposed code edits with an "Apply edit" action, collapsible tool-call logs, and inline system notes (e.g. capability-loss notices on model switch, per §3.3).
-  3. **Input bar** — text box; undo icon, image-upload icon, and mic icon appear/disappear based on selected model's `input_modalities`; send button; a small token-cost estimate for the draft prompt (optional, nice-to-have).
+  3. **Input bar** — text box; undo icon, image-upload icon, and mic icon appear/disappear based on selected model's `input_modalities`; send button; dynamic pre-flight token estimate indicator showing calculated tokens for the prompt text plus all staged file attachments, document chips, and images (per §3.4.1).
   4. **Footer strip** — context-used meter (e.g. "34% of context used") plus running session token count + cost.
 
 **Reasoning Effort Selector (Header Control):**
@@ -102,10 +102,25 @@ Beyond model switching, a single long-running conversation with one model also n
 - **Pinned context (never summarized):** to prevent summarization from silently dropping hard constraints (e.g. "don't touch the auth module"), the extension supports a separate pinned-context tier that is always sent to the model in full, regardless of summarization state:
   - **Manual pinning** — a pin icon on any message in the thread (alongside the undo icon, §3.2) lets the user mark that message as pinned. Pinned messages are excluded from the rolling summarization pool entirely.
   - **Project-level system instructions** are always treated as pinned by default — they're never eligible for summarization.
-  - Pinned content is expected to stay small by design (a few sentences of hard constraints, not whole files) — the mechanism relies on the user curating what's worth protecting rather than the AI guessing at importance, which avoids both under- and over-inclusion failure modes.
+- Pinned content is expected to stay small by design (a few sentences of hard constraints, not whole files) — the mechanism relies on the user curating what's worth protecting rather than the AI guessing at importance, which avoids both under- and over-inclusion failure modes.
   - **Token meter reflects the split:** the context meter (footer strip, §3.2) shows pinned vs. active context separately (e.g. "12% pinned, 34% active context") so the fixed cost floor created by pinning stays visible.
   - **Soft warning on pinned growth:** if pinned content grows large enough to become its own cost concern (e.g. crosses ~15% of the active model's context window), a warning is shown suggesting the user unpin older items — so the safety net doesn't quietly turn into the same cost problem it was meant to avoid.
   - Auto-extracted pinning (the AI inferring what's important without being told) is explicitly out of scope for v1 — manual pinning only, to keep behavior predictable and cost bounded.
+
+#### 3.4.1 Attached File & Document Token Accounting
+Attached files (code files, workspace docs, Plan/Walkthrough artifacts, and image attachments) carry substantial token weight and must be accurately surfaced in both pre-flight input estimation and running context accounting:
+
+1. **Pre-Flight Input Bar Estimation (Staged Draft):**
+   - As the user types in the input bar or stages attachments (via `@` mention chips, file attachment buttons, or "Send to Reviewer" doc chips):
+     - **Text & Code Files:** Estimated as `Math.ceil(fileContent.length / 4)` tokens per attached file.
+     - **Artifact Documents:** Staged Plan docs or Walkthrough/Results docs compute tokens based on their full serialized markdown payload.
+     - **Image / Multimodal Attachments:** For vision-capable models, vision token calculations are factored in based on standard tile budgeting (e.g., base ~85 tokens + ~170 tokens per 512×512 tile).
+     - **Combined Pre-Flight Total:** The staged prompt estimate combines `userTypedText` tokens + `sum(attachedFileTokens)` + `imageTokens`.
+2. **Pre-Flight Footer Meter Projection:**
+   - When attachments are staged in the input bar, the footer context meter dynamically indicates the projected impact (e.g., `(Projected: +3,450 tokens)` or visual projected fill percentage) prior to sending, alerting users before they exceed the model's token limits.
+3. **Session History Synchronization:**
+   - When switching or loading sessions (`HISTORY_LOADED`), token meter fallback calculations must not only sum `m.content` characters, but also include all attached file payloads (`m.attachments[].content`, `m.attachedFile.content`, `m.planDocument`, `m.walkthroughDocument`).
+   - This ensures that reloading past sessions containing file attachments accurately initializes the token meter to true consumed context.
 
 ### 3.5 Usage Report View
 - Separate full view (`#view-usage`) within the webview container, navigated to via Settings or direct commands, featuring a pinned header strip (`.settings-header-strip`) with back navigation (`‹ Settings`), view title ("Usage Report"), and a dynamic export button (`📥 Export CSV (N)`).
@@ -128,7 +143,7 @@ Beyond model switching, a single long-running conversation with one model also n
   - The Export CSV button dynamically indicates the full filtered count (e.g. `📥 Export CSV (42)`), exporting all matching records across the full dataset regardless of visible table pagination limit.
 - **Pinned Header & Scroll Architecture:**
   - A fixed header strip (`.settings-header-strip`) keeps navigation and export actions permanently accessible while the audit table scrolls independently inside `#usage-scroll-body`. Navigating between views automatically resets scroll position (`scrollTop = 0`).
-- **Clear history — single entry point, staged flow:** Settings has one "Clear history" button, not two separate ones. Clicking it opens a **category selection step first** — "What would you like to clear? Chat history / Usage data" — rather than immediately confirming a deletion. Once the user picks one, a second, final confirmation step follows, scoped to that specific category (e.g. picking "Chat history" shows "This will permanently delete N chat conversations. This cannot be undone." with a "Yes, delete" button; picking "Usage data" shows the equivalent for M logged usage/cost records). Only the category the user explicitly selected is affected — the other remains untouched. This is a three-step flow overall: Clear history → choose category → confirm deletion.
+- **Clear history — single entry point, staged flow:** Located in the Settings "Usage data" row alongside `📊 View usage report` and `View logs` (which opens diagnostic logs in a dedicated editor tab), the "Clear history" button is positioned at the far right. Settings has one "Clear history" button, not two separate ones. Clicking it opens a **category selection step first** — "What would you like to clear? Chat history / Usage data" — rather than immediately confirming a deletion. Once the user picks one, a second, final confirmation step follows, scoped to that specific category (e.g. picking "Chat history" shows "This will permanently delete N chat conversations. This cannot be undone." with a "Yes, delete" button; picking "Usage data" shows the equivalent for M logged usage/cost records). Only the category the user explicitly selected is affected — the other remains untouched. This is a three-step flow overall: Clear history → choose category → confirm deletion.
 
 ---
 
@@ -237,9 +252,66 @@ The extension maintains its **own private git repository**, entirely separate fr
 - **Pinned Header Strip:** A fixed header strip (`.settings-header-strip`) keeps the `‹ Back` navigation button and "Settings" title permanently pinned at the top, while configuration options scroll smoothly inside `#settings-scroll-body`. Scroll position is automatically reset (`scrollTop = 0`) on view transitions.
 - **Permission States:** Interactive toggles and selectors for file read, code edit auto-apply/ask/deny, terminal execution, and cross-file access (§4.1).
 - **Reviewer Model Configuration:** Workspace-scoped master toggle, side-by-side reviewer model and dynamic reasoning-effort selector, and customizable reviewer system prompt (§10).
+- **Usage Data & Diagnostic Logs Actions:** The "Usage data" section provides direct action buttons: `📊 View usage report`, `View logs` (opens the active diagnostic log file in a new VS Code editor tab via `openrouter.openDiagnosticLog`), and a danger-accented `Clear history` button positioned at the far right.
 - **History & Retention:** Staged "Clear history" flow with category selection (Chat history vs. Usage data) and scoped confirmation dialogs (§3.5).
 - **Privacy Policy Link:** Direct link in Settings pointing to OpenRouter's official privacy documentation at `https://openrouter.ai/privacy` (§7.3).
-- **Version Indicator:** Displays the current extension version (e.g. `OpenRouter v0.2.0`) pinned at the bottom of the Settings view, updated synchronously with `package.json` across version increments.
+- **Version Indicator:** Displays the current extension version (e.g. `OpenRouter v0.3.0`) pinned at the bottom of the Settings view, updated synchronously with `package.json` across version increments.
+
+### 5.5 Dynamic Environment & Shell Injection
+- **Runtime Environment Resolution:** When assembling system instructions for model completion turns, the extension queries the runtime environment via Node.js standard APIs (`process.platform`, `process.env.ComSpec`, `process.env.SHELL`) rather than static or hardcoded defaults.
+- **Platform & Shell Adaptation:**
+  - **Windows (`win32`):** Injects explicit operating system identity and default shell (`cmd.exe` or `powershell.exe`). Enforces Windows command syntax: forbids Unix-only utilities (`pwd`, `ls`, `cat`, `grep`, `export`, `rm -rf`, `touch`) and instructs use of Windows native equivalents (e.g. `cd` without arguments to print working directory, `dir` to list files, `type` to inspect files, Windows path conventions).
+  - **macOS / Linux (`darwin` / `linux`):** Injects POSIX/Unix environment identity and shell (`bash`, `zsh`), directing standard POSIX shell syntax.
+- **Dynamic Code Fence Language Tagging:** Shell commands in model responses are directed to use the appropriate language identifier for the detected shell (e.g. \`\`\`cmd, \`\`\`powershell, or \`\`\`bash), aligning with client-side block matchers.
+- **Recent Terminal Outputs Feedback:** Feeds recent terminal command executions (`terminalOutputs`) into the system prompt context, ensuring the model maintains visibility into real command exit codes and captured stdout/stderr.
+
+### 5.6 Terminal Command Self-Healing & Auto-Retry Loop (Bounded Recovery)
+- **Autonomous Error Recovery (`runTerminalCommand = 'allow'`):** When terminal commands auto-execute under Allow permission and return a non-zero exit status code (`result.executed && result.exitCode !== 0`), the extension initiates an automated self-healing retry turn. The failure details (command, non-zero exit code, truncated stderr/stdout) are packaged into a diagnosis prompt sent to the active model.
+- **Infinite Loop Safeguards & Circuit Breakers:**
+  1. **Hard Retry Limit (`MAX_TERMINAL_RETRIES = 2`):** A strict attempt cap limits self-healing turns to at most 2 retries per command chain. If the second retry still fails, execution halts unconditionally with an explanatory warning posted to chat: `⚠️ Terminal auto-retry limit reached (2/2 attempts). Halting self-healing loop.`
+  2. **Duplicate Failing Command Suppression:** The extension maintains a set of failed commands for the active turn. If the model suggests the identical failing command that previously failed, the retry terminates immediately: `⚠️ Model proposed identical failing command '<cmd>'. Halting self-healing retry to prevent infinite execution.`
+  3. **User Abort & Cancellation Propagation:** If the user clicks the "Stop" button or triggers a session abort controller, all active execution and pending self-healing retries terminate instantly.
+  4. **Non-Cascading Command Execution:** If a command in a multi-command response block fails, subsequent commands in that block are halted immediately to prevent running downstream commands that rely on the failed predecessor.
+  5. **Transparent Chat Audit Trail:** Each retry attempt logs a visible notice in the chat thread (e.g. `🔄 Terminal command '<cmd>' failed with exit code 1. Initiating self-healing retry (1/2)...`) so the user maintains complete real-time visibility into the autonomous recovery cycle.
+
+### 5.7 Two-Tier Terminal Command Architecture & Screen Clutter Reduction
+- **Problem Solved:** When a model inspects the codebase using inspection commands (`type`, `dir`, `cat`, `ls`, `grep`), rendering full "Terminal Command" cards and raw stdout chat messages generated excessive visual noise.
+- **Tier 1 — Read-Only / Inspection Commands:**
+  - **Classified Commands:** `type`, `dir`, `cat`, `ls`, `grep`, `find`, `findstr`, `pwd`, `echo`, `head`, `tail`, `wc`, `which`, `where`, `Get-Content`, `Get-ChildItem`, `Select-String`, and git inspection (`git status`, `git diff`, `git log`).
+  - **Silent Execution & Zero Clutter:** No `.terminal-card` is rendered in the chat UI, and no raw stdout message (`termMsg`) is appended to chat history. The chat remains clean and readable.
+  - **Live Screen Feedback:** While running, the progress bar and status indicator display live real-time feedback (e.g. `Reading file: index.ts...` or `Inspecting directory...`), which automatically disappears upon completion.
+  - **Full Context Pipe:** Outputs are captured in `TerminalOutputTracker` and fed to the model context for autonomous continuation and planning.
+  - **Zero Permission Friction:** Pure read-only commands do not prompt confirmation dialogs in either `"allow"` or `"ask"` permission modes (as long as `runTerminalCommand` is not `"deny"`).
+- **Tier 2 — Side-Effecting / Mutating Commands:**
+  - **Commands:** Package managers (`npm`, `yarn`, `pnpm`, `pip`), compiler/build scripts, git mutating commands (`commit`, `push`), file creations/deletions/writes (`rm`, `del`, `mkdir`).
+  - **Redirection & Chaining Safety:** Any command containing file redirection (`>` or `>>`) or PowerShell file-writing cmdlets (`Out-File`, `Set-Content`, `Add-Content`) is strictly promoted to Tier 2. Chained commands (`&&`, `;`, `|`) are treated as Tier 2 if any segment is mutating.
+  - **Full Visual Treatment:** Interactive `.terminal-card` cards render in chat with action buttons, status badges, and output details. Governed strictly by the "Terminal commands" permission toggle (`allow`, `ask`, `deny`).
+
+### 5.8 Resilient Targeted Edit (SEARCH/REPLACE) Parsing & Extraction
+- **Non-Truncating Action Block Extraction:** When parsing model responses, action blocks (`edit_file`, `create_file`, `file`) use a lookahead-aware regex (`/(?:```|````)(?:create_file|edit_file|file):([^\r\n]+)\r?\n((?:[\s\S]*?<<<< SEARCH[\s\S]*?\n>>>>[^\r\n]*|[\s\S]*?))\r?\n(?:```|````)/gi`) that matches through to the terminating `>>>>` marker before closing. Internal code blocks (such as code snippets inside Markdown files like `PRD.md` or accidental model wrapping) do not prematurely sever the edit block or spill the replacement hunk into the chat thread.
+- **Marker Tolerances & Git Conflict Disambiguation:** The parser tolerates trailing spaces, tabs, and optional marker annotations on `<<<< SEARCH`, `====`, and `>>>>` lines, while strictly distinguishing 4-character markers from 7-character Git merge conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`).
+- **Spurious Code Fence Auto-Unwrapping:** If the model wraps replacement content in conversational code fences (e.g. ```` ```text\n...\n``` ````) where the search block contains no code fences, the parser automatically unwraps the extraneous backticks so raw content is applied cleanly to disk.
+- **Trailing Whitespace Fallback (`trimEnd`):** Line endings are normalized to LF (`\n`). If strict exact matching fails solely due to trailing whitespace discrepancies on lines between the prompt context and on-disk buffer, a line-by-line `trimEnd()` fallback locates the matching hunk and reconstructs the file without dropping boundary newlines.
+- **Prompt-Level Invariant:** The system prompt explicitly instructs models that internal backtick fences and markdown language tags are strictly forbidden inside `SEARCH` and `REPLACE` blocks.
+
+### 5.9 Autonomous Plan Continuity & Non-Blocking Execution Engine
+- **Non-Blocking File Modifications During Plan Execution (`applyEdit: 'ask'`):**
+  - **Philosophy:** Aligns with modern AI coding platforms (Cursor, Windsurf, Copilot Edits). When an implementation plan has been approved by the user, the agent completes all planned modifications continuously without pausing between individual files to ask for approval.
+  - **Rollback / Keep-or-Revert Architecture:** Rather than blocking execution, each file edit is automatically staged into a unified shadow-git checkpoint before disk write. The webview diff cards update to `✓ Applied` and provide interactive diff inspection and full per-turn Undo capabilities. The user retains complete review and revert control without the agent grinding to a halt mid-plan.
+  - **Deny Permission Invariant:** If `applyEdit` is explicitly toggled to `'deny'`, file edits are strictly prevented from auto-applying and surface a clear rejection audit message.
+  - **Isolated Single-Turn Fallback:** When code edits are proposed in isolation outside an active plan and outside autonomous execution, `applyEdit: 'ask'` maintains standard confirmation behavior.
+- **Broadened Approval & Execution Intent Recognition:**
+  - **Natural Language Command Tolerance:** In `panelProvider.ts`, `isExecutionIntent` matches all natural user approval commands, including `"proceed"`, `"continue"`, `"please continue"`, `"start"`, `"do it"`, `"carry on"`, `"approved"`, `"go ahead"`, `"apply the plan"`, `"yes"`, and `"ok"`.
+  - **Plan-Aware Intent Resolution:** If an uncompleted implementation plan exists in the conversation history, any short affirmative user response (e.g. `"yes"`, `"sure"`, `"next"`, `"continue"`) is automatically promoted to execution intent, initializing the autonomous retry/continuation context.
+- **OpenRouter Token Limit Cutoff Auto-Resumption (`finish_reason: 'length'`):**
+  - **SSE Chunk Parsing:** The streaming parser in `openrouterClient.ts` captures `finish_reason` directly from `choices[0].finish_reason` in Server-Sent Events.
+  - **Automated Resume Turn:** When `finish_reason === 'length'` occurs during plan execution, the extension detects that the model was cut off mid-response by `max_tokens`. It applies any complete code blocks already parsed, and automatically triggers a seamless continuation turn prompting the model to resume directly from the exact point where it was cut off.
+- **Auto-Continuation on Manual Bulk Acceptance (`ACCEPT_ALL_EDITS`):**
+  - When a user manually accepts a batch of edits via `ACCEPT_ALL_EDITS`, the host checks whether an active plan is underway. If more tasks remain (no `walkthrough` emitted), it automatically schedules a continuation turn to implement the next step without requiring a manual user nudge.
+- **State Tracking, Plan Checklist Reconciliation & Premature Completion Guard:**
+  - **Structured Plan Checklists:** System instructions require all plans to format tasks with structured checklist items (`- [ ] [task_name] path/to/file`).
+  - **Execution Checklist Reconciliation:** In multi-step continuation turns, the model is instructed to maintain checklist awareness, check off completed tasks (`- [x]`), and verify that all planned file modifications have been executed before declaring completion.
+  - **Premature Walkthrough Prohibition:** Models are strictly forbidden from emitting the ````walkthrough```` block while any checklist items or planned file modifications remain unexecuted.
 
 ---
 
@@ -307,7 +379,8 @@ openrouter-copilot/
 │   │   └── contextMeter.ts         # Computes % context used, % pinned, for the footer strip
 │   │
 │   ├── terminal/
-│   │   └── commandRunner.ts        # Confirmation flow + execution + audit logging (§4.3/§5.3)
+│   │   ├── commandRunner.ts        # Child-process execution + output channel streaming + timeout safety (§14)
+│   │   └── terminalOutputTracker.ts # Exit status tracking, secret sanitization & prompt context injection (§14)
 │   │
 │   ├── usage/
 │   │   ├── usageStore.ts           # SQLite (sql.js) local store — chat calls, summarization
@@ -380,7 +453,7 @@ openrouter-copilot/
   - Positioned directly above the input bar, stacked above the existing Context preview strip (`Input box` → `Context bar` → `Pending Edits bar` → `Message thread`).
   - Only renders when there is at least one unresolved (not yet applied or rejected) AI-proposed edit; collapses when 0 pending.
   - Each pending edit shows as a compact row: file name, "Preview Diff", Apply, Reject. Resolving one does not lock others.
-  - When there are 3 or more pending edits ($\ge 3$), displays "Apply All" and "Reject All" bulk action buttons.
+  - When there are 2 or more pending edits ($\ge 2$), displays "Apply All" and "Reject All" bulk action buttons.
   - **Undo Scoping Invariant:** When "Apply All" applies edits across multiple files in one action, shadow-git checkpoints are treated as one single atomic undoable unit. Triggering undo reverts all files affected by that single click together (`git checkout <checkpointId> -- <file1> <file2> ...`), satisfying §4.3.
 - Terminal command confirmation flow + destructive-command flagging + suggested reverse commands + one-click "Run in Terminal" action cards
 
@@ -498,7 +571,7 @@ To prevent conflicting instructions (e.g. attempting to produce an implementatio
   - **Trivial single-file edits:** typo fixes, simple renames, one-line bug fixes.
   - **Documentation and text file tasks:** creating or updating any `.md`, `.txt`, `.rst`, or similar non-executable file — READMEs, PRDs, changelogs, notes, specifications. These carry zero execution risk and no workspace side effects. The Implementation Plan → Proceed → Walkthrough lifecycle must never trigger for these tasks regardless of how the request is phrased (e.g. "generate a PRD", "write specs", "draft a README").
   - **Explicit single-file creation:** any task where the user has specified both *what* to write and *where*, leaving nothing ambiguous to resolve before acting.
-- **Planning trigger threshold:** The plan → proceed → walkthrough lifecycle activates only when a task modifies **3 or more interrelated code files**, or involves breaking architectural changes, schema migrations, or package replacements. This threshold is fixed — individual models routed through the extension must not drift below it based on keyword matching (e.g. "PRD", "specifications", "architecture") without meeting the file-count or destructiveness criteria.
+- **Planning trigger threshold:** The plan → proceed → walkthrough lifecycle activates only when a task modifies **2 or more interrelated code files**, or involves breaking architectural changes, schema migrations, or package replacements. This threshold is fixed — individual models routed through the extension must not drift below it based on keyword matching (e.g. "PRD", "specifications", "architecture") without meeting the file-count or destructiveness criteria.
 
 ### 9.4 Directive 3: Search-Before-Read Code Navigation
 - Instructs the assistant to favor targeted search/grep queries to locate functions and symbols rather than reading entire files sequentially line-by-line. This significantly improves performance and token efficiency on cheaper models.
@@ -583,13 +656,13 @@ This phase directly builds upon two foundational prerequisites:
 ### 11.3 The Reviewer Panel
 - **Layout & Structure:**
   - **Header Strip:** Features a `‹ Main Chat` back navigation button, view title ("Review Implementation Plan" or "Review Walkthrough"), and a pill badge displaying the active reviewer model and reasoning effort.
-  - **Collapsible Artifact Section:** Displays the original artifact document in a scrollable reference preview. Includes an "Open in Editor Tab" button to open the real artifact Markdown document directly in a native VS Code editor tab for line-specific inspection.
+  - **In-Chat File & Artifact Reference Cards (Replacing Top Preview):** Rather than pinning a bulky preview section (`#reviewer-artifact-section`) at the top of the conversation view which consumed excessive vertical space, the document under review is embedded directly into the user message turn as an interactive reference card (`.reviewer-file-ref-card`). The card displays the file/artifact name, type badge (`Plan`, `Walkthrough`, or `File`), and an `Open in Tab ↗` action that immediately opens the document in an active VS Code editor tab.
   - **Reviewer Conversation Stream:** Dedicated back-and-forth chat conversation thread between the user and the reviewer model. Users can ask clarifying questions, challenge critiques, request deeper security analysis, or explore alternatives.
     - **Header Clarify Affordance:** Assistant messages in the Reviewer stream include a `Clarify` button next to `Copy` to quote the full reviewer response directly into the Reviewer's input bar as a chip.
     - **Reviewer Aspect Quoting & Sequential Numbering:** Users can highlight specific critique sentences and click `💬 Clarify Selection` on the selection toolbar to discuss that specific point without cluttering the input textarea. Chips are numbered sequentially (`Quote 1: ...`, `Quote 2: ...`) with dynamic re-indexing upon removal.
     - **Smart Fallback Precedence:** When a quote is attached in the Reviewer input bar and sent without typed text, the smart fallback query (`Can you clarify this?`) takes precedence over the default artifact review prompt (`Please review these Plan docs.`).
     - **Session Switching Cleanup:** Switching between review sessions, creating a new review session, or clicking reset context automatically cleanses any unsent quote chips in the Reviewer input bar.
-  - **Input Bar:** Compact prompt input with an attachment preview bar (`#reviewer-attachment-preview-bar`), Send, and Stop streaming controls dedicated strictly to the reviewer model.
+  - **Input Bar:** Compact prompt input with an attachment preview bar (`#reviewer-attachment-preview-bar`), Send, and Stop streaming controls dedicated strictly to the reviewer model. Users can attach workspace files or revised plan documents for subsequent review turns.
 - **Native Comments API Integration (`vscode.comments.createCommentController`):**
   - Integrates VS Code's native Comments API (`openrouter-reviewer`, label: "OpenRouter Reviewer Comments").
   - Comment threads bind directly to the real `file://` URI generated by `ArtifactDocumentManager.prepareArtifactFile()`.
@@ -751,3 +824,583 @@ This phase directly builds upon two foundational prerequisites:
 - **Smart Conditional Visibility:**
   - Reasoning Effort dropdown renders inline beside the combobox only when the selected model supports reasoning (`supportsReasoningEffort`).
   - For standard models, the reasoning effort dropdown collapses completely, and the model selector expands to 100% width.
+
+---
+
+## Phase 13 — Planning Artifact Lifecycle, Reviewer Integration & File Automation UX
+
+**Goal:** Establish end-to-end reliability for implementation plans and verification walkthroughs across all planning phrasings (including generic "plan only"), guarantee immediate disk persistence of reasoning artifacts, make the Review action unconditionally active on all artifact cards with graceful model fallbacks, and deliver seamless in-editor file handling through auto-saving, auto-opening of newly created files, and interactive clickable file paths.
+
+### 13.1 Generic Plan Request Handling & Multi-Tier Code Fence Aliases
+- **Universal Trigger for Planning Requests:**
+  - The assistant responds to ANY user phrasing requesting a plan (including `"plan"`, `"plan only"`, `"make a plan"`, `"plan this"`, `"create a plan"`, `"implementation plan"`, or `"plan out..."`) by always outputting a standalone plan document inside an artifact code fence.
+  - Eliminated the restriction that suppressed plan blocks on fewer than 3 files when the user explicitly requested planning.
+- **Code Fence Tag Aliases (`findTopLevelFence`):**
+  - Broadened regex matching to accept:
+    - Plans: ````plan````, ````implementation_plan````, ````implementation-plan````, ````implementationplan````, ````plan_document````, ````plan_docs````.
+    - Walkthroughs: ````walkthrough````, ````results````, ````result````, ````result_walkthrough````, ````verification_walkthrough````, ````walkthrough_document````.
+- **Resilient Fallback for Unfenced Model Responses:**
+  - If a model (particularly lower-tier or open-weights models) outputs a plan without markdown code fences, `extractArtifacts` detects top-level markdown headings (`# Implementation Plan`, `# Plan`, `## Implementation Plan`), extracts the plan document with byte-for-byte fidelity, and injects the `📄 Plan docs ready — [view]` notice card into the chat summary.
+  - The same resilient fallback applies for walkthrough documents (`# Walkthrough`, `# Verification & Walkthrough`, `# Results`).
+
+### 13.2 Conversational Confirmation & Steerability Directives
+- **Model Confirmation Prompting:**
+  - Outside the ````plan```` block, the assistant outputs a 1–2 sentence conversational summary explicitly asking whether the user would like to proceed with the proposed plan, review it, or make adjustments first (e.g. *"I have prepared an implementation plan for creating the notepad app. Would you like me to proceed with this plan, or would you like to review or make adjustments first?"*).
+  - When analyzing new complex requests, the model can also ask if a plan should be created first or if it should proceed directly.
+
+### 13.3 Immediate Artifact Disk Persistence
+- **Proactive Document Generation:**
+  - In `panelProvider.ts` upon message completion stream finish (`onDone`), `ArtifactDocumentManager.prepareArtifactFile` is immediately executed for any extracted `planDocument` or `walkthroughDocument`.
+  - Guarantees the markdown artifact file (`implementation_plan_<id>.md` or `walkthrough_<id>.md`) is immediately created and saved in the extension's workspace storage directory (`storageUri/artifacts/`) without requiring the user to click "View" or "Review" first.
+
+### 13.4 Unconditionally Active Review Button & Active Model Fallback
+- **Universal Review Action on Artifact Cards:**
+  - The **Review** button (`.chat-artifact-review-btn`) is unconditionally active and visible on all artifact cards:
+    - On **Plan docs** cards: View, Proceed, Review buttons are all available.
+    - On **Results docs** / Walkthrough cards: View, Review buttons are both available.
+  - Removed the `if (isReviewerEnabled)` UI gate that previously hid the button when workspace reviewer setting was false.
+- **Reviewer Model Fallback:**
+  - Clicking "Review" when no specific Reviewer Model has been configured in workspace settings automatically falls back to `Configuration.getLastModel()` (the currently selected chat model) or the first available model, allowing reviews to start immediately without presenting an error toast or blocking workflow.
+
+### 13.5 File Creation Auto-Open, Auto-Save & Interactive Navigation
+- **Automatic Document Saving (`applyEdit`):**
+  - Applying an edit or new file immediately executes `await doc.save()`, eliminating unsaved/dirty buffer states and keeping files in sync with disk.
+- **Auto-Open Newly Created Files:**
+  - Newly created files via `create_file` automatically open in an editor tab with `{ preview: true, preserveFocus: true }`. Developers immediately see the new file's content, location, and syntax highlighting without losing keyboard focus in the chat input.
+- **Single Edit Focus:**
+  - When manually applying a single edit via the "Apply" button on a proposed edit card, the file is opened/brought into view with `{ preview: true, preserveFocus: true }`.
+  - Batch edits (`Apply All` or multi-file auto-execution) suppress bulk tab opening to prevent tab explosion while ensuring all files are saved to disk.
+- **Interactive Clickable File Paths in Chat UI:**
+  - Proposed file paths in the diff card headers and pending edit rows are clickable (`OPEN_FILE`), enabling one-click opening of any referenced file at any time.
+
+---
+
+## Phase 14 — Reliable Child-Process Terminal Execution, Output Capture & Exit Status Feedback
+
+**Goal:** Replace the fire-and-forget, shell-integration-dependent terminal execution mechanism with a dedicated Node.js `child_process.spawn` execution engine. This guarantees immediate and reliable capture of stdout, stderr, process exit codes (status), timeout safety, and real-time output channel streaming, while delivering live execution feedback, completion badges, and expandable output viewers in the webview chat interface and subsequent model prompt context.
+
+### 14.1 Problem Statement & Architectural Motivation
+- **Fire-and-Forget Limitation:** Previously, commands routed through VS Code's integrated terminal shell integration (`terminal.shellIntegration.executeCommand`) or `terminal.sendText()`. On newly created terminals, `shellIntegration` was almost always `undefined`, forcing an immediate fallback to `terminal.sendText()`.
+- **Zero API Status Capture:** `terminal.sendText()` simply injects keystrokes into the pty without any API in VS Code to capture stdout, stderr, or process exit codes.
+- **Immediate Return with Incomplete Status:** `executeCommand` returned synchronously within 1ms as `executed: true` before the command even started running, causing auto-run and UI buttons to falsely claim completion before any output existed.
+- **Context Blindness:** The model could not determine whether a build, lint, or test command actually succeeded or failed with an error, preventing true autonomous verification loops.
+
+### 14.2 Child Process Execution Engine (`CommandRunner`)
+- **Direct Child Process Spawning:** Commands execute directly via Node's `child_process.spawn(command, { cwd, shell: true, windowsHide: true, env: process.env })`.
+  - Supports Windows (PowerShell/cmd), macOS, and Linux seamlessly.
+  - Automatically verifies cwd existence on disk, falling back to `process.cwd()` to prevent `ENOENT` spawn crashes when workspace paths are unmounted or mocked.
+- **Live Output Streaming (`vscode.OutputChannel`):**
+  - Live stdout and stderr chunks stream in real time to a dedicated `OpenRouter: Terminal` output channel.
+  - Developers can open the Output panel in VS Code to watch live builds, installations, and test execution as they run.
+- **Timeout Safety & Process-Tree Termination:**
+  - Configurable 60-second default execution timeout prevents forgotten or hanging processes from running indefinitely.
+  - On timeout or abort, cleanly terminates the entire process tree using `taskkill /pid <PID> /T /F` on Windows or `SIGKILL` on Unix to eliminate orphaned background zombie processes.
+- **Memory Buffer Protection:** Stdout and stderr memory accumulation is capped at 512 KB to avoid memory leaks on excessively verbose commands.
+- **Interactive Terminal Fallback:** Preserves an optional fallback flag (`interactiveInTerminal: true`) and UI button (`Integrated Terminal`) for commands that inherently require user stdin interaction (e.g. interactive setup wizards, pagers, or dev servers).
+
+### 14.3 Output & Exit Status Tracking (`TerminalOutputTracker`)
+- **Structured Result Recording (`recordExecutionResult`):**
+  - Records completed executions with `command`, `cwd`, `exitCode: number | null`, `status: 'success' | 'failed' | 'timed_out'`, and sanitized output.
+  - Secret redaction (`SecretScanner.redact`) is applied to the combined raw stdout/stderr before storage or context injection.
+- **Prompt Context Status Injection:**
+  - In `getRecentOutputsFormatted()`, recent terminal executions injected into the assistant's context are explicitly formatted with exit status headers:
+    ```
+    [Command executed at 2026-09-19T22:00:00.000Z]
+    $ npm test
+    [Exit code: 0 (Success)]
+    <output>
+    ```
+    or `[Exit code: 1 (Failed)]` / `[Timed out (Process killed after 60s)]`.
+  - The model immediately knows whether its proposed commands succeeded or failed, enabling true autonomous verification loops.
+
+### 14.4 Webview UI Feedback & Terminal Result Cards
+- **Dual-Action Terminal Cards:**
+  - Primary button: `▶ Run Command` (executes via child process, captures output and status).
+  - Secondary button: `Integrated Terminal` (launches in standard interactive VS Code terminal).
+- **Live Execution Feedback:**
+  - Clicking `▶ Run Command` disables the button and displays a live `⏳ Running...` state.
+  - Host broadcasts `TERMINAL_RUNNING` and `TERMINAL_RESULT` messages across the webview protocol.
+- **Status Badges & Expandable Output Accordion:**
+  - Upon completion, the card updates with a distinct status badge:
+    - `✓ Completed (Exit Code: 0)` in green.
+    - `✗ Failed (Exit Code: N)` in red.
+    - `⏰ Timed out after 60s (Process killed)` in warning amber.
+    - `⚠️ Cancelled by user` if blocked by permission.
+  - A collapsible `<details>` section displays the captured, sanitized output (`View Output (N chars)`) in a styled monospace box.
+  - Allows re-running via `↻ Re-run`.
+- **Auto-Execution Chat Summaries:**
+  - When `runTerminalCommand === 'allow'`, auto-executed commands post an enriched summary message into chat with the exact exit code and a formatted code snippet of the stdout/stderr output.
+
+---
+
+## Phase 15 — Reviewer In-Chat Workspace File Referencing & Multi-Turn System Prompt Inheritance
+
+**Goal:** Eliminate bulky, pinned artifact preview UI from the top of the Reviewer view, embed all reviewed files and artifacts directly within conversation message turns as interactive, clickable cards that open in VS Code editor tabs, support reviewing additional workspace files or revised plans as distinct conversation turns, and strictly preserve the Reviewer Model System Prompt across all multi-turn review interactions.
+
+### 15.1 Elimination of Pinned Artifact Preview Section
+- **Problem Statement:** The pinned preview container (`#reviewer-artifact-section`) consumed significant vertical space at the top of the Reviewer view, displaying raw document text, collapse toggles, and duplicate buttons that constrained conversation thread readability.
+- **Resolution:**
+  - `#reviewer-artifact-section` is marked with `display: none !important;` in `style.css` and given the `.hidden` class in DOM templates.
+  - The Reviewer conversation thread expands to occupy 100% of the available panel height, delivering a clean, uncluttered chat layout.
+
+### 15.2 In-Chat Clickable File & Artifact Reference Cards
+- **Message Turn Card Embedding:**
+  - When a review starts or when a user attaches an artifact or workspace file, an interactive `.reviewer-file-ref-card` is rendered directly inside the message body of that turn.
+  - **Visual Elements:**
+    - Document SVG icon (`📄`).
+    - File/artifact name (e.g. `Plan docs`, `Results docs`, or `src/auth.ts`).
+    - Distinction badge (`Plan`, `Walkthrough`, or `File`).
+    - Interactive `Open in Tab ↗` action button (`.reviewer-file-ref-open-btn`).
+- **One-Click VS Code Tab Opening:**
+  - Clicking the card or the `Open in Tab` button dispatches `OPEN_FILE` across the webview protocol.
+  - The host handler in `panelProvider.ts` resolves `file://` URIs, absolute disk paths, and workspace-relative paths, opening the file directly via `vscode.workspace.openTextDocument()` and `vscode.window.showTextDocument()` with `preview: false` (permanent independent tab) and preserved focus.
+
+### 15.3 Multi-Turn File Reviews as Separate Turns
+- **Attaching Additional Files in Active Sessions:**
+  - Users can attach new files or revised plans into the Reviewer chat input via the document upload button, file drag-and-drop, or subsequent "Review with Reviewer" button clicks in the main chat.
+  - Files appear as preview chips in the Reviewer attachment bar (`#reviewer-attachment-preview-bar`).
+- **Discrete Turn Separation:**
+  - Submitting a message attaches the file reference to that specific turn.
+  - The user's typed prompt is displayed alongside the interactive reference card without dumping voluminous raw file content as text into the chat bubble.
+  - Each review turn operates as a separate evaluation milestone in the ongoing thread.
+
+### 15.4 Strict Reviewer System Prompt Inheritance Across Turns
+- **Architectural Guarantee:**
+  - Every review turn continues to inherit the workspace's configured Reviewer System Prompt (critique criteria, security audits, architecture logic, and edge-case requirements).
+  - When streaming completions (`_streamReviewerResponse`), the effective system prompt combines the base instructions with the active document under review:
+    ```
+    <Reviewer System Prompt>
+
+    # Document Under Review (<FileName>):
+    <File Content>
+    ```
+  - The conversation history (including previous reviewer critiques and user follow-ups) is passed alongside the current turn prompt, ensuring the reviewer maintains full conversational context while evaluating the newly submitted file against the comprehensive reviewer standard.
+
+---
+
+## Phase 16: Smart Autoscroll & Scroll-Fighting Elimination
+
+### 16.1 Context & Problem Definition
+When the Main Model or Reviewer is generating responses, incoming chunks and periodic re-renders update the chat DOM at high frequencies (up to 50+ times per second). Previously, each chunk unconditionally set `container.scrollTop = container.scrollHeight`. This caused severe "scroll fighting", snapping the scroll view to the bottom whenever the user attempted to scroll up to inspect previous answers, verify code snippets, or compare instructions during an active stream.
+
+### 16.2 Smart Scroll Controller Architecture
+- **Proximity & Intent Detection (`SmartScrollController`):**
+  - Uses a proximity threshold (60px) to determine whether the user is actively viewing the latest stream tokens (`scrollHeight - scrollTop - clientHeight <= 60`).
+  - Listens to `wheel` events (`deltaY < 0`) for instant recognition of upward intent before browser inertia finishes.
+  - Listens to `scroll` and `touchmove` events for continuous tracking.
+- **Selective Autoscroll:**
+  - `scrollToBottomIfAtBottom()`: Only applies `scrollTop = scrollHeight` if `userScrolledUp === false`. If the user has scrolled up, incoming chunks render in the DOM without altering the scroll offset, allowing uninterrupted reading.
+  - When the user scrolls back to within 60px of the bottom, autoscroll automatically re-engages for subsequent tokens.
+- **Forced Snapping on Intentional Actions:**
+  - `scrollToBottom(force = true)`: Resets `userScrolledUp = false` and jumps immediately to the bottom when the user submits a new prompt, switches chat sessions, or clicks the floating jump-to-bottom button.
+
+### 16.3 Floating Jump-to-Bottom Indicator
+- Both the Main Chat and Reviewer chat containers include a discreet, circular floating button (`.scroll-bottom-btn`).
+- The button smoothly appears when the user is scrolled away from the bottom during generation or history review.
+- Clicking the button instantly animates/scrolls the viewport to the latest message and re-engages autoscroll.
+- **Scoping & Positioning Invariant:** The floating button is placed strictly inside the messages feed container (`position: relative; flex: 1; min-height: 0;`), positioned `bottom: 12px; right: 16px;`. This guarantees that the button floats above the messages viewport without bleeding down into or overlapping the input box, attachments bar, or footer strip across both Main Chat and Reviewer views.
+
+---
+
+## Phase 17: Independent Editor Tab Management
+
+### 17.1 Context & Problem Definition
+In standard VS Code / Antigravity IDE behavior, files opened with `{ preview: true }` or single-clicked in the explorer open in "Preview Mode" (indicated by italic tab titles). When in Preview Mode, opening any subsequent file replaces the existing tab on screen instead of opening alongside it in a new tab.
+
+### 17.2 Extension Tab Invariants
+To guarantee that user work and AI operations never overwrite active editor tabs:
+- **Explicit `preview: false` Enforcement:**
+  - All host calls to `vscode.window.showTextDocument()` across the extension explicitly configure `{ preview: false }`:
+    - Newly created files after applied edits (`diffPreview.ts`).
+    - Open-in-tab actions from main chat or file cards (`panelProvider.ts`).
+    - Artifact document reviews such as Plans and Walkthroughs (`artifactDocumentManager.ts`).
+- **Workbench Setting Alignment:**
+  - Users seeking global single-click independent tab behavior across VS Code Explorer and Quick Open configure:
+    ```json
+    "workbench.editor.enablePreview": false,
+    "workbench.editor.enablePreviewFromQuickOpen": false
+    ```
+
+---
+
+## Phase 18: Prompt Fence Disambiguation & Robust EOF Append Resolution
+
+### 18.1 Context & Root Cause Analysis
+When users asked the AI to append comments or sections to documents (e.g. `please append a comment "thank you" to PRD.md`), two interacting failure modes caused the edit to fail with *"The AI's proposed edit no longer matches this file's current content"*:
+1. **Prompt Wrapper Collisions on Markdown Files:**
+   - Injected active file buffers and referenced workspace files were previously delimited using triple backticks (```` ```markdown\n<content>\n``` ````).
+   - The LLM mistook the system prompt's closing triple backticks as the actual final line of the document and emitted ````<<<< SEARCH\n```\n====\n```\n\nthank you\n>>>>````.
+   - Because the real target file on disk did not contain trailing triple backticks, the search match failed.
+2. **Accidental Inner Fence Enclosure:**
+   - LLMs frequently wrap search or replace blocks in accidental internal code fences (e.g. ````<<<< SEARCH\n```ts\n...\n```\n====\n```ts\n...\n```\n>>>>````).
+
+### 18.2 Architectural Resolutions
+- **XML Tag Boundary Isolation (`systemPrompt.ts`):**
+  - Active editor file contents and referenced workspace files are enclosed in structured XML boundary tags (`<file_content file="...">` ... `</file_content>`), completely eliminating closing triple backtick collisions at the end of injected files.
+  - Prompt instructions explicitly clarify that XML tags are prompt boundaries and show clear anchor patterns for appending to files.
+- **Accidental Search Block Fence Unwrapping (`diffPreview.ts`):**
+  - `resolveProposedContent` detects and unwraps outer code fence wrappers (`^```...\n([\s\S]*?)\n```$`) from `searchBlock` in addition to `replaceBlock`.
+- **EOF Append Fallback (`diffPreview.ts`):**
+  - If a model proposes `searchBlock.trim() === '```'` or ````'```markdown'```` on a file that does not contain triple backticks, the diff preview engine recognizes the EOF append intent, strips any accidental code fences from `replaceBlock`, and safely appends the addition to the end of the file.
+
+---
+
+## Phase 19: Response Execution Duration & Generation Latency Metrics
+
+### 19.1 Context & Problem Definition
+Developers interact with various LLMs (from lightweight instruction models to deep reasoning models like `o1`/`o3-mini`) with varying latency profiles. Previously, users had no visibility into how long a generation took once complete. To provide transparency and performance feedback, the extension displays the execution duration for every assistant response across both the Main Chat and Reviewer panels.
+
+### 19.2 Timing & Host-Side Measurement Architecture
+- **Host-Side Precision Timing:**
+  - Measurement begins immediately when the chat completion stream request is dispatched to OpenRouter (`streamStartTime` in Main Chat, `reviewerStartTime` in Reviewer).
+  - Measurement concludes when the stream finishes emitting tokens (`MESSAGE_STREAM_DONE` / `REVIEWER_STREAM_DONE`).
+  - Total elapsed duration is computed in milliseconds (`Date.now() - startTime`).
+- **Persistence Across Sessions & Reloads:**
+  - Stored on `StoredChatMessage.executionDurationMs` in `HistoryStore` (for main chat) and `_historyStore.appendReviewerMessage` (for reviewer history).
+  - Maintained across session switches (`SWITCH_SESSION`, `SWITCH_REVIEWER_SESSION`, `_loadChatHistory`, `OPEN_REVIEWER_VIEW`), guaranteeing that historical conversation turns retain their generation duration badges upon reload.
+
+### 19.3 Visual Presentation & Formatting Specifications
+- **Formatting Rules:**
+  - **Sub-Minute Durations (< 60s):** Formatted with **exactly one decimal place** (e.g. `0.5s`, `14.2s`, `59.9s`).
+  - **Minute-Scale Durations (≥ 60s):** Formatted in minutes and integer seconds (e.g. `1m 0s`, `1m 24s`, `2m 5s`).
+  - Rounding boundaries: Values rounding up to a minute boundary (e.g. `59.96s`) transition cleanly to `1m 0s`.
+  - Non-positive or missing durations: Gracefully omitted without rendering empty badges.
+- **UI Placement & Aesthetics:**
+  - **Location Invariant:** Rendered inside `.message-header-actions` directly **preceding** the Clarify button (`.msg-quote-btn`).
+  - Order in header actions: `[Duration Badge]` → `[Clarify Button]` → `[Copy Button]`.
+  - Styled with `.msg-duration-badge`:
+    - Monospace font (`var(--vscode-editor-font-family)`), muted color (`#8b949e`), 10px text, inline clock/stopwatch SVG icon, and hover opacity transition.
+    - Tooltip displays descriptive title: `Generation time: <formatted duration>`.
+  - Synchronized across both live streaming completion and historical message replay in both Main Chat and Reviewer panels.
+
+---
+
+## Phase 20: Large File Context Management & Non-Truncating Batch Processing
+
+### 20.1 Context & Problem Definition
+Previously, workspace files read by `contextReader.ts` were arbitrarily capped at a hardcoded 25,000 character limit. For large source files or specifications exceeding this cap, the tail was silently or crudely truncated with `[... truncated]`. Truncation prevented models from viewing critical EOF structures, schema declarations, or appending updates to the end of documents without error.
+
+### 20.2 Non-Truncating Batch Chunk Architecture (`chunkManager.ts`)
+- **Zero-Data-Loss Processing:**
+  - Eliminates blind 25k character truncation. Files are read completely from disk or active editor buffers.
+- **Syntactic Line-Preserving Chunking:**
+  - Files exceeding the configured or model-available context window are partitioned by `ChunkManager` into structured batches using natural line boundaries (`\n`) rather than slicing arbitrary byte/character offsets.
+- **Context Allocation & Token Headroom:**
+  - Calculates chunk sizes based on model context limits (with safe headroom for system prompts and conversational turns).
+  - Batches include structured chunk envelope headers:
+    ```markdown
+    [Chunk 1 of 3: lines 1-450 of 1200]
+    ```
+- **Context Injection & Prompt Grounding:**
+  - Integrates seamlessly with Phase 18 XML isolation tags (`<file_content file="...">`).
+  - Provides clear model directives allowing the LLM to inspect, reference, and target specific line ranges without context corruption.
+
+---
+
+## Phase 21: Multi-Turn Reviewer Artifact Context Injection & Attachment Turn Grounding
+
+### 21.1 Context & Problem Definition
+In the Dedicated Reviewer Panel (Phase 11), users frequently iterate on implementation plans and walkthrough verification documents across multiple conversational turns:
+1. Turn 1: Reviewer critiques the initial document and produces specific actionable items (e.g. key lifecycle, durability tests, autosave semantics).
+2. Follow-up Turn: The user addresses these items in the main chat, produces an updated document (`Plan docs` or `Results docs`), and attaches the new artifact to the active reviewer session with a prompt like `"review this new one"` or `"please review"`.
+
+Previously, attaching a revised document in a follow-up reviewer message only mutated the session's system-role context at index 0 (`role: 'system'`), while the conversational user message (`role: 'user'`) was dispatched with only the user's brief text note (e.g. `"review this new one"`). Because LLMs in multi-turn dialogues perceive system messages as static initial configuration set at session launch and inspect the latest user message for referenced entities, models routinely reported failure:
+> *"It looks like the new document didn't come through — I only see your request, not the updated plan. Please paste the revised implementation plan..."*
+
+### 21.2 Architectural Resolutions & Invariants
+
+- **Strict Separation Between UI Presentation and Model Payload:**
+  - **Chat Bubble Presentation Invariant:** In `HistoryStore` and the webview UI, the user message bubble maintains clean readability. `StoredChatMessage.content` preserves only the concise user note (e.g. `"review this new one"`), while attachment metadata (`name`, `uri`, `artifactType`, `content`) is stored inside `AttachedFileRef`. The visual badge card (`[📄 Plan docs] [PLAN] [Open in Tab]`) is rendered cleanly without flooding chat bubbles with raw markdown.
+  - **Outgoing Conversational Turn Grounding:** When `_streamReviewerResponse` in `panelProvider.ts` maps `this._reviewerHistory` to the API `messages` payload for `OpenRouterClient.sendChatCompletionStream`, any user turn containing an attached file or artifact is dynamically augmented:
+    ```markdown
+    ${m.content}
+
+    ---
+    # Attached Document Under Review (${docLabel}):
+    ${m.attachedFile.content}
+    ---
+    ```
+- **System-Role & Turn-Role Dual Context:**
+  - The system prompt continues to maintain `# Document Under Review` for baseline role grounding.
+  - The latest conversational turn contains the exact revised document alongside the user's critique instruction, enabling the LLM to directly compare previous critique points against the newly attached revision.
+- **Session Continuity & Persistence:**
+  - `AttachedFileRef` in `messages.ts` explicitly includes optional `content?: string`.
+  - Serialized within `HistoryStore.reviewerSessions`, guaranteeing that session switches (`SWITCH_REVIEWER_SESSION`) and retries (`RETRY_REVIEWER_MESSAGE`) retain document context across app restarts without requiring file re-reads from disk.
+
+---
+
+## Phase 22: Persistent Execution State, Process Tree Cancellation, & Workspace Analysis First
+
+### 22.1 Context & Problem Definition
+During multi-step implementation tasks, terminal executions, and file operations, users experienced several friction points:
+1. The Send/Stop button would prematurely flip back to Send during active terminal or file operations, making the extension appear frozen without visual cues.
+2. Clicking the Stop button failed to kill background child process trees, leaving orphaned processes running.
+3. Chat logs showed duplicate terminal output bubbles when commands executed automatically in `allow` mode.
+4. When given complex multi-file tasks or reviewer feedback, models prematurely refused to act, claiming *"the extension only injected file paths, not actual contents"*, rather than analyzing the codebase.
+
+### 22.2 Process Tree Cancellation via `AbortSignal`
+- **Full Process-Tree Cleanup:**
+  - `CommandRunner.executeCommand` accepts an optional `AbortSignal`.
+  - When the user cancels execution (by clicking the red Stop button), the signal fires and kills the entire spawned process tree:
+    - Windows: `taskkill /pid <PID> /T /F`
+    - POSIX / Unix: `child.kill('SIGKILL')`
+  - Returns `{ cancelled: true }` cleanly without leaving lingering background processes or locked files.
+
+### 22.3 Workspace Analysis First Directive & Multi-File Context Injection
+- **Multi-File Auto-Discovery:**
+  - At send-time, the extension scans the prompt, attached reviewer feedback, and workspace file list to discover all explicitly referenced files (`recovery_screen.dart`, `main.dart`, `failure_taxonomy.dart`, `pubspec.yaml`).
+  - Pre-reads all discovered files up to token limits and injects live `<file_content>` XML blocks into the prompt context.
+- **System Prompt Directive:**
+  - Added **Workspace Analysis First (CRITICAL)** in Phase 1 of `systemPrompt.ts`.
+  - Strictly prohibits models from complaining about missing file contents or asking the user to manually open files when workspace inspection tools and terminal commands (`type <path>`, `cat <path>`) are available.
+
+---
+
+## Phase 23: Live Streaming Activity Visibility, Reasoning Token Streaming, & Intelligent Activity Timeouts
+
+### 23.1 Context & Problem Definition
+In long sessions or when routing to slow, queue-congested, or deep reasoning models (e.g. `GLM 5.3 Flash`, `o3-mini`, `DeepSeek R1`), the UI previously remained frozen on `● Working ...` for several minutes with zero feedback. Users could not tell if the extension was reading files, connecting, thinking, writing, or completely hung.
+
+### 23.2 Live Lifecycle Activity Tracking (`AGENT_PROGRESS`)
+- **Granular Execution Phases:**
+  - `loading`: `Loading workspace files...` during initial repository tree indexing.
+  - `reading`: `Reading file: <filename>...` during active editor buffer and referenced file extraction.
+  - `connecting`: `Connecting to <modelName>...` while constructing payloads and dispatching the HTTP request.
+  - `thinking`: `Thinking...` (styled with a purple accent) when reasoning tokens are received.
+  - `writing`: `Writing...` (styled with a blue accent) as response token streaming begins.
+  - `applying`: `Applying edit: <filename>...` during diff application.
+  - `terminal`: `Running in terminal: <cmd>...` (styled with an amber accent) during command execution.
+- **Dual UI Synchronization:**
+  - Live status text updates both the in-chat progress pill (`agentProgress.ts`) and the bottom footer status bar simultaneously.
+
+### 23.3 OpenRouter Reasoning Token Streaming
+- **SSE Stream Capture:**
+  - Extended `StreamChunkChoice.delta` in `openrouterClient.ts` to capture `reasoning` and `thought` tokens.
+  - Emits `onReasoningChunk` on the first thinking token, immediately updating the status pill to `Thinking...` and preventing the model from appearing frozen during extended reasoning intervals.
+
+### 23.4 Dual Activity Timeouts
+- **75-Second Initial Connection Timeout:** Protects against unresponsive upstream provider queues before response headers arrive.
+- **45-Second Idle Chunk Timeout:** Detects stalled SSE streams and surfaces an interactive error card with a `↻ Retry` action rather than hanging indefinitely.
+
+---
+
+## Phase 24: Reasoning Effort Recording & High-Visibility Audit Badging
+
+### 24.1 Context & Problem Definition
+Reasoning effort selection (`Low`, `Medium`, `High`) previously disappeared from the Usage Data report across multi-turn autonomous executions, terminal retries, and model switches. Additionally, long model strings in the audit table cell were CSS-truncated to 140px, hiding the reasoning tier from view.
+
+### 24.2 Comprehensive Model Capability Detection
+- Expanded `isReasoningModel` in `modelCapabilities.ts` to detect reasoning capacity across model IDs, names, descriptions, and parameter definitions matching `r1`, `reason`, `thinking`, `qwq`, `glm`, `o1`, and `o3`.
+
+### 24.3 Persistence & Explicit Audit Attributes
+- **Data Model:** Added `reasoningEffort?: string` directly to `UsageAuditRecord` in `usageStore.ts`.
+- **Session-Wide Tracking:** `_activeReasoningEffort` is maintained across all autonomous continuation steps, terminal self-healing retries, and empty-completion recovery turns.
+- **Model Switch Preservation:** User effort preferences persist during model exploration in `main.ts` rather than being wiped to `undefined`.
+
+### 24.4 Visual Badging in Usage Reports
+- **Styling:** Added `.effort-badge` with a glowing purple glassmorphism pill (`background: rgba(210, 168, 255, 0.18); border: 1px solid rgba(210, 168, 255, 0.4); font-weight: 600;`).
+- **Layout:** Expanded the audit table model column width to `260px` to prevent label truncation.
+
+---
+
+## Phase 25: Autonomous Execution Continuity & Multi-Layered Self-Healing Engine
+
+### 25.1 Context & Problem Definition
+During multi-step plan execution, terminal tasks, and file modifications, execution frequently halted prematurely mid-operation, forcing the user to repeatedly prompt *"continue"* or *"go on"*.
+
+Root causes identified:
+1. **Continuation Nested Under Terminal Permissions:** The multi-step continuation turn for file edits was nested directly inside `if (runTerminalPerm === 'allow')`. Because terminal permissions default to `'ask'`, applying file edits without terminal commands never triggered the continuation turn.
+2. **Permission Check Missed `'allow_session'`:** Checks such as `applyEditPerm === 'allow'` evaluated to `false` when permissions were set to `'allow_session'`.
+3. **No File Edit Self-Healing:** Unlike terminal commands, when an edit encountered a minor line drift or search block mismatch, the extension logged a red warning and halted execution immediately rather than asking the model to fix the block.
+4. **Conversational Pauses Mid-Task:** If the model emitted intermediate thoughts without generating code or concluding with a walkthrough, the extension released the busy state and stalled.
+5. **Terminal Timeouts Stalled Loops:** Commands running over 60s timed out and were dropped from both continuation and retries.
+6. **Syntax Variations in Code Fences:** Fences such as ````edit:path````, ````create:path````, and ````dart:path```` failed the restrictive `create_file|edit_file|file` regex.
+
+### 25.2 Un-nested Multi-Step Execution Lifecycle
+- Moved file-edit continuation to the top level of `_handleAutoExecution` in `panelProvider.ts`.
+- Applying file edits immediately triggers the next implementation step, completely independent of whether terminal permissions are `'ask'`, `'deny'`, or `'allow'`.
+
+### 25.3 Live File Edit Self-Healing Loop
+- When a file edit fails (e.g. `SEARCH block not found in file` or malformed search/replace blocks), the extension records it in `failedEdits`.
+- If retries remain (`retryCount < 5`), the extension reads the actual current content of the target file and dispatches an automated self-healing retry turn:
+  ```markdown
+  🔄 File edit to `<path>` failed: <error>. Initiating self-healing retry (<attempt>/5)...
+  ```
+- The model is supplied with the live file excerpt and prompted to emit a corrected `edit_file` block with exact matching lines, allowing execution to self-heal and proceed automatically.
+
+### 25.4 Extended Terminal Timeout & Timeout Self-Healing
+- Increased default command timeout from 60s to 120s in `commandRunner.ts` to support Flutter/Dart compilation, dependency resolution (`pub get`), and test runs.
+- Timeout events (`result.timedOut`) are routed to diagnostic self-healing prompts rather than being dropped, allowing the model to adjust commands or proceed.
+
+### 25.5 Conversational Stall Recovery & Execution Intent Tracking
+- In `case 'SEND_MESSAGE'`, user execution commands (`"Proceed with the plan"`, `"implement"`, `"execute"`) automatically initialize the autonomous execution context (`isAutoFollowUp: true`).
+- If an autonomous execution turn produces neither file edits nor terminal commands nor a concluding `walkthrough` block, the extension automatically prompts the model:
+  *"Please proceed directly with the implementation without pausing for confirmation. Emit the required file edits or terminal commands for the next step, or provide the final walkthrough if all implementation and verification steps are complete."*
+
+### 25.6 Unified Permission Support & Expanded Code Fence Matching
+- **Permission States:** Both `applyEdit` and `runTerminalCommand` accept `'allow'` and `'allow_session'` identically.
+- **Expanded Code Fences:** Updated `fileActionRegex` in both `panelProvider.ts` and `main.ts` to match `create_file:`, `edit_file:`, `file:`, `create:`, `edit:`, `patch:`, and language-prefixed paths (e.g. `dart:lib/...`).
+- **Manual Command Continuation:** In `case 'RUN_TERMINAL'`, manual execution from chat cards automatically feeds results back to the model, ensuring seamless continuity even when terminal permissions are set to `'ask'`.
+
+---
+
+## Phase 26: Proactive Workspace File Discovery Rule
+
+### 26.1 Context & Problem Definition
+When users referenced a file by name (e.g. `prd.md`, `schema.prisma`) in a prompt, the assistant occasionally responded claiming the file did not exist — even when the file was present in a subdirectory — because it only checked the top-level root directory or currently open editor tabs.
+
+### 26.2 Workspace Rule: `file_discovery.md`
+- A dedicated workspace rule (`.agents/rules/file_discovery.md`) was added to enforce **Mandatory Silent Pre-Search** before any claim of file absence.
+- **Rule invariants:**
+  1. **Never claim a file is missing without searching first.** If a file name is referenced and is not immediately visible, the assistant must run a workspace search (`dir /s /b`, ripgrep, or directory tree traversal) before responding.
+  2. **Search subdirectories.** The search must recurse through the full workspace tree (e.g. `Docs\PRD.md`, `specs/`, nested source directories).
+  3. **Only fallback on zero matches.** Only if all search attempts across all subfolders yield no results may the assistant ask for clarification or report the file as missing.
+- This eliminates premature hallucination / bail-out behavior on fresh model turns where the file context was not pre-injected into the prompt.
+
+---
+
+## Phase 27: Stop Button Race Condition Fix
+
+### 27.1 Context & Problem Definition
+The Stop button (`STOP_STREAM`) correctly set `_isUserCancelled = true` and called `_activeAbortController.abort()`. However, a race condition existed in the auto-follow-up / autonomous continuation path:
+
+1. Auto-turn N+1 enters `_handleSendMessage`.
+2. The `else` branch (auto-follow-up path) checks `_isUserCancelled` → `false`. ✅
+3. A **new** `AbortController` is created and assigned to `_activeAbortController`.
+4. **Stop fires here** → calls `abort()` on the **old** controller (now discarded). ❌ New controller is never aborted.
+5. Turn N+1 streams to completion and triggers turn N+2.
+
+### 27.2 Double-Check Fix
+- After creating the new `AbortController` in the auto-follow-up path, `_isUserCancelled` is checked **a second time** (closing the race window):
+  ```typescript
+  this._activeAbortController = new AbortController();
+  if (this._isUserCancelled) {
+    this._activeAbortController.abort();
+    this._postMessage({ type: 'SET_BUSY', busy: false });
+    return;
+  }
+  ```
+- This guarantees that any Stop signal arriving between the first flag check and the controller swap is honored on the new controller before any streaming begins.
+- JavaScript's single-threaded execution model ensures the only interleaving point is across `await` boundaries; the double-check closes that window.
+
+---
+
+## Phase 28: Reviewer Session Lifecycle Overhaul — No New Sessions on Startup
+
+### 28.1 Context & Problem Definition
+Every time VS Code launched fresh and the user clicked **Review** on an artifact, a **new empty reviewer session** was created on disk — despite a fully populated previous session existing. After several sessions, the sessions list accumulated many empty entries. Root cause:
+
+- `RESET_REVIEWER_CONTEXT` called `startNewReviewerSession()` → created a new **empty** session on disk.
+- On next startup, `_reviewerHistory = []` (never loaded from disk yet) and `activeSession.messages.length === 0` (the empty reset session) → `isSessionActive = false` → `_handleStartReview` called `startNewReviewerSession()` again → another new empty session.
+- This repeated on every cold-start.
+
+### 28.2 `clearActiveReviewerSession()` — In-Place Wipe
+- Added `clearActiveReviewerSession()` to `HistoryStore`:
+  - Clears `messages`, resets `title`, `artifactContent`, `artifactType`, `artifactMessageId` on the **active session in-place**.
+  - Saves to disk. No new session entry is created.
+- `RESET_REVIEWER_CONTEXT` now calls `clearActiveReviewerSession()` instead of `startNewReviewerSession('Review Session (Fresh)')`.
+
+### 28.3 Disk-First Session Sync in `_handleStartReview`
+- `_handleStartReview` now **always** calls `loadReviewerSessions()` first and syncs `_reviewerHistory` from the persisted active session if in-memory history is empty.
+- After syncing, `hasExistingMessages` is evaluated accurately even on cold-start (no reviewer tab opened yet this session).
+- If the active session is **empty** (fresh or after a reset), it is **reused in-place** (title + artifact context updated, no new entry created).
+- If the active session **has messages**, the full history and model data are sent to the webview.
+
+---
+
+## Phase 29: Reviewer Panel Cold-Start Initialization Fix
+
+### 29.1 Context & Problem Definition
+When the user pushed an artifact for review **without** first clicking the reviewer tab (cold-start push), the reviewer panel opened in a blank state:
+- **Messages area:** empty — no conversation history visible.
+- **Model selector:** showed "Reviewer Model…" placeholder instead of the configured model name.
+- **Reasoning effort control:** hidden (because `updateReviewerPanelReasoningControl` returned early when `loadedModels` was empty).
+
+The AI still understood the request (session was synced from disk), but the UI appeared completely blank.
+
+Two distinct failure modes:
+
+**Failure A — Wrong message type sent:** The `hasExistingMessages = true` branch of `_handleStartReview` sent only `REVIEWER_ATTACH_ARTIFACT`. This function only opens the view and adds the doc chip — it never sets `activeReviewerModelId`, never renders history, and never calls `updateReviewerPanelReasoningControl`.
+
+**Failure B — Model list race:** `REVIEWER_VIEW_DATA` could arrive before `MODELS_LOADED` completed. `loadedModels = []` → `foundModel = undefined` → raw model ID shown instead of display name → reasoning effort hidden.
+
+### 29.2 Fix A — Dual Message Sequence for Existing Sessions
+The `hasExistingMessages` branch now sends **two messages** in sequence:
+1. **`REVIEWER_VIEW_DATA`** — renders full history, sets `activeReviewerModelId`, shows model display name, populates reasoning effort control.
+2. **`REVIEWER_ATTACH_ARTIFACT`** — adds the newly pushed doc chip to the input bar.
+
+`openReviewerView` already handles clearing and re-rendering history correctly; `handleReviewerAttachArtifact` adds the chip right after — the sequence is clean with no duplication.
+
+### 29.3 Fix B — Deferred Reviewer Panel Refresh After Model List Load
+In the `MODELS_LOADED` handler, after populating `loadedModels`, a check is added:
+```typescript
+if (viewReviewer && !viewReviewer.classList.contains('hidden') && activeReviewerModelId) {
+  // Re-apply reviewer panel display now that model list is available
+  const foundReviewerModel = loadedModels.find((m) => m.id === activeReviewerModelId);
+  if (foundReviewerModel) {
+    reviewerPanelModelInput.value = foundReviewerModel.name || foundReviewerModel.id;
+  }
+  updateReviewerPanelReasoningControl(activeReviewerModelId);
+  updateReviewerTokenMeter();
+}
+```
+If `REVIEWER_VIEW_DATA` arrived before models loaded (race), this deferred refresh corrects the model display name and reasoning effort visibility as soon as the model catalog is available.
+
+---
+
+## Phase 30: Diagnostic Logging System & Execution Visibility
+
+### 30.1 Purpose & Problem Statement
+When models stall, hit rate limits, terminate unexpectedly mid-stream, or fail permission checks, non-technical users and developers need clear, comprehensive diagnostic telemetry without exposing sensitive credentials or file contents. Furthermore, sessions need distinct visibility between the Main Agent workflow and the secondary Reviewer workflow.
+
+### 30.2 Diagnostic Logger Architecture (`src/logger.ts`)
+- **Storage & Rotation:**
+  - Persisted in VS Code's global storage directory: `log-today.txt`, `log-yesterday.txt`, and `log-2daysago.txt` (rolling 3-day history).
+  - Maximum size bounded at 2MB per file to prevent unbounded disk growth.
+  - In-memory ring buffer (1,000 lines) for fast access without disk thrashing.
+  - Asynchronous non-blocking file append pipeline with safe write queueing.
+- **Privacy & Safety Guards:**
+  - Strictly sanitizes outputs: API keys, tokens, prompt text, and full file contents are never written to disk.
+  - Only event categories, metadata, timestamps, token counts, error codes, and relative file paths are logged.
+- **Commands:**
+  - `OpenRouter: Copy Diagnostic Logs to Clipboard` (`openrouter.copyDiagnosticLogs`) — reads today's log directly into the OS clipboard and surfaces an informative notification.
+  - `OpenRouter: Open Diagnostic Log File` (`openrouter.openDiagnosticLog`) — opens the active `log-today.txt` file directly inside the VS Code editor tab.
+
+### 30.3 Event Taxonomy & Categorization Tags
+
+| Category Tag | Component | Description & Event Details |
+|---|---|---|
+| `[LOGGER  ]` | Logger Core | Logger initialization, storage path verification, and date rotation. |
+| `[EXT     ]` | Extension Lifecycle | Extension activation and clean deactivation/shutdown events. |
+| `[AUTH    ]` | Authentication | API key presence checks, validation success, or validation failures. |
+| `[MODELS  ]` | Catalog | Fetching `/models` catalog count, refresh triggers, and network errors. |
+| `[CHAT    ]` | User Interaction | User message submissions with estimated draft tokens and active model ID. |
+| `[AGENT   ]` | Main Agent Workflow | Agent turn initialization, context window calculations, token budgets (`history` vs `model limit`). |
+| `[REVIEW  ]` | Reviewer Workflow | Reviewer session lifecycle, reviewer stream initiation, artifact attachment token estimates (`artifact: ~N tokens`). |
+| `[API     ]` | OpenRouter Client | Stream requests (with attempt number / retries), completion statuses, token metrics (`INPUT` and `OUTPUT` on separate lines), and stream termination reasons. |
+| `[PERM    ]` | Permission Manager | Evaluations for `runTerminalCommand`, `applyEdit`, `createDeleteFiles`: records whether action was `ALLOWED`, `DENIED`, or `ASKING user` (including session/permanent grants). |
+| `[EDIT    ]` | Diff Preview / Workspace | Diff preview openings (`Opened diff preview for <path>`) and patch applications (`Applied edit successfully` or `Failed to apply edit`). |
+| `[TERM    ]` | Command Runner | Terminal command executions, exact commands, process exit codes, timeouts, cancellations, and self-healing retries. |
+| `[FILE    ]` | Context Reader | Active document inspections, read requests, batching triggers, and missing referenced files. |
+| `[CMD     ]` | Command Palette | User triggering diagnostic log commands. |
+
+### 30.4 Stream Mid-Execution Termination Diagnostics (`finish_reason`)
+To explain why a model stopped or cut off mid-response, the SSE stream parser captures the chunk-level `finish_reason` and outputs explicit diagnostic diagnostics:
+- **`stop`**: `Stop reason: "stop" — model finished normally ✓`
+- **`length`**: `Stop reason: "length" — model hit its max_tokens limit and was CUT OFF mid-response!`
+- **`content_filter`**: `Stop reason: "content_filter" — response was blocked by the provider content policy`
+- **`tool_calls`**: `Stop reason: "tool_calls" — model requested tool/function calls`
+- **Missing / Free Tier**: `Stop reason: unknown — finish_reason was not included in stream (free model or provider limitation)`
+
+### 30.5 Streamlined Token Usage Formatting
+Stream completion logs format input and output tokens onto distinct lines for clarity:
+```text
+[INFO ] [API     ] Stream complete ✓ — INPUT  tokens: 4200
+[INFO ] [API     ] Stream complete ✓ — OUTPUT tokens: 312 (total: 4512)
+```
+
+### 30.6 Main Agent vs. Reviewer Stream Differentiation
+Differentiating actions between the main agent and the reviewer is accomplished through explicit category tagging and sequencing:
+- Main agent turns emit `[AGENT   ] Turn start` followed by `[API     ] Stream request`.
+- Reviewer runs emit `[REVIEW  ] Reviewer stream start — model: <id>, artifact: ~N tokens` followed by `[API     ] Stream request`.
+- Both stream completions are tagged with `[API     ]`, traceable directly to their initiating block.

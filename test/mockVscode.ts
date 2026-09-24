@@ -32,12 +32,14 @@ export const workspace: any = {
   openTextDocument: async (uri: any) => ({
     getText: () => '',
     positionAt: (offset: number) => new Position(0, offset),
+    save: async () => true,
   }),
   fs: {
     stat: async (uri: any) => ({ type: 1, size: 0, mtime: 0, ctime: 0 }),
     readFile: async (uri: any) => new Uint8Array(),
     writeFile: async (uri: any, content: any) => undefined,
     createDirectory: async (uri: any) => undefined,
+    readDirectory: async (uri: any) => [] as [string, any][],
   },
   applyEdit: async (edit: any) => true,
   _config: new Map<string, any>(),
@@ -110,6 +112,15 @@ export const window: any = {
     window.terminals.push(t);
     return t;
   },
+  createOutputChannel: (name: string) => ({
+    name,
+    append: () => {},
+    appendLine: () => {},
+    clear: () => {},
+    show: () => {},
+    hide: () => {},
+    dispose: () => {},
+  }),
   showInformationMessage: async () => undefined,
   showWarningMessage: async () => undefined,
   showErrorMessage: async () => undefined,
@@ -146,6 +157,13 @@ export enum DiagnosticSeverity {
   Warning = 1,
   Information = 2,
   Hint = 3,
+}
+
+export enum FileType {
+  Unknown = 0,
+  File = 1,
+  Directory = 2,
+  SymbolicLink = 64,
 }
 
 export class Diagnostic {

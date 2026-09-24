@@ -8,6 +8,7 @@ export interface ModelCapabilities {
   supportedReasoningEfforts?: string[];
   inputModalities: string[];
   outputModalities: string[];
+  isAgentic: boolean;
 }
 
 export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilities {
@@ -20,6 +21,7 @@ export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilit
       supportedReasoningEfforts: undefined,
       inputModalities: ['text'],
       outputModalities: ['text'],
+      isAgentic: false,
     };
   }
 
@@ -31,14 +33,25 @@ export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilit
 
   const idLower = (model.id || '').toLowerCase();
   const descLower = (model.description || '').toLowerCase();
+  const nameLower = (model.name || '').toLowerCase();
   const isReasoningModel =
     hasReasoningParam ||
     idLower.includes('/o1') ||
     idLower.includes('/o3') ||
     idLower.includes('o1-') ||
     idLower.includes('o3-') ||
-    idLower.includes('reasoning') ||
-    idLower.includes('deepseek-r1') ||
+    idLower.includes('o1') ||
+    idLower.includes('o3') ||
+    idLower.includes('r1') ||
+    idLower.includes('reason') ||
+    idLower.includes('thinking') ||
+    idLower.includes('qwq') ||
+    idLower.includes('glm') ||
+    nameLower.includes('r1') ||
+    nameLower.includes('reason') ||
+    nameLower.includes('thinking') ||
+    descLower.includes('reasoning') ||
+    descLower.includes('thinking') ||
     descLower.includes('reasoning effort') ||
     descLower.includes('reasoning token');
 
@@ -50,6 +63,24 @@ export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilit
   }
 
   if (!model.architecture) {
+    const isAgentic =
+      idLower.includes('opus') ||
+      nameLower.includes('opus') ||
+      idLower.includes('sonnet') ||
+      nameLower.includes('sonnet') ||
+      idLower.includes('claude-3') ||
+      idLower.includes('claude-4') ||
+      idLower.includes('claude-5') ||
+      (idLower.includes('claude') && !idLower.includes('haiku')) ||
+      (nameLower.includes('claude') && !nameLower.includes('haiku')) ||
+      idLower.includes('gpt-4') ||
+      idLower.includes('gpt-5') ||
+      idLower.includes('o1') ||
+      idLower.includes('o3') ||
+      idLower.includes('deepseek') ||
+      idLower.includes('gemini-2') ||
+      idLower.includes('coder');
+
     return {
       supportsVision: false,
       supportsAudio: false,
@@ -58,6 +89,7 @@ export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilit
       supportedReasoningEfforts,
       inputModalities: ['text'],
       outputModalities: ['text'],
+      isAgentic,
     };
   }
 
@@ -78,12 +110,43 @@ export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilit
     modality.includes('audio');
 
   const supportsTools =
-    model.architecture.instruct_type !== null &&
-    !model.id.includes('instruct-free') &&
-    (model.description?.toLowerCase().includes('tool') ||
-      model.id.includes('gpt-') ||
-      model.id.includes('claude-') ||
-      model.id.includes('gemini-'));
+    supportedParams.includes('tools') ||
+    supportedParams.includes('tool_choice') ||
+    supportedParams.includes('function_calling') ||
+    supportedParams.includes('functions') ||
+    (model.architecture.instruct_type !== null &&
+      !model.id.includes('instruct-free') &&
+      (model.description?.toLowerCase().includes('tool') ||
+        idLower.includes('gpt') ||
+        idLower.includes('claude') ||
+        nameLower.includes('claude') ||
+        idLower.includes('gemini') ||
+        nameLower.includes('gemini')));
+
+  const isAgentic =
+    idLower.includes('opus') ||
+    nameLower.includes('opus') ||
+    idLower.includes('sonnet') ||
+    nameLower.includes('sonnet') ||
+    idLower.includes('claude-3') ||
+    idLower.includes('claude-4') ||
+    idLower.includes('claude-5') ||
+    (idLower.includes('claude') && !idLower.includes('haiku')) ||
+    (nameLower.includes('claude') && !nameLower.includes('haiku')) ||
+    idLower.includes('gpt-4') ||
+    idLower.includes('gpt-5') ||
+    idLower.includes('/o1') ||
+    idLower.includes('/o3') ||
+    idLower.includes('o1-') ||
+    idLower.includes('o3-') ||
+    idLower.includes('gemini-2') ||
+    idLower.includes('gemini-1.5-pro') ||
+    idLower.includes('deepseek') ||
+    (idLower.includes('qwen') && (idLower.includes('coder') || idLower.includes('code'))) ||
+    idLower.includes('coder') ||
+    nameLower.includes('coder') ||
+    isReasoningModel ||
+    Boolean(supportsTools && (model.context_length ?? 0) >= 32000);
 
   return {
     supportsVision,
@@ -93,6 +156,7 @@ export function detectModelCapabilities(model?: OpenRouterModel): ModelCapabilit
     supportedReasoningEfforts,
     inputModalities: inputModalities.length > 0 ? inputModalities : ['text'],
     outputModalities: outputModalities.length > 0 ? outputModalities : ['text'],
+    isAgentic,
   };
 }
 

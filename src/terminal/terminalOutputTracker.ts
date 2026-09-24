@@ -6,6 +6,8 @@ export interface CapturedOutput {
   cwd: string;
   sanitizedOutput: string;
   timestamp: number;
+  exitCode?: number | null;
+  status?: 'success' | 'failed' | 'timed_out' | 'running';
 }
 
 export class TerminalOutputTracker {
@@ -23,6 +25,45 @@ export class TerminalOutputTracker {
     this.startReading(execution).catch(() => {
       // Ignore stream errors
     });
+  }
+
+  public static recordExecutionResult(result: {
+    command: string;
+    cwd: string;
+    exitCode: number | null;
+    stdout: string;
+    stderr: string;
+    timedOut?: boolean;
+    error?: string;
+  }) {
+    const combinedRaw = (
+      result.stdout +
+      (result.stderr ? (result.stdout ? '\n' : '') + result.stderr : '') +
+      (result.error ? `\n[Error]: ${result.error}` : '')
+    ).trim();
+
+    const sanitized = SecretScanner.redact(combinedRaw).sanitized;
+    const finalOutput = this.truncate(sanitized);
+
+    const status: 'success' | 'failed' | 'timed_out' = result.timedOut
+      ? 'timed_out'
+      : result.exitCode === 0
+      ? 'success'
+      : 'failed';
+
+    this.recentOutputs.push({
+      command: result.command,
+      cwd: result.cwd,
+      sanitizedOutput: finalOutput,
+      exitCode: result.exitCode,
+      status,
+      timestamp: Date.now(),
+    });
+
+    // Keep the last 5 completed outputs to prevent context bloating
+    if (this.recentOutputs.length > 5) {
+      this.recentOutputs.shift();
+    }
   }
 
   private static async startReading(execution: vscode.TerminalShellExecution) {
@@ -50,11 +91,12 @@ export class TerminalOutputTracker {
           command: state.command,
           cwd: state.cwd,
           sanitizedOutput: finalOutput,
+          status: 'success',
           timestamp: Date.now()
         });
 
-        // Keep only the last 3 completed outputs to prevent context bloating
-        if (this.recentOutputs.length > 3) {
+        // Keep only the last 5 completed outputs to prevent context bloating
+        if (this.recentOutputs.length > 5) {
           this.recentOutputs.shift();
         }
       }
@@ -79,7 +121,17 @@ export class TerminalOutputTracker {
 
     // 1. Completed outputs
     for (const out of this.recentOutputs) {
-      parts.push(`[Command executed at ${new Date(out.timestamp).toISOString()}]\n$ ${out.command}\n${out.sanitizedOutput}`);
+      let statusHeader = '';
+      if (out.status === 'success') {
+        statusHeader = `[Exit code: 0 (Success)]`;
+      } else if (out.status === 'timed_out') {
+        statusHeader = `[Timed out (Process killed after 60s)]`;
+      } else {
+        statusHeader = `[Exit code: ${out.exitCode ?? 'unknown'} (Failed)]`;
+      }
+
+      const outputBody = out.sanitizedOutput ? `\n${out.sanitizedOutput}` : '\n(No output produced)';
+      parts.push(`[Command executed at ${new Date(out.timestamp).toISOString()}]\n$ ${out.command}\n${statusHeader}${outputBody}`);
     }
 
     // 2. Still running outputs (e.g. dev servers, watch processes)

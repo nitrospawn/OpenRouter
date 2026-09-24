@@ -17,6 +17,7 @@ class MockElement {
   }
 
   public id: string = '';
+  public title: string = '';
   public style: any = {};
   public children: MockElement[] = [];
   public events: Record<string, Function> = {};
@@ -51,7 +52,8 @@ class MockElement {
   querySelector(selector: string): MockElement | undefined {
     if (selector === 'span' && this.tagName === 'span') return this;
     for (const child of this.children) {
-      if (child.tagName === selector || (selector.startsWith('.') && child.className === selector.substring(1))) {
+      const isClassMatch = selector.startsWith('.') && child.className.split(/\s+/).includes(selector.substring(1));
+      if (child.tagName === selector || isClassMatch) {
         return child;
       }
       const found = child.querySelector(selector);
@@ -234,8 +236,8 @@ test('User Message Collapsing: Collapsed state is independent per message', () =
   const wrapper1 = msg1.children.find(c => c.className === 'message-body')!.children.find(c => c.className === 'code-block-wrapper')!;
   const wrapper2 = msg2.children.find(c => c.className === 'message-body')!.children.find(c => c.className === 'code-block-wrapper')!;
   
-  const toggle1 = wrapper1.children[0].children[1].children.find((c: any) => c.textContent === 'Expand' || c.textContent === 'Collapse');
-  const toggle2 = wrapper2.children[0].children[1].children.find((c: any) => c.textContent === 'Expand' || c.textContent === 'Collapse');
+  const toggle1 = wrapper1.children[0].children[1].children.find((c: any) => c.textContent === 'Expand' || c.textContent === 'Collapse')!;
+  const toggle2 = wrapper2.children[0].children[1].children.find((c: any) => c.textContent === 'Expand' || c.textContent === 'Collapse')!;
   
   assert.strictEqual(toggle1.textContent, 'Expand');
   assert.strictEqual(toggle2.textContent, 'Expand');
@@ -353,7 +355,7 @@ test('Reviewer Feedback Attachment: appendMessage does NOT render reviewer feedb
 
   appendMessage('user', rawModelPayload);
 
-  const messagesContainer = mockDocument.getElementById('messages-container');
+  const messagesContainer = mockDocument.getElementById('messages-container')!;
   const lastMsg = messagesContainer.children[messagesContainer.children.length - 1];
   assert.ok(lastMsg);
 
@@ -374,5 +376,111 @@ test('Reviewer Feedback Attachment: appendMessage does NOT render reviewer feedb
   assert.ok(allBodyText.includes('Please fix the auth header parser'), 'User typed instructions must be rendered');
 });
 
+test('Undo reattachment: extractAttachmentsAndPrompt extracts file, quote, reviewer, and image', () => {
+  const { extractAttachmentsAndPrompt } = require('../src/webview/ui/main');
 
+  const content = `<!-- reviewer-feedback:start -->\n[Reviewer Feedback]:\nConsider edge case handling.\n<!-- reviewer-feedback:end -->\n\n> const existing = 123;\n\n\`\`\`helper.ts\nexport const add = (a: number, b: number) => a + b;\n\`\`\`\n\nCan you optimize this function?`;
+
+  const images = [{ name: 'diagram.png', dataUrl: 'data:image/png;base64,abc123' }];
+
+  const result = extractAttachmentsAndPrompt(content, images);
+
+  assert.strictEqual(result.cleanText, 'Can you optimize this function?');
+  assert.strictEqual(result.attachments.length, 4);
+
+  const reviewerAtt = result.attachments.find((a: any) => a.isReviewerFeedback);
+  assert.ok(reviewerAtt);
+  assert.strictEqual(reviewerAtt.data, 'Consider edge case handling.');
+
+  const quoteAtt = result.attachments.find((a: any) => a.isQuote);
+  assert.ok(quoteAtt);
+  assert.strictEqual(quoteAtt.data, 'const existing = 123;');
+
+  const fileAtt = result.attachments.find((a: any) => a.name === 'helper.ts');
+  assert.ok(fileAtt);
+  assert.strictEqual(fileAtt.isImage, false);
+  assert.ok(fileAtt.data.includes('export const add'));
+
+  const imgAtt = result.attachments.find((a: any) => a.isImage);
+  assert.ok(imgAtt);
+  assert.strictEqual(imgAtt.name, 'diagram.png');
+  assert.strictEqual(imgAtt.data, 'data:image/png;base64,abc123');
+});
+
+test('Undo reattachment: appendMessage stores userTypedText and attachments in dataset and map', () => {
+  const { appendMessage, messageAttachmentsMap } = require('../src/webview/ui/main');
+
+  const messageId = 'test-msg-123';
+  const userTypedText = 'Refactor this module';
+  const attachments = [
+    {
+      id: 'att-1',
+      name: 'foo.ts',
+      data: 'console.log("test");',
+      isImage: false,
+    },
+  ];
+
+  appendMessage(
+    'user',
+    '```foo.ts\nconsole.log("test");\n```\n\nRefactor this module',
+    undefined,
+    false,
+    messageId,
+    undefined,
+    undefined,
+    undefined,
+    false,
+    userTypedText,
+    attachments
+  );
+
+  const messagesContainer = mockDocument.getElementById('messages-container')!;
+  const msgEl = messagesContainer.children[messagesContainer.children.length - 1];
+  assert.ok(msgEl);
+  assert.strictEqual(msgEl.dataset.userTypedText, userTypedText);
+  assert.ok(msgEl.dataset.attachments);
+
+  const inMap = messageAttachmentsMap.get(messageId);
+  assert.ok(inMap);
+  assert.strictEqual(inMap.typedText, userTypedText);
+  assert.strictEqual(inMap.attachments.length, 1);
+  assert.strictEqual(inMap.attachments[0].name, 'foo.ts');
+});
+
+test('Model Display Name: getModelDisplayName formats model ID or returns friendly name', () => {
+  const { getModelDisplayName } = require('../src/webview/ui/main');
+  assert.strictEqual(getModelDisplayName(''), 'OpenRouter');
+  assert.strictEqual(getModelDisplayName(undefined), 'OpenRouter');
+  assert.strictEqual(getModelDisplayName('anthropic/claude-3.5-sonnet'), 'claude-3.5-sonnet');
+  assert.strictEqual(getModelDisplayName('openai/gpt-4o'), 'gpt-4o');
+});
+
+test('Model Role Tag: appendMessage renders model name instead of generic OpenRouter', () => {
+  const { appendMessage } = require('../src/webview/ui/main');
+  const messagesContainer = mockDocument.getElementById('messages-container')!;
+  const countBefore = messagesContainer.children.length;
+
+  appendMessage(
+    'assistant',
+    'Hello from Claude!',
+    undefined,
+    false,
+    'msg-model-test-1',
+    undefined,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    undefined,
+    'anthropic/claude-3.5-sonnet'
+  );
+
+  assert.strictEqual(messagesContainer.children.length, countBefore + 1);
+  const msgEl = messagesContainer.children[messagesContainer.children.length - 1]!;
+  const roleTag = msgEl.querySelector('.role-tag')!;
+  assert.ok(roleTag, 'Role tag must exist in message header');
+  assert.strictEqual(roleTag.textContent, 'claude-3.5-sonnet');
+  assert.strictEqual(roleTag.title, 'anthropic/claude-3.5-sonnet');
+});
 

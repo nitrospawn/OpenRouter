@@ -107,3 +107,57 @@ test('buildSystemPrompt: injects active file buffer, workspace files, and refere
   assert.ok(prompt.includes('--- Referenced Workspace File (LIVE BUFFER - AUTHORITATIVE) ---'));
   assert.ok(prompt.includes('export const x = 1;'));
 });
+
+test('buildSystemPrompt: injects dynamic OS and shell environment for Windows (win32)', () => {
+  const prompt = buildSystemPrompt({
+    environment: {
+      platform: 'win32',
+      shell: 'cmd.exe',
+    },
+  });
+
+  assert.ok(prompt.includes('Operating System: Windows (win32)'));
+  assert.ok(prompt.includes('Default Terminal Shell: cmd.exe'));
+  assert.ok(prompt.includes('You are running on Windows using cmd.exe'));
+  assert.ok(prompt.includes('To show current working directory in cmd.exe, use `cd` without arguments (do NOT use `pwd`)'));
+  assert.ok(prompt.includes('```cmd'));
+});
+
+test('buildSystemPrompt: injects dynamic OS and shell environment for POSIX (darwin/linux)', () => {
+  const prompt = buildSystemPrompt({
+    environment: {
+      platform: 'darwin',
+      shell: 'zsh',
+    },
+  });
+
+  assert.ok(prompt.includes('Operating System: macOS (darwin)'));
+  assert.ok(prompt.includes('Default Terminal Shell: zsh'));
+  assert.ok(prompt.includes('Standard bash/POSIX syntax applies'));
+  assert.ok(prompt.includes('```bash'));
+});
+
+test('buildSystemPrompt: injects recent terminal outputs into prompt context', () => {
+  const prompt = buildSystemPrompt({
+    terminalOutputs: '[Exit code: 0] Tests ran cleanly.',
+  });
+
+  assert.ok(prompt.includes('--- Recent Terminal Outputs ---'));
+  assert.ok(prompt.includes('[Exit code: 0] Tests ran cleanly.'));
+});
+
+test('buildSystemPrompt: enforces Plan Storage Directive forbidding model from asking to save plan as file', () => {
+  const prompt = buildSystemPrompt();
+  assert.ok(prompt.includes('Plan Storage Directive (CRITICAL)'));
+  assert.ok(prompt.includes('NEVER ask or offer to save the plan as a file'));
+  assert.ok(prompt.includes('The plan is ALREADY saved as an artifact by the extension'));
+});
+
+test('buildSystemPrompt: enforces Autonomous Multi-Step Execution directive forbidding pausing between steps', () => {
+  const prompt = buildSystemPrompt();
+  assert.ok(prompt.includes('Autonomous Multi-Step Execution (NO MID-TASK PAUSING)'));
+  assert.ok(prompt.includes('DO NOT PAUSE TO ASK PERMISSION BETWEEN STEPS'));
+  assert.ok(prompt.includes('STRICTLY PROHIBITED during plan implementation'));
+});
+
+

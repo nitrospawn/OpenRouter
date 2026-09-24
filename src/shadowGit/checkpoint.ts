@@ -2,6 +2,7 @@ import { ShadowRepo } from './shadowRepo';
 import { GitignoreRespect } from './gitignoreRespect';
 import * as path from 'path';
 import * as fs from 'fs';
+import { logger } from '../logger';
 
 export interface CheckpointInfo {
   checkpointId: string;
@@ -29,8 +30,16 @@ export class CheckpointManager {
     const workTree = this.shadowRepo.getWorkTree();
     const validFiles: string[] = [];
 
-    for (const rel of affectedFilesRelative) {
-      if (!GitignoreRespect.isIgnored(workTree, rel)) {
+    for (const raw of affectedFilesRelative) {
+      let rel = raw.replace(/\\/g, '/');
+      if (path.isAbsolute(raw)) {
+        rel = path.relative(workTree, raw).replace(/\\/g, '/');
+      }
+      rel = rel.replace(/^\/+/, '');
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        continue;
+      }
+      if (rel.length > 0 && !GitignoreRespect.isIgnored(workTree, rel)) {
         validFiles.push(rel);
       }
     }
@@ -40,6 +49,8 @@ export class CheckpointManager {
     }
 
     try {
+      logger.info('SHADOW_GIT', `Creating checkpoint for ${validFiles.length} file(s): [${validFiles.join(', ')}] — "${description}"`);
+
       // Stage the affected files.
       // If batch add fails (e.g. one or more files in validFiles are new files being created that
       // do not exist on disk yet), stage existing files individually so new files don't abort checkpointing.
@@ -62,8 +73,10 @@ export class CheckpointManager {
       // Get latest commit hash
       const { stdout } = await this.shadowRepo.runGit(['rev-parse', 'HEAD']);
       const checkpointId = stdout.trim();
+      logger.info('SHADOW_GIT', `Checkpoint created: ${checkpointId.substring(0, 7)} — "${description}"`);
       return checkpointId;
     } catch (err) {
+      logger.error('SHADOW_GIT', `Failed to create checkpoint for "${description}": ${err}`);
       console.error('[CheckpointManager] Failed to create checkpoint:', err);
       return null;
     }

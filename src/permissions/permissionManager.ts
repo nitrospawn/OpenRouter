@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import { ConfirmationDialogs } from './confirmationDialogs';
+import { isReadOnly } from '../terminal/commandClassifier';
+import { logger } from '../logger';
 
 export type PermissionCategory =
   | 'readActiveContext'
@@ -219,21 +221,31 @@ export class PermissionManager {
   ): Promise<'allowed' | 'denied'> {
     const permState = this.getPermission('runTerminalCommand');
     if (permState === 'deny') {
+      logger.warn('PERM', `DENIED runTerminalCommand — permission set to deny. Command: ${command.substring(0, 60)}`);
       vscode.window.showErrorMessage('Terminal commands are disabled in OpenRouter permissions.');
       return 'denied';
     }
 
     // Explicit 'allow' or 'allow_session' skips the confirmation dialog entirely
     if (permState === 'allow' || permState === 'allow_session') {
+      logger.info('PERM', `ALLOWED runTerminalCommand (${permState}): ${command.substring(0, 60)}`);
+      return 'allowed';
+    }
+
+    // Safe read-only inspection commands (type, dir, cat, ls, grep) do not require confirmation prompts
+    if (isReadOnly(command)) {
+      logger.info('PERM', `ALLOWED runTerminalCommand (read-only inspection): ${command.substring(0, 60)}`);
       return 'allowed';
     }
 
     // Exact command approved previously in this specific cwd skips confirmation
     if (!isDestructive && this.isExactCommandAllowed(command, cwd)) {
+      logger.info('PERM', `ALLOWED runTerminalCommand (exact match pre-approved): ${command.substring(0, 60)}`);
       return 'allowed';
     }
 
     // Otherwise prompt the user with modal dialog
+    logger.info('PERM', `ASKING user for runTerminalCommand permission${isDestructive ? ' [DESTRUCTIVE]' : ''}: ${command.substring(0, 60)}`);
     const confirmed = await ConfirmationDialogs.confirmTerminalCommand(
       command,
       cwd,
@@ -242,12 +254,16 @@ export class PermissionManager {
     );
 
     if (confirmed === 'deny') {
+      logger.warn('PERM', `DENIED runTerminalCommand — user cancelled dialog: ${command.substring(0, 60)}`);
       vscode.window.showInformationMessage('Command execution cancelled.');
       return 'denied';
     }
 
     if (confirmed === 'allow_always') {
+      logger.info('PERM', `ALLOWED runTerminalCommand (user: allow always): ${command.substring(0, 60)}`);
       await this.allowExactCommand(command, cwd);
+    } else {
+      logger.info('PERM', `ALLOWED runTerminalCommand (user: allow once): ${command.substring(0, 60)}`);
     }
 
     return 'allowed';
@@ -264,51 +280,64 @@ export class PermissionManager {
     if (isNewFile) {
       const createPerm = this.getPermission('createDeleteFiles');
       if (createPerm === 'deny') {
+        logger.warn('PERM', `DENIED createDeleteFiles — permission set to deny: ${filePath}`);
         vscode.window.showErrorMessage('Creating files is currently disabled in OpenRouter permissions.');
         return 'denied';
       }
       if (createPerm === 'allow') {
+        logger.info('PERM', `ALLOWED createDeleteFiles (allow): ${filePath}`);
         return 'allowed';
       }
     }
 
     const editPerm = this.getPermission('applyEdit');
     if (editPerm === 'deny') {
+      logger.warn('PERM', `DENIED applyEdit — permission set to deny: ${filePath}`);
       vscode.window.showErrorMessage('Applying edits is currently disabled in OpenRouter permissions.');
       return 'denied';
     }
 
     if (editPerm === 'allow' || editPerm === 'allow_session') {
-      // If creating a new file and createDeleteFiles is set to 'ask', prompt specifically for file creation
       if (isNewFile) {
         const createPerm = this.getPermission('createDeleteFiles');
         if (createPerm === 'ask') {
+          logger.info('PERM', `ASKING user for createDeleteFiles (new file): ${filePath}`);
           const confirmed = await ConfirmationDialogs.confirmFileEdit(filePath, true);
           if (confirmed === 'deny') {
+            logger.warn('PERM', `DENIED createDeleteFiles — user cancelled: ${filePath}`);
             vscode.window.showInformationMessage('File creation cancelled.');
             return 'denied';
           }
           if (confirmed === 'allow_session') {
+            logger.info('PERM', `ALLOWED createDeleteFiles (user: allow session): ${filePath}`);
             await this.setPermission('createDeleteFiles', 'allow_session');
+          } else {
+            logger.info('PERM', `ALLOWED createDeleteFiles (user: allow once): ${filePath}`);
           }
           return 'allowed';
         }
       }
+      logger.info('PERM', `ALLOWED applyEdit (${editPerm}): ${filePath}`);
       return 'allowed';
     }
 
     // Default 'ask'
+    logger.info('PERM', `ASKING user for applyEdit permission: ${filePath}`);
     const confirmed = await ConfirmationDialogs.confirmFileEdit(filePath, isNewFile);
     if (confirmed === 'deny') {
+      logger.warn('PERM', `DENIED applyEdit — user cancelled: ${filePath}`);
       vscode.window.showInformationMessage(isNewFile ? 'File creation cancelled.' : 'Edit cancelled.');
       return 'denied';
     }
 
     if (confirmed === 'allow_session') {
+      logger.info('PERM', `ALLOWED applyEdit (user: allow session): ${filePath}`);
       await this.setPermission('applyEdit', 'allow_session');
       if (isNewFile) {
         await this.setPermission('createDeleteFiles', 'allow_session');
       }
+    } else {
+      logger.info('PERM', `ALLOWED applyEdit (user: allow once): ${filePath}`);
     }
 
     return 'allowed';

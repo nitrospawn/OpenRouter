@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { PermissionManager } from '../permissions/permissionManager';
+import { logger } from '../logger';
 
 export class DiffPreviewManager {
   private static readonly SCHEME = 'openrouter-diff';
@@ -38,7 +39,7 @@ export class DiffPreviewManager {
     originalContent = originalContent.replace(/\r\n/g, '\n');
     proposedContent = proposedContent.replace(/\r\n/g, '\n');
 
-    const blockRegex = /<<<< SEARCH(?:\n([\s\S]*?))?\n====\n([\s\S]*?)\n>>>>/g;
+    const blockRegex = /<<<< SEARCH[ \t]*(?:\n([\s\S]*?))?\n====(?!=)[ \t]*(?:\n[ \t]*>>>>(?!>)[ \t]*|\n([\s\S]*?)\n>>>>(?!>)[ \t]*)/g;
     let match;
     let resolvedContent = originalContent;
     let hasMatches = false;
@@ -48,26 +49,76 @@ export class DiffPreviewManager {
 
     while ((match = blockRegex.exec(proposedContent)) !== null) {
       hasMatches = true;
-      const searchBlock = match[1] ?? '';
-      const replaceBlock = match[2];
+      let searchBlock = match[1] ?? '';
+      let replaceBlock = match[2] ?? '';
+
+      // Unwrap accidental full code fence wrapper around search block if present
+      const searchFenceMatch = /^```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n```$/.exec(searchBlock.trim());
+      if (searchFenceMatch) {
+        searchBlock = searchFenceMatch[1];
+      }
+
+      // Unwrap accidental code fence wrapper around replace block
+      let cleanReplaceBlock = replaceBlock;
+      if (cleanReplaceBlock) {
+        cleanReplaceBlock = cleanReplaceBlock.replace(/```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n```/g, '$1');
+      }
 
       if (searchBlock === '') {
         if (originalContent.trim() === '') {
-          resolvedContent = replaceBlock;
+          resolvedContent = cleanReplaceBlock;
           continue;
         }
         throw new Error('Empty SEARCH block is not allowed. The AI proposed an invalid edit block.');
       }
 
-      if (!resolvedContent.includes(searchBlock)) {
-        throw new Error(
-          "The AI's proposed edit no longer matches this file's current content — it may have changed since the edit was proposed. Please ask again."
-        );
-      }
+      if (resolvedContent.includes(searchBlock)) {
+        resolvedContent = resolvedContent.replace(searchBlock, cleanReplaceBlock);
+      } else {
+        // Fallback 1: If exact match failed due to trailing whitespace differences on lines
+        const searchLines = searchBlock.split('\n');
+        const resolvedLines = resolvedContent.split('\n');
+        let matchedIndex = -1;
 
-      // Replace only the first occurrence to avoid replacing multiple identical blocks if not intended.
-      // But standard search/replace usually replaces the first exact match it finds.
-      resolvedContent = resolvedContent.replace(searchBlock, replaceBlock);
+        for (let i = 0; i <= resolvedLines.length - searchLines.length; i++) {
+          let allMatch = true;
+          for (let j = 0; j < searchLines.length; j++) {
+            if (resolvedLines[i + j].trimEnd() !== searchLines[j].trimEnd()) {
+              allMatch = false;
+              break;
+            }
+          }
+          if (allMatch) {
+            matchedIndex = i;
+            break;
+          }
+        }
+
+        if (matchedIndex !== -1) {
+          const before = resolvedLines.slice(0, matchedIndex);
+          const after = resolvedLines.slice(matchedIndex + searchLines.length);
+          const replacedLines = cleanReplaceBlock ? cleanReplaceBlock.split('\n') : [];
+          resolvedContent = [...before, ...replacedLines, ...after].join('\n');
+        } else if (
+          (searchBlock.trim() === '```' || searchBlock.trim() === '```markdown') &&
+          !resolvedContent.includes('```')
+        ) {
+          // Fallback 2: EOF Append Heuristic
+          // The model mistook the prompt's markdown code fence wrapper for the file's last line.
+          // Extract appended text, stripping any accidental opening/closing fences in replace block.
+          const appendText = cleanReplaceBlock
+            .replace(/^```[a-zA-Z0-9_-]*\r?\n?/, '')
+            .replace(/\r?\n?```$/, '')
+            .trim();
+          if (appendText.length > 0) {
+            resolvedContent = resolvedContent.trimEnd() + '\n\n' + appendText + '\n';
+          }
+        } else {
+          throw new Error(
+            "The AI's proposed edit no longer matches this file's current content — it may have changed since the edit was proposed. Please ask again."
+          );
+        }
+      }
     }
 
     if (!hasMatches) {
@@ -113,11 +164,13 @@ export class DiffPreviewManager {
       `${this.SCHEME}:${pathKey}?proposed#${fileUri.fsPath} (Proposed)`
     );
 
+    const relPath = vscode.workspace.asRelativePath(fileUri);
+    logger.info('EDIT', `Opened diff preview for ${relPath}`);
     await vscode.commands.executeCommand(
       'vscode.diff',
       originalUri,
       proposedUri,
-      `Diff: ${vscode.workspace.asRelativePath(fileUri)} (Current ↔ OpenRouter)`
+      `Diff: ${relPath} (Current ↔ OpenRouter)`
     );
   }
 
@@ -163,6 +216,17 @@ export class DiffPreviewManager {
       return false;
     }
 
+    const relPath = vscode.workspace.asRelativePath(fileUri);
+
+    // Idempotency guard: if the file already exists and its current content matches
+    // the resolved content, skip writing to disk to avoid duplicate appends.
+    const normalizedOriginal = originalContent.replace(/\r\n/g, '\n');
+    const normalizedResolved = resolvedContent.replace(/\r\n/g, '\n');
+    if (fileExists && normalizedOriginal === normalizedResolved) {
+      logger.info('EDIT', `Applied edit successfully to ${relPath} (content already matches, no-op)`);
+      return true;
+    }
+
     const edit = new vscode.WorkspaceEdit();
 
     if (!fileExists) {
@@ -177,9 +241,25 @@ export class DiffPreviewManager {
       edit.replace(fileUri, fullRange, resolvedContent);
     }
 
+    logger.info('FILE', `Writing to file: ${relPath}${!fileExists ? ' (creating new file)' : ''}`);
     const success = await vscode.workspace.applyEdit(edit);
     if (!success) {
-      vscode.window.showErrorMessage(`Failed to apply edit to ${vscode.workspace.asRelativePath(fileUri)}`);
+      logger.error('EDIT', `Failed to apply edit to ${relPath}`);
+      vscode.window.showErrorMessage(`Failed to apply edit to ${relPath}`);
+    } else {
+      logger.info('EDIT', `Applied edit successfully to ${relPath}${!fileExists ? ' (created new file)' : ''}`);
+      try {
+        const doc = await vscode.workspace.openTextDocument(fileUri);
+        if (typeof doc.save === 'function') {
+          await doc.save();
+        }
+        // If file was newly created, automatically open it in an independent editor tab without stealing chat focus
+        if (!fileExists) {
+          await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true });
+        }
+      } catch {
+        // non-fatal
+      }
     }
 
     return success;
