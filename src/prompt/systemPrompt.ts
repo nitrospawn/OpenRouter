@@ -50,6 +50,7 @@ export interface SystemPromptContext {
     shell?: string;
   };
   reasoningEffort?: 'low' | 'medium' | 'high';
+  recentActivities?: string;
 }
 
 export function buildSystemPrompt(context: SystemPromptContext = {}): string {
@@ -288,6 +289,10 @@ Phase 4: Code Verification Before Declaring Completion
   Running test commands (e.g. \`\`\`bash\nnpm test\n\`\`\`) is a terminal action and MUST go through the user's explicit confirmation/permission flow. Propose test commands as standard bash blocks so the user can review and approve execution. Never treat test runs as silent internal actions.
 - Terminal Output Capture:
   When you propose a terminal command and it is executed, the stdout/stderr output is captured and fed back to you in the "Recent Terminal Outputs" section below. This allows you to see the real execution results. Do NOT assume you cannot see command outputs, and do NOT ask the user to paste the output if it is already provided below.
+- Efficient File Inspection Guidance:
+  When you need to read or inspect existing files in the workspace:
+  - If a file is large (e.g. over 300 lines), prefer targeted inspections (e.g. line-range queries, searching for specific methods, or checking symbol outlines) rather than printing entire multi-thousand-line files, to keep response speed fast and context focused.
+  - You retain full freedom to execute shell utilities (type, cat, Get-Content, grep, findstr) whenever needed to investigate problems.
 - Honest reporting on verification failure:
   If verification reveals the change did not fully fix the issue or introduced a regression, state this clearly and either propose a follow-up fix or ask for guidance. Never declare success on an unverified or broken change.
 
@@ -348,6 +353,12 @@ new code
 - NEVER wrap code or comments in fenced code blocks (e.g. \`\`\`text ... \`\`\` or \`\`\`ts) inside the SEARCH or REPLACE block. Emitting internal triple backticks inside an edit block will corrupt the file edit.
 - All code fences and markdown language tags are strictly forbidden inside SEARCH and REPLACE blocks (unless the target file is itself a markdown file that literally requires markdown code fences in its body).
 
+**CRITICAL RULE FOR NEW FILES & CONSOLIDATED EDITS:**
+- To create a brand new file, ALWAYS use \`\`\`create_file:path/to/file.ext. Never emit \`\`\`edit_file with an empty SEARCH block for a file that does not yet exist.
+- When modifying a file, emit EXACTLY ONE \`\`\`edit_file:path/to/file.ext block per file in your response. NEVER emit multiple separate \`\`\`edit_file blocks for the same file in the same turn.
+- Inside that single \`\`\`edit_file block, consolidate all changes with sequential SEARCH/REPLACE sections in top-to-bottom order.
+- If more than 30% of the file is being modified or refactored, do NOT use fragmented SEARCH/REPLACE blocks — provide the full new content directly without SEARCH/REPLACE markers to guarantee flawless application.
+
 **CRITICAL RULE FOR APPENDING / ADDING CONTENT & EMPTY SEARCH BLOCKS:**
 - An empty SEARCH block (where nothing is between \`<<<< SEARCH\` and \`====\`) is ONLY valid when the target file is genuinely empty or newly created (0 bytes / no existing lines).
 - Once a file has ANY existing content (even a single line), an empty SEARCH block is STRICTLY FORBIDDEN and will fail with "Empty SEARCH block is not allowed".
@@ -388,7 +399,8 @@ If you absolutely must replace the entire file, you may omit the SEARCH/REPLACE 
 \`\`\`${isWindows ? (shell.toLowerCase().includes('powershell') || shell.toLowerCase().includes('pwsh') ? 'powershell' : 'cmd') : 'bash'}
 [command]
 \`\`\`
-(Only suggest a terminal command when the user explicitly asks to run a command or when executing operations like installing packages, compiling, or running tests. Always tag the code block with the appropriate shell language tag: \`\`\`cmd, \`\`\`powershell, or \`\`\`bash.)
+(Only suggest a terminal command when the user explicitly asks to run a command or when executing operations like installing packages, compiling, or running tests. Always tag the code block with the appropriate shell language tag: \`\`\`cmd, \`\`\`powershell, or \`\`\`bash.
+CRITICAL EXCEPTION: If the user states they will run commands themselves, asks you not to run commands, or says "no need to retry/run", NEVER emit executable \`\`\`cmd, \`\`\`powershell, or \`\`\`bash code fences (use inline \`code\` or \`\`\`text instead) so the extension does not auto-execute them.)
 `;
 
   if (context.activeFile) {
@@ -465,6 +477,10 @@ Permission Constraint: Terminal Commands are DENIED
 The user has configured terminal command permissions to "DENIED".
 - Terminal commands will NOT be executed automatically.
 - NEVER claim that you ran or executed a command.`;
+  }
+
+  if (context.recentActivities) {
+    prompt += context.recentActivities;
   }
 
   prompt += '\nRespond helpfully, directly, and concisely.';

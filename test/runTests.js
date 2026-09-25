@@ -45,6 +45,7 @@ async function run() {
       'test/executionSelfHealingAndContinuation.test.ts',
       'test/commandClassifier.test.ts',
       'test/fileMutationGuardAndTerminalDropdown.test.ts',
+      'test/memoryManifest.test.ts',
     ],
     bundle: true,
     outdir: 'dist/test',

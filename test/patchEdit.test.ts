@@ -415,4 +415,62 @@ function step2() { return 200; }
   assert.ok(!resolved.includes('deadMethod'));
 });
 
+test('TargetedEdit: successfully chains multiple proposed blocks sequentially against original content', () => {
+  const original = `import { A } from './a';\n\nexport function doSomething() {\n  return 1;\n}\n\nexport function doAnother() {\n  return 2;\n}\n`;
+
+  const block1 = `<<<< SEARCH
+export function doSomething() {
+  return 1;
+}
+====
+export function doSomething() {
+  return 10;
+}
+>>>>`;
+
+  const block2 = `<<<< SEARCH
+export function doAnother() {
+  return 2;
+}
+====
+export function doAnother() {
+  return 20;
+}
+>>>>`;
+
+  const chained = DiffPreviewManager.resolveMultipleProposedBlocks(original, [block1, block2]);
+  assert.ok(chained.includes('return 10;'));
+  assert.ok(chained.includes('return 20;'));
+  assert.ok(!chained.includes('return 1;'));
+  assert.ok(!chained.includes('return 2;'));
+});
+
+test('TargetedEdit: empty SEARCH block against an empty file succeeds as new file content', () => {
+  const original = '';
+  const proposed = `<<<< SEARCH
+====
+export const config = { port: 3000 };
+>>>>`;
+
+  const resolved = DiffPreviewManager.resolveProposedContent(original, proposed);
+  assert.strictEqual(resolved, 'export const config = { port: 3000 };');
+});
+
+test('TargetedEdit: empty SEARCH block against a non-empty file throws descriptive error', () => {
+  const original = 'const existing = 1;\n';
+  const proposed = `<<<< SEARCH
+====
+const appended = 2;
+>>>>`;
+
+  assert.throws(
+    () => {
+      DiffPreviewManager.resolveProposedContent(original, proposed);
+    },
+    (err: any) => {
+      return err.message.includes('Empty SEARCH block is not allowed');
+    }
+  );
+});
+
 

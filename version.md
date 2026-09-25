@@ -4,6 +4,64 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-09-25
+
+### Fixed
+- **Process Cancellation & Aggressive Child Termination:**
+  - Upgraded process termination on cancellation or timeout: uses non-blocking `cp.spawn('taskkill', ['/pid', pid, '/T', '/F'])` on Windows to immediately destroy the entire child process tree.
+  - Added daemon cleanup for background compilation processes (e.g. running `gradlew.bat --stop`) so orphan `java.exe` instances do not lock workspace files.
+- **Intent-Based Terminal Auto-Run Suppression:**
+  - Added user intent detection in `panelProvider.ts`: if the user explicitly asks to run commands manually or asks not to retry (e.g. *"I will run it by myself"*, *"don't run"*), automatic execution of side-effecting terminal blocks is suppressed for that turn.
+  - Interactive terminal cards remain visible in chat so the user can execute them with a single click if desired.
+- **Normalized Command Similarity in Self-Healing Retry:**
+  - Upgraded loop detection to compare normalized command signatures (executable + primary action) rather than strict exact string matches. Prevents models from repeating failing operations with superficial flag variations when no workspace files were edited.
+- **Consolidated Per-File Edit Cards & UI Grouping:**
+  - Multiple edit blocks proposing changes to the same file within a single turn are now grouped under a single card with an aggregated changes counter (`data-file-key`), preventing fragmented UI walls of cards.
+- **Apply as User Confirmation Semantics:**
+  - Clicking Apply/Accept serves as user confirmation to transition UI state from `⏳ Pending` to `✓ Applied` without executing redundant duplicate disk writes.
+- **Reject Rollback via Checkpoints:**
+  - Clicking Reject rolls back file modifications on disk via `checkpointManager.revertCheckpoint()` and marks the activity manifest log as reverted.
+- **SEARCH/REPLACE Anchor Matching Resilience:**
+  - Added indentation/whitespace tolerance fallback in `DiffPreviewManager.resolveProposedContent` to prevent match failures on minor formatting differences.
+  - Enhanced system prompt with single-block emission rules and full-file replacement recommendations when modifying >30% of a file.
+
+---
+
+## [0.4.4] - 2026-09-24
+
+### Added
+- **Model Memory (Persistent Cross-Session Activity Manifest):**
+  - Added [MemoryManifest](file:///c:/Users/HP/Videos/Qubators/MVP/Openrouter%20code/src/memory/memoryManifest.ts) managing `.openrouter/activity_log.md` to record high-level tasks across sessions.
+  - Automatically captures tasks with `IN PROGRESS` status as soon as edits touch disk, transitioning to `COMPLETED` when walkthroughs are generated.
+  - Synchronized with shadow-git undo: clicking Undo marks entries as `~~[Task Summary]~~ [REVERTED by user]`, preventing cross-session hallucinations of undone code.
+  - Auto-injects the most recent active tasks into new chat sessions under `<recent_workspace_activities>` with low token overhead (~150-250 tokens).
+  - Ensured `.openrouter/` is cleanly ignored in `.gitignore`.
+
+### Fixed
+- **Non-Blocking Terminal Execution & Batch Continuation:**
+  - Resolved freeze caused when read-only inspection commands (e.g. `type`, `cat`) failed with exit code 1. Replaced halting `break` with `continue`, ensuring all commands in a batch execute.
+  - Added automated feedback loop that captures both successful and failing inspection command outputs and returns them to the model in an auto-continuation turn.
+  - Capped terminal outputs at 3,000 characters to prevent context spikes while maintaining full model visibility.
+  - Added system prompt guidance advising efficient file inspection practices while preserving complete model autonomy.
+
+---
+
+## [0.4.3] - 2026-09-24
+
+### Fixed
+- **Multi-Block Edit Chaining Per File (Strategy 1):**
+  - Grouped all proposed edit blocks for the same file in a turn so that they resolve sequentially in memory against the file's original state before being applied to disk atomically in a single write operation.
+  - Resolved `✗ Failed to apply` errors in "Ask before edit" mode where applying edit block 1 invalidated the `<<<< SEARCH` anchors of subsequent blocks for that file.
+  - Updated both streaming auto-execution and bulk `ACCEPT_ALL_EDITS` to resolve chained blocks sequentially and emit unified status updates for each edit proposal.
+- **Relaxed Empty SEARCH Block on New/Empty Files:**
+  - Allowed empty `SEARCH` blocks when the target file is empty (0 bytes) or only whitespace, preventing false "Empty SEARCH block is not allowed" errors when creating new files with `edit_file:path`.
+- **Self-Healing Duplicate Elimination:**
+  - Enhanced the self-healing retry prompt to supply the real current file content and explicitly forbid re-declaring methods, classes, or imports that already landed in the file.
+- **System Prompt Refinements:**
+  - Added strict guidance instructing models to prefer `create_file:path` for brand-new files and consolidate edits to the same file into a single block.
+
+---
+
 ## [0.4.2] - 2026-09-24
 
 ### Added

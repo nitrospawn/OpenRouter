@@ -4,3 +4,4 @@ dist/
 *.vsix
 .env
 chat_history.json
+.openrouter/

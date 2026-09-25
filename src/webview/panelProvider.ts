@@ -22,6 +22,7 @@ import { logger } from '../logger';
 import { UsageStore } from '../usage/usageStore';
 import { PricingCalculator } from '../api/pricing';
 import { ProjectResolver } from '../usage/projectResolver';
+import { MemoryManifest } from '../memory/memoryManifest';
 import { buildSystemPrompt, FileBatchMetadata } from '../prompt/systemPrompt';
 import { ChunkManager } from '../editor/chunkManager';
 import { extractArtifacts } from '../prompt/responseParser';
@@ -777,36 +778,75 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               }
             }
 
-            // Step 3: Apply each edit sequentially with skipPermissionCheck = true
+            // Step 3: Group edits by file to support multi-block edits per file.
+            // If the model produced multiple blocks for the same file, chain them sequentially
+            // against the file's original content in memory, and apply the final result once.
+            const editsByFile = new Map<string, typeof resolvedEdits>();
             for (const item of resolvedEdits) {
-              logger.info('USER', `Applying bulk edit to: ${item.relativePath}`);
-              logger.info('FILE', `Writing to file: ${item.relativePath}`);
+              const key = item.fileUri.fsPath;
+              const list = editsByFile.get(key) || [];
+              list.push(item);
+              editsByFile.set(key, list);
+            }
+
+            for (const [_, fileGroup] of editsByFile) {
+              const firstItem = fileGroup[0];
+              logger.info('USER', `Applying bulk edit to: ${firstItem.relativePath} (${fileGroup.length} block${fileGroup.length > 1 ? 's' : ''})`);
+              logger.info('FILE', `Writing to file: ${firstItem.relativePath}`);
+
               let origContent = '';
               try {
-                const fileData = await vscode.workspace.fs.readFile(item.fileUri);
+                const fileData = await vscode.workspace.fs.readFile(firstItem.fileUri);
                 origContent = new TextDecoder('utf-8').decode(fileData);
               } catch {
-                // ignore
+                // ignore if new file
               }
 
-              const success = await DiffPreviewManager.applyEdit(
-                item.fileUri,
-                item.edit.newContent,
-                this._permissionManager,
-                true
-              );
+              let finalResolved: string;
+              let resolveFailed = false;
+              let resolveError = '';
+
+              try {
+                if (fileGroup.length === 1) {
+                  finalResolved = DiffPreviewManager.resolveProposedContent(origContent, firstItem.edit.newContent);
+                } else {
+                  const blocks = fileGroup.map((g) => g.edit.newContent);
+                  finalResolved = DiffPreviewManager.resolveMultipleProposedBlocks(origContent, blocks);
+                }
+              } catch (err: any) {
+                resolveFailed = true;
+                resolveError = err.message || 'Failed to resolve proposed content';
+                finalResolved = firstItem.edit.newContent;
+              }
+
+              let success = false;
+              if (!resolveFailed) {
+                success = await DiffPreviewManager.applyEdit(
+                  firstItem.fileUri,
+                  firstItem.edit.newContent,
+                  this._permissionManager,
+                  true,
+                  finalResolved
+                );
+              } else {
+                vscode.window.showErrorMessage(resolveError);
+              }
 
               if (success) {
-                this._trackAppliedEdit(item.edit.filePath, checkpointId, origContent, item.edit.editId);
+                for (const g of fileGroup) {
+                  this._trackAppliedEdit(g.edit.filePath, checkpointId, origContent, g.edit.editId);
+                }
               }
 
-              this._postMessage({
-                type: 'EDIT_APPLIED',
-                editId: item.edit.editId,
-                success,
-                checkpointId, // All edits share this common checkpointId for unified per-turn undo
-                filePath: item.edit.filePath,
-              });
+              for (const g of fileGroup) {
+                this._postMessage({
+                  type: 'EDIT_APPLIED',
+                  editId: g.edit.editId,
+                  success,
+                  checkpointId, // All edits share this common checkpointId for unified per-turn undo
+                  filePath: g.edit.filePath,
+                });
+              }
             }
 
             // Step 4: Tag the current turn with the unified checkpoint
@@ -985,7 +1025,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             `Undo turn completed: reverted ${targetFiles.length} file(s) to checkpoint ${checkpointId.substring(0, 7)}`
           );
 
-          // 5. Only NOW truncate historyStore (removes data.messageId itself and any subsequent messages)
+          // 5. Update MemoryManifest to mark task as reverted
+          if (checkpointId) {
+            try {
+              await MemoryManifest.markReverted(checkpointId);
+            } catch {
+              // non-fatal
+            }
+          }
+
+          // 6. Only NOW truncate historyStore (removes data.messageId itself and any subsequent messages)
           const truncResult = await this._historyStore.truncateAfter(data.messageId);
 
           // 6. Post success to Webview UI
@@ -2066,6 +2115,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       ? (process.env.ComSpec ? path.basename(process.env.ComSpec) : 'cmd.exe')
       : (process.env.SHELL ? path.basename(process.env.SHELL) : 'bash');
 
+    const recentActivities = await MemoryManifest.formatForPrompt();
+
     const systemPrompt = buildSystemPrompt({
       activeFile: editorCtx.hasContext && (editorCtx.relativePath || editorCtx.isArtifactDocument) ? {
         relativePath: editorCtx.relativePath || '',
@@ -2089,6 +2140,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         platform,
         shell,
       },
+      recentActivities: recentActivities || undefined,
     });
 
     // Phase 7: Secret Scanning & Redaction Pipeline
@@ -2324,6 +2376,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               planDocument,
               this._storageUri
             );
+            // Record planned task in MemoryManifest
+            const taskId = `task-${assistantMessageId}`;
+            await MemoryManifest.recordTask({
+              id: taskId,
+              taskTitle: chatSummary ? chatSummary.slice(0, 80) : 'Implementation Plan',
+              status: 'in_progress',
+              summary: 'Created implementation plan',
+            });
           } catch {
             // non-fatal
           }
@@ -2337,6 +2397,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               walkthroughDocument,
               this._storageUri
             );
+            // Complete task in MemoryManifest
+            const taskId = `task-${assistantMessageId}`;
+            await MemoryManifest.recordTask({
+              id: taskId,
+              taskTitle: chatSummary ? chatSummary.slice(0, 80) : 'Completed implementation task',
+              status: 'completed',
+              summary: chatSummary ? chatSummary.slice(0, 150) : undefined,
+            });
           } catch {
             // non-fatal
           }
@@ -2620,12 +2688,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           statusText: 'Applying file edits...',
         });
       }
+      // Pre-collect and parse all valid edit matches
+      const rawMatches: Array<{ filePath: string; newContent: string; editId: string; editCount: number }> = [];
       let fileMatch;
       let editCount = 0;
       while ((fileMatch = fileActionRegex.exec(content)) !== null) {
-        if (this._activeAbortController?.signal.aborted) {
-          break;
-        }
         let filePath = fileMatch[1].trim();
         if (!filePath.includes('.') && !filePath.includes('/') && !filePath.includes('\\')) {
           continue;
@@ -2643,6 +2710,22 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           ? `${assistantMessageId}-edit-${editCount}`
           : `${Date.now()}-${editCount}`;
 
+        rawMatches.push({ filePath, newContent, editId, editCount });
+      }
+
+      // Group matches by file path so multiple blocks for the same file are resolved sequentially
+      const groupedByFile = new Map<string, typeof rawMatches>();
+      for (const m of rawMatches) {
+        const list = groupedByFile.get(m.filePath) || [];
+        list.push(m);
+        groupedByFile.set(m.filePath, list);
+      }
+
+      for (const [filePath, fileMatches] of groupedByFile) {
+        if (this._activeAbortController?.signal.aborted) {
+          break;
+        }
+
         const fileUri = path.isAbsolute(filePath)
           ? vscode.Uri.file(filePath)
           : vscode.Uri.joinPath(workspaceFolders[0].uri, filePath);
@@ -2655,6 +2738,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         const relativePath = vscode.workspace.asRelativePath(fileUri);
+        const firstMatch = fileMatches[0];
 
         try {
           // Check permission
@@ -2668,7 +2752,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
           if (!permAllowed) {
             const deniedMsg = {
-              id: `${Date.now()}-error-${editCount}`,
+              id: `${Date.now()}-error-${firstMatch.editCount}`,
               role: 'assistant' as const,
               content: `⚠️ Could not auto-apply edit to \`${relativePath}\`: permission denied.`,
               timestamp: Date.now(),
@@ -2680,15 +2764,17 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               type: 'MESSAGE_RECEIVED',
               message: deniedMsg,
             });
-            this._postMessage({
-              type: 'EDIT_APPLIED',
-              editId,
-              success: false,
-            });
+            for (const m of fileMatches) {
+              this._postMessage({
+                type: 'EDIT_APPLIED',
+                editId: m.editId,
+                success: false,
+              });
+            }
             continue;
           }
 
-          // Pre-resolve proposed content to catch malformed SEARCH/REPLACE blocks early with exact error message
+          // Pre-resolve proposed content to catch malformed SEARCH/REPLACE blocks early
           let originalContent = '';
           if (fileExists) {
             try {
@@ -2698,14 +2784,21 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               // ignore
             }
           }
-          DiffPreviewManager.resolveProposedContent(originalContent, newContent);
 
-          // Shadow-git checkpointing applies identically
+          let finalResolved: string;
+          if (fileMatches.length === 1) {
+            finalResolved = DiffPreviewManager.resolveProposedContent(originalContent, firstMatch.newContent);
+          } else {
+            const blocks = fileMatches.map((m) => m.newContent);
+            finalResolved = DiffPreviewManager.resolveMultipleProposedBlocks(originalContent, blocks);
+          }
+
+          // Shadow-git checkpointing
           let checkpointId: string | undefined;
           if (this._checkpointManager) {
             const res = await this._checkpointManager.createCheckpoint(
               [filePath],
-              `Before edit ${editId}`
+              `Before edit ${firstMatch.editId}`
             );
             if (res) {
               checkpointId = res;
@@ -2713,21 +2806,37 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           }
 
           // Apply edit (skipPermissionCheck = true because checked above)
-          logger.info('FILE', `Writing to file: ${filePath}${isAskMode ? ' (optimistic apply)' : ' (auto-apply)'}`);
+          logger.info('FILE', `Writing to file: ${filePath}${isAskMode ? ' (optimistic apply)' : ' (auto-apply)'}${fileMatches.length > 1 ? ` (${fileMatches.length} chained blocks)` : ''}`);
           const success = await DiffPreviewManager.applyEdit(
             fileUri,
-            newContent,
+            firstMatch.newContent,
             this._permissionManager,
-            true
+            true,
+            finalResolved
           );
 
           if (success) {
             successfullyEditedFiles.push(filePath);
-            // Tag turn checkpoint
             if (checkpointId) {
               await this._tagCurrentTurnCheckpoint(checkpointId, [filePath]);
             }
-            this._trackAppliedEdit(filePath, checkpointId, originalContent, editId);
+            for (const m of fileMatches) {
+              this._trackAppliedEdit(filePath, checkpointId, originalContent, m.editId);
+            }
+
+            // Proactively record activity into MemoryManifest
+            try {
+              const taskId = assistantMessageId ? `task-${assistantMessageId}` : `task-${Date.now()}`;
+              await MemoryManifest.recordTask({
+                id: taskId,
+                taskTitle: `Edited ${path.basename(filePath)}`,
+                status: 'in_progress',
+                checkpointId: checkpointId ?? undefined,
+                affectedFiles: successfullyEditedFiles,
+              });
+            } catch {
+              // non-fatal
+            }
 
             // Open edited file into independent editor tab with preserveFocus
             try {
@@ -2740,7 +2849,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             if (isApplyEditAllowed) {
               const fileName = path.basename(filePath);
               const appliedMsg = {
-                id: `${Date.now()}-applied-${editCount}`,
+                id: `${Date.now()}-applied-${firstMatch.editCount}`,
                 role: 'assistant' as const,
                 content: `✓ **Applied:** updated \`${fileName}\``,
                 timestamp: Date.now(),
@@ -2753,13 +2862,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
                 message: appliedMsg,
               });
 
-              this._postMessage({
-                type: 'EDIT_APPLIED',
-                editId,
-                success: true,
-                checkpointId,
-                filePath,
-              });
+              for (const m of fileMatches) {
+                this._postMessage({
+                  type: 'EDIT_APPLIED',
+                  editId: m.editId,
+                  success: true,
+                  checkpointId,
+                  filePath,
+                });
+              }
             } else {
               // In 'Ask' mode: The file is written to disk and checkpointed optimistically.
               // We do NOT send EDIT_APPLIED yet! The UI keeps the card in "Pending" state
@@ -2772,10 +2883,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               filePath,
               relativePath,
               error: 'Edit could not be applied to file',
-              editCount,
+              editCount: firstMatch.editCount,
             });
             const failMsg = {
-              id: `${Date.now()}-fail-${editCount}`,
+              id: `${Date.now()}-fail-${firstMatch.editCount}`,
               role: 'assistant' as const,
               content: `⚠️ Failed to auto-apply edit to \`${relativePath}\`.`,
               timestamp: Date.now(),
@@ -2787,22 +2898,24 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               type: 'MESSAGE_RECEIVED',
               message: failMsg,
             });
-            this._postMessage({
-              type: 'EDIT_APPLIED',
-              editId,
-              success: false,
-            });
+            for (const m of fileMatches) {
+              this._postMessage({
+                type: 'EDIT_APPLIED',
+                editId: m.editId,
+                success: false,
+              });
+            }
           }
         } catch (err: any) {
           failedEdits.push({
             filePath,
             relativePath,
             error: err.message || 'Malformed search/replace block or write error',
-            editCount,
+            editCount: firstMatch.editCount,
           });
           // Malformed search/replace or write error: fail safely with clear chat error message
           const errMsg = {
-            id: `${Date.now()}-fail-${editCount}`,
+            id: `${Date.now()}-fail-${firstMatch.editCount}`,
             role: 'assistant' as const,
             content: `⚠️ Failed to auto-apply edit to \`${relativePath}\`: ${err.message}`,
             timestamp: Date.now(),
@@ -2814,11 +2927,13 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             type: 'MESSAGE_RECEIVED',
             message: errMsg,
           });
-          this._postMessage({
-            type: 'EDIT_APPLIED',
-            editId,
-            success: false,
-          });
+          for (const m of fileMatches) {
+            this._postMessage({
+              type: 'EDIT_APPLIED',
+              editId: m.editId,
+              success: false,
+            });
+          }
         }
       }
     }
@@ -2866,7 +2981,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         ? currentFileContent.substring(0, 5000) + '\n... [truncated]'
         : currentFileContent;
 
-      const retryPrompt = `The proposed edit to \`${firstFailed.relativePath}\` could not be applied.\nReason: ${firstFailed.error}\n\nHere is the current content of \`${firstFailed.relativePath}\`:\n\`\`\`\n${truncatedFile}\n\`\`\`\n\nPlease output a corrected \`\`\`edit_file:${firstFailed.relativePath} block where the <<<< SEARCH block matches the lines from the file above exactly. Continue executing until all tasks and verifications succeed.`;
+      const retryPrompt = `The proposed edit to \`${firstFailed.relativePath}\` could not be applied.\nReason: ${firstFailed.error}\n\nHere is the current real content of \`${firstFailed.relativePath}\`:\n\`\`\`\n${truncatedFile}\n\`\`\`\n\nCRITICAL INSTRUCTIONS FOR CORRECTION:\n1. Inspect the current file content above carefully. Some of your previous changes may ALREADY have been applied.\n2. Do NOT duplicate already-applied code, imports, methods, or classes.\n3. Output a SINGLE consolidated \`\`\`edit_file:${firstFailed.relativePath} block that applies ONLY the missing change, ensuring the <<<< SEARCH block matches the lines from the file above verbatim. If the file should be completely replaced or created, use \`\`\`create_file:${firstFailed.relativePath}.\nContinue executing until all tasks and verifications succeed.`;
 
       await this._handleSendMessage(
         retryPrompt,
@@ -2888,6 +3003,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const runTerminalPerm = this._permissionManager.getPermission('runTerminalCommand');
     const isRunTerminalAllowed = runTerminalPerm === 'allow' || runTerminalPerm === 'allow_session';
     const successfulCommands: Array<{ command: string; output: string }> = [];
+    const executedInspectionCommands: Array<{ command: string; success: boolean; output: string; exitCode: number | null }> = [];
     let executedCommandsSummary: Array<{
       command: string;
       outcome: string;
@@ -2906,6 +3022,24 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         content: summaryContent,
         timestamp: Date.now(),
       };
+      
+      // Proactively record significant terminal actions in MemoryManifest
+      try {
+        const sideEffectingRan = executedCommandsSummary.filter(c => !CommandRunner.isReadOnly(c.command));
+        if (sideEffectingRan.length > 0) {
+          const firstCmd = sideEffectingRan[0];
+          const taskId = assistantMessageId ? `task-${assistantMessageId}-term` : `task-${Date.now()}-term`;
+          await MemoryManifest.recordTask({
+            id: taskId,
+            taskTitle: `Terminal: ${firstCmd.command.slice(0, 60)}`,
+            status: firstCmd.outcome.includes('completed') ? 'completed' : 'in_progress',
+            summary: `${sideEffectingRan.length} command(s) executed ${firstCmd.outcome}`,
+          });
+        }
+      } catch {
+        // non-fatal
+      }
+
       executedCommandsSummary = [];
       if (this._historyStore?.appendMessage) {
         await this._historyStore.appendMessage(termMsg);
@@ -2917,6 +3051,18 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     };
 
     if (runTerminalPerm !== 'deny') {
+      // Check if the user's latest message explicitly asked not to run commands or said they'll run it manually
+      let userRequestedManual = false;
+      if (this._currentTurnUserMessageId && historyForPlanCheck.length > 0) {
+        const lastUserMsg = [...historyForPlanCheck].reverse().find(m => m.role === 'user');
+        if (lastUserMsg?.content) {
+          const userText = lastUserMsg.content.toLowerCase();
+          const forbidsRun = /\b(i will run|i'll run|run (it )?by myself|don'?t run|no need to (re)?try|do not run|stop running|just tell me|only explain)\b/i.test(userText);
+          const explicitlyCommandsExecution = /\b(execute|run (it|this|now|the command))\b/i.test(userText);
+          userRequestedManual = forbidsRun && !explicitlyCommandsExecution;
+        }
+      }
+
       const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
       let match;
       let cmdCount = 0;
@@ -2937,7 +3083,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           const isReadOnlyCmd = CommandRunner.isReadOnly(command);
           // Side-effecting commands require explicit allow/allow_session to auto-run.
           // In 'ask' mode, side-effecting commands render interactive UI cards for user approval.
-          if (!isReadOnlyCmd && !isRunTerminalAllowed) {
+          // Also skip auto-running if user explicitly asked to run by themselves or not to run.
+          if (!isReadOnlyCmd && (!isRunTerminalAllowed || userRequestedManual)) {
             continue;
           }
 
@@ -3101,6 +3248,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             });
           }
 
+          if (isReadOnlyCmd && !result.cancelled) {
+            executedInspectionCommands.push({
+              command,
+              success: result.executed && result.exitCode === 0,
+              output: truncatedSnippet,
+              exitCode: result.exitCode ?? null,
+            });
+          }
+
           // Self-Healing Auto-Retry with Loop Protection (including timeouts)
           const isFailed = (result.executed && result.exitCode !== 0) || (result.timedOut && !result.cancelled);
           if (isFailed && !result.cancelled) {
@@ -3113,14 +3269,24 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
 
             // Safeguard 2: Duplicate failing command detection (infinite loop breaker)
-            // If no files were edited and the identical command failed again, halt
-            if (failedCommands.has(command) && successfullyEditedFiles.length === 0) {
+            // Normalize command to catch flag/argument variations of the same command (e.g. flutter run vs flutter run -d chrome)
+            const normalizeCmdSignature = (cmd: string) => {
+              const cleaned = cmd.toLowerCase().replace(/start\s+\/b\s+cmd\s+\/c\s+/g, '').replace(/["']/g, '').trim();
+              const tokens = cleaned.split(/\s+/).filter(Boolean);
+              // Take base executable and primary verb/subcommand
+              return tokens.slice(0, 3).join(' ');
+            };
+            const cmdSig = normalizeCmdSignature(command);
+            const hasSimilarFailure = Array.from(failedCommands).some(fc => fc === command || normalizeCmdSignature(fc) === cmdSig);
+
+            // If no files were edited and the identical or equivalent command failed again, halt
+            if ((failedCommands.has(command) || hasSimilarFailure) && successfullyEditedFiles.length === 0) {
               await flushExecutedTerminalSummary();
               if (!isReadOnlyCmd) {
                 const loopMsg = {
                   id: `${Date.now()}-term-loop-${cmdCount}`,
                   role: 'assistant' as const,
-                  content: `⚠️ Model proposed identical failing command \`${command}\` without file modifications. Halting self-healing retry to prevent infinite execution.`,
+                  content: `⚠️ Model proposed repeating failing command \`${command}\` without file modifications. Halting self-healing retry to prevent infinite execution.`,
                   timestamp: Date.now(),
                 };
                 if (this._historyStore?.appendMessage) {
@@ -3155,10 +3321,19 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               break;
             }
 
-            // Eligible for self-healing retry only for side-effecting/build/test commands (NOT read-only inspection commands)
-            // If a read-only command (like git log, git status, dir, type, cat) fails, do NOT initiate self-healing or mutate workspace
+            // For read-only inspection commands (like dir, type, cat):
+            // Do NOT initiate side-effecting self-healing or abort the remaining commands.
+            // Continue the loop so other commands in the batch run, and record the failure outcome.
             if (isReadOnlyCmd) {
-              break;
+              executedCommandsSummary.push({
+                command,
+                outcome,
+                exitCode: result.exitCode ?? null,
+                output: truncatedSnippet,
+                timedOut: result.timedOut,
+                cancelled: result.cancelled,
+              });
+              continue;
             }
 
             failedCommands.add(command);
@@ -3248,8 +3423,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const MAX_AUTO_FOLLOWUPS = 10;
 
     // 3. Auto-continue conversation with terminal outputs so the model can complete its response
+    const hasCommandsToReport = successfulCommands.length > 0 || executedInspectionCommands.length > 0;
     if (
-      successfulCommands.length > 0 &&
+      hasCommandsToReport &&
       !this._isUserCancelled &&
       !this._activeAbortController?.signal.aborted
     ) {
@@ -3257,12 +3433,29 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
         const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
 
-        let continuationPrompt = `The following terminal command(s) executed successfully in the user's workspace:\n\n`;
-        for (const item of successfulCommands) {
-          const out = item.output.length > 3000
-            ? item.output.substring(0, 3000) + '\n... [output truncated]'
-            : item.output || '(No output produced)';
-          continuationPrompt += `Command: \`${item.command}\`\nOutput:\n\`\`\`\n${out}\n\`\`\`\n\n`;
+        let continuationPrompt = `The following terminal command(s) were executed in the user's workspace:\n\n`;
+        
+        if (successfulCommands.length > 0) {
+          for (const item of successfulCommands) {
+            const out = item.output.length > 3000
+              ? item.output.substring(0, 3000) + '\n... [output truncated]'
+              : item.output || '(No output produced)';
+            continuationPrompt += `Command: \`${item.command}\`\nOutput:\n\`\`\`\n${out}\n\`\`\`\n\n`;
+          }
+        }
+
+        if (executedInspectionCommands.length > 0) {
+          continuationPrompt += `File/Workspace Inspection Results:\n`;
+          for (const item of executedInspectionCommands) {
+            const out = item.output.length > 3000
+              ? item.output.substring(0, 3000) + '\n... [output truncated]'
+              : item.output || '(No output produced)';
+            if (item.success) {
+              continuationPrompt += `- Command \`${item.command}\` (exit code 0):\n\`\`\`\n${out}\n\`\`\`\n\n`;
+            } else {
+              continuationPrompt += `- Command \`${item.command}\` failed (exit code ${item.exitCode ?? 1}):\n\`\`\`\n${out}\n\`\`\`\n(If path was not found, check the workspace file list or try the correct path).\n\n`;
+            }
+          }
         }
         if (successfullyEditedFiles.length > 0) {
           continuationPrompt += `Applied file edits:\n${successfullyEditedFiles.map((f) => `- \`${f}\``).join('\n')}\n\n`;

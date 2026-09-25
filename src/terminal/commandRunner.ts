@@ -195,12 +195,21 @@ export class CommandRunner {
           logger.warn('TERM', `Command cancelled by user: ${command.substring(0, 60)}`);
           try {
             if (isWin && child.pid) {
-              cp.exec(`taskkill /pid ${child.pid} /T /F`, () => {});
-            } else {
+              // Immediately and forcefully terminate child process and all descendants
+              cp.spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+              // If this was a gradle command, stop the gradle daemon so java.exe doesn't linger
+              if (/\bgradlew(\.bat)?\b/i.test(command) || /\bgradle\b/i.test(command)) {
+                cp.spawn('cmd.exe', ['/c', 'gradlew.bat', '--stop'], { cwd: spawnCwd, windowsHide: true, stdio: 'ignore' });
+              }
+            } else if (child.pid) {
               child.kill('SIGKILL');
             }
           } catch {
-            child.kill();
+            try {
+              child.kill();
+            } catch {
+              // ignore
+            }
           }
           resolve({
             exitCode: null,
@@ -220,12 +229,19 @@ export class CommandRunner {
           logger.warn('TERM', `Command timed out after ${timeoutMs}ms: ${command.substring(0, 60)}`);
           try {
             if (isWin && child.pid) {
-              cp.exec(`taskkill /pid ${child.pid} /T /F`, () => {});
-            } else {
+              cp.spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+              if (/\bgradlew(\.bat)?\b/i.test(command) || /\bgradle\b/i.test(command)) {
+                cp.spawn('cmd.exe', ['/c', 'gradlew.bat', '--stop'], { cwd: spawnCwd, windowsHide: true, stdio: 'ignore' });
+              }
+            } else if (child.pid) {
               child.kill('SIGKILL');
             }
           } catch {
-            child.kill();
+            try {
+              child.kill();
+            } catch {
+              // ignore
+            }
           }
         }, timeoutMs);
       }

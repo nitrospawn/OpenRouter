@@ -69,6 +69,11 @@ export class DiffPreviewManager {
           resolvedContent = cleanReplaceBlock;
           continue;
         }
+        // If file content is empty or only whitespace, treat as valid new content
+        if (resolvedContent.trim() === '') {
+          resolvedContent = cleanReplaceBlock;
+          continue;
+        }
         throw new Error('Empty SEARCH block is not allowed. The AI proposed an invalid edit block.');
       }
 
@@ -99,24 +104,46 @@ export class DiffPreviewManager {
           const after = resolvedLines.slice(matchedIndex + searchLines.length);
           const replacedLines = cleanReplaceBlock ? cleanReplaceBlock.split('\n') : [];
           resolvedContent = [...before, ...replacedLines, ...after].join('\n');
-        } else if (
-          (searchBlock.trim() === '```' || searchBlock.trim() === '```markdown') &&
-          !resolvedContent.includes('```')
-        ) {
-          // Fallback 2: EOF Append Heuristic
-          // The model mistook the prompt's markdown code fence wrapper for the file's last line.
-          // Extract appended text, stripping any accidental opening/closing fences in replace block.
-          const appendText = cleanReplaceBlock
-            .replace(/^```[a-zA-Z0-9_-]*\r?\n?/, '')
-            .replace(/\r?\n?```$/, '')
-            .trim();
-          if (appendText.length > 0) {
-            resolvedContent = resolvedContent.trimEnd() + '\n\n' + appendText + '\n';
-          }
         } else {
-          throw new Error(
-            "The AI's proposed edit no longer matches this file's current content — it may have changed since the edit was proposed. Please ask again."
-          );
+          // Fallback 1b: If leading indentation differs slightly (e.g. 2 spaces vs 4 spaces)
+          let leadingMatchIndex = -1;
+          for (let i = 0; i <= resolvedLines.length - searchLines.length; i++) {
+            let allMatch = true;
+            for (let j = 0; j < searchLines.length; j++) {
+              if (resolvedLines[i + j].trim() !== searchLines[j].trim()) {
+                allMatch = false;
+                break;
+              }
+            }
+            if (allMatch) {
+              leadingMatchIndex = i;
+              break;
+            }
+          }
+
+          if (leadingMatchIndex !== -1) {
+            const before = resolvedLines.slice(0, leadingMatchIndex);
+            const after = resolvedLines.slice(leadingMatchIndex + searchLines.length);
+            const replacedLines = cleanReplaceBlock ? cleanReplaceBlock.split('\n') : [];
+            resolvedContent = [...before, ...replacedLines, ...after].join('\n');
+          } else if (
+            (searchBlock.trim() === '```' || searchBlock.trim() === '```markdown') &&
+            !resolvedContent.includes('```')
+          ) {
+            // Fallback 2: EOF Append Heuristic
+            const appendText = cleanReplaceBlock
+              .replace(/^```[a-zA-Z0-9_-]*\r?\n?/, '')
+              .replace(/\r?\n?```$/, '')
+              .trim();
+            if (appendText.length > 0) {
+              resolvedContent = resolvedContent.trimEnd() + '\n\n' + appendText + '\n';
+            }
+          } else {
+            const previewLines = searchLines.slice(0, 3).map(l => l.trim()).join(' ');
+            throw new Error(
+              `The AI's proposed edit no longer matches this file's current content — proposed SEARCH block ("${previewLines.slice(0, 50)}...") could not be found. Please ask again or specify the section to modify.`
+            );
+          }
         }
       }
     }
@@ -127,6 +154,18 @@ export class DiffPreviewManager {
     }
 
     return resolvedContent;
+  }
+
+  /**
+   * Sequentially resolves multiple proposed contents/blocks for a single file in memory.
+   * Chaining ensures block N+1 is applied cleanly on top of block N.
+   */
+  public static resolveMultipleProposedBlocks(originalContent: string, blocks: string[]): string {
+    let current = originalContent;
+    for (const block of blocks) {
+      current = this.resolveProposedContent(current, block);
+    }
+    return current;
   }
 
   /**
@@ -181,7 +220,8 @@ export class DiffPreviewManager {
     fileUri: vscode.Uri,
     newContent: string,
     permissionManager: PermissionManager,
-    skipPermissionCheck: boolean = false
+    skipPermissionCheck: boolean = false,
+    resolvedOverride?: string
   ): Promise<boolean> {
     let fileExists = true;
     try {
@@ -209,11 +249,15 @@ export class DiffPreviewManager {
     }
 
     let resolvedContent: string;
-    try {
-      resolvedContent = this.resolveProposedContent(originalContent, newContent);
-    } catch (err: any) {
-      vscode.window.showErrorMessage(err.message);
-      return false;
+    if (typeof resolvedOverride === 'string') {
+      resolvedContent = resolvedOverride;
+    } else {
+      try {
+        resolvedContent = this.resolveProposedContent(originalContent, newContent);
+      } catch (err: any) {
+        vscode.window.showErrorMessage(err.message);
+        return false;
+      }
     }
 
     const relPath = vscode.workspace.asRelativePath(fileUri);

@@ -661,6 +661,13 @@ function updateReviewerToggleBtnVisibility(enabled: boolean) {
       }
     }
   }
+  document.querySelectorAll<HTMLElement>('.chat-artifact-review-btn').forEach((btn) => {
+    if (enabled) {
+      btn.classList.remove('hidden');
+    } else {
+      btn.classList.add('hidden');
+    }
+  });
 }
 updateReviewerToggleBtnVisibility(isReviewerEnabled);
 
@@ -2556,14 +2563,46 @@ function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: H
     return;
   }
 
-  // Prevent duplicate cards for the same editId
+  // Prevent duplicate cards for the exact same editId
   if (document.getElementById(`edit-card-${editId}`)) {
+    return;
+  }
+
+  // Consolidate cards: if a card for this file already exists in the same message parentEl,
+  // append content to that card rather than creating a fragmented second card
+  const safeFileKey = edit.filePath.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const existingFileCard = parentEl?.querySelector(`.diff-card[data-file-key="${safeFileKey}"]`) as HTMLElement;
+  if (existingFileCard) {
+    const existingBody = existingFileCard.querySelector('.diff-body');
+    if (existingBody) {
+      const divider = document.createElement('hr');
+      divider.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+      divider.style.margin = '8px 0';
+      existingBody.appendChild(divider);
+      try {
+        const extraBody = document.createElement('div');
+        renderCodeBlock(edit.filePath, edit.newContent, extraBody, document);
+        existingBody.appendChild(extraBody);
+      } catch {
+        const pre = document.createElement('pre');
+        pre.textContent = edit.newContent;
+        existingBody.appendChild(pre);
+      }
+    }
+    const lineCountEl = existingFileCard.querySelector('.diff-line-count');
+    if (lineCountEl) {
+      const matchCount = (parseInt(existingFileCard.getAttribute('data-block-count') || '1', 10) + 1);
+      existingFileCard.setAttribute('data-block-count', String(matchCount));
+      lineCountEl.textContent = `(${matchCount} changes in file)`;
+    }
     return;
   }
 
   const card = document.createElement('div');
   card.className = 'diff-card collapsed';
   card.id = `edit-card-${editId}`;
+  card.setAttribute('data-file-key', safeFileKey);
+  card.setAttribute('data-block-count', '1');
 
   const lines = edit.newContent.split(/\r?\n/).filter((l) => l.trim().length > 0);
   const lineCountText = `${lines.length} line${lines.length === 1 ? '' : 's'} written`;
@@ -3383,7 +3422,7 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
 
       // On plans and walkthroughs, include active "Review" action
       const reviewBtn = document.createElement('button');
-      reviewBtn.className = 'chat-artifact-review-btn';
+      reviewBtn.className = `chat-artifact-review-btn${isReviewerEnabled ? '' : ' hidden'}`;
       reviewBtn.innerHTML = `
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="11" cy="11" r="8"></circle>

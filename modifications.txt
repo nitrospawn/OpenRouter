@@ -255,3 +255,22 @@ Get started
      - Logged on user terminal executions: logger.info('USER', User ran terminal command: );
      - Logged on diff preview: logger.info('USER', User opened diff preview for: );
      - Logged on session & settings actions: model selection, model refresh, new/switch/rename/delete sessions, clear history, and permission toggles.
+
+## Feature Request: Model Memory (Persistent Cross-Session Task Manifest)
+- **Concept & Purpose:**
+  - Maintain a lightweight, persistent activity manifest in the workspace (e.g. .openrouter/activity_log.md or .openrouter/memory.jsonl) that records concise 1-line summaries of high-level tasks completed across chat sessions.
+  - When a new chat session is launched (after clicking + or switching conversations), the system reads the last 10-15 recent entries and injects them under a <recent_workspace_activities> prompt block so the model remembers past implementations without incurring heavy token costs.
+
+- **Key Architectural Requirements:**
+  1. **Task-Level Logging (Not Raw Edits):**
+     - Record at the macro task level (user intent, high-level summary, affected files, checkpoint ID), rather than logging noisy raw character/diff chunks.
+  2. **Undo-Aware Synchronization:**
+     - Each entry is linked to its shadow-git checkpoint.
+     - When a user clicks Undo in the chat or rolls back a turn/bulk edit, the manifest entry is immediately updated/marked as reverted (e.g. ~~[Task Summary]~~ [REVERTED by user]), preventing the model in subsequent sessions from hallucinating that undone code still exists.
+  3. **Stateful Task Lifecycle (Resilience to Interrupted / Dropped Turns):**
+     - To prevent tasks from disappearing if a network timeout occurs, user clicks Stop, or the model quits without outputting a walkthrough:
+       - Tasks begin in an IN PROGRESS state as soon as edits touch disk.
+       - Once completed cleanly, the status transitions to COMPLETED.
+       - If aborted mid-way, the entry remains flagged with its partial progress so a new chat session can recognize the interrupted task and offer to resume or revert it cleanly.
+  4. **Token-Efficient Rolling Window:**
+     - Limit disk storage to the last ~100 entries and only feed the top 10-15 active entries into prompt context (~150-250 tokens total overhead).
