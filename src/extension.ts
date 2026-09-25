@@ -11,7 +11,7 @@ import { UsageStore } from './usage/usageStore';
 
 export function activate(context: vscode.ExtensionContext) {
   // Initialize diagnostic logger first so all subsequent code can use it
-  logger.initialize(context.globalStorageUri);
+  logger.initialize(context.storageUri, context.globalStorageUri);
   logger.info('EXT', 'Extension activating');
 
   const secretStore = new SecretStore(context);

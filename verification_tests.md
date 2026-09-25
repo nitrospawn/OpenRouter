@@ -14,7 +14,8 @@ This document provides an end-to-end, rigorous manual and automated test matrix 
 7. [Persistent Model Memory (Activity Manifest)](#7-persistent-model-memory-activity-manifest)
 8. [Context Assembling & Token Budgeting](#8-context-assembling--token-budgeting)
 9. [Usage Tracking, Cost & Analytics](#9-usage-tracking-cost--analytics)
-10. [End-to-End Regression Scenarios](#10-end-to-end-regression-scenarios)
+10. [Diagnostic Logging & Multi-Workspace Isolation](#10-diagnostic-logging--multi-workspace-isolation)
+11. [End-to-End Regression Scenarios](#11-end-to-end-regression-scenarios)
 
 ---
 
@@ -373,7 +374,40 @@ This document provides an end-to-end, rigorous manual and automated test matrix 
 
 ---
 
-## 10. End-to-End Regression Scenarios
+## 10. Diagnostic Logging & Multi-Workspace Isolation
+
+### TC-LOG-01: Per-Workspace Storage & No-Crosstalk Verification
+* **Goal:** Ensure each opened workspace logs exclusively to its own `current.log` file in `storageUri` and does not inherit or leak logs to other projects.
+* **Test Steps:**
+  1. Open Project A in VS Code and trigger an action (e.g. check version or run a prompt).
+  2. Open Project B in a separate VS Code window and perform a different action.
+  3. Run `openrouter.openDiagnosticLog` ("View logs") in both windows.
+* **Expected Result:**
+  - Project A's log file resides in Project A's workspace storage and contains only events from Project A.
+  - Project B's log file resides in Project B's workspace storage and contains only events from Project B.
+  - No logs from Project A appear in Project B.
+  - In-memory session buffers are completely isolated.
+
+### TC-LOG-02: Calendar Date-Time Timestamp Formatting (`YYYY-MM-DD HH:MM:SS`)
+* **Goal:** Verify log lines contain full calendar date and time for unambiguous multi-day auditability.
+* **Test Steps:**
+  1. Trigger any log event (e.g. model chat, diff preview, or settings view).
+  2. Inspect the generated lines in `current.log`.
+* **Expected Result:**
+  - Every line starts with `[YYYY-MM-DD HH:MM:SS]` (e.g. `[2026-09-25 21:00:00]`).
+  - Session restart writes a clean resume banner with timestamp and workspace label.
+
+### TC-LOG-03: Safety from Git & Document Operations
+* **Goal:** Verify logs remain intact after `git clean`, `git reset`, undo actions, or branch switching.
+* **Test Steps:**
+  1. Run `git reset --hard` or perform shadow-git undo operations in the project.
+  2. Inspect the diagnostic log via "View logs".
+* **Expected Result:**
+  - Log entries are fully preserved because the log directory resides in VS Code internal storage outside the workspace repository.
+
+---
+
+## 11. End-to-End Regression Scenarios
 
 ### TC-E2E-01: Multi-Phase Mobile/Web App Build
 * **Goal:** Validate end-to-end multi-phase project generation from scratch to verified build.

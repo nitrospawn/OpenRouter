@@ -1,7 +1,7 @@
 # PRD: OpenRouter — Product Requirements Document (PRD)
 
 **Status:** Living Specification  
-**Version:** 0.4.6  
+**Version:** 0.4.7  
 **Name:** OpenRouter
 
 ## 1. Overview

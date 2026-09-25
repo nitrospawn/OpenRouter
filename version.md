@@ -4,6 +4,25 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-09-25
+
+### Added
+- **Workspace-Isolated Diagnostic Logging:**
+  - Upgraded diagnostic logger to write logs per-workspace inside `context.storageUri/logs/current.log` (falling back to `context.globalStorageUri/logs/` when running in standalone file mode).
+  - Guarantees zero crosstalk between projects: opening, switching, or running multiple workspaces simultaneously preserves independent logs per workspace.
+  - Reset in-memory session buffer and start time upon workspace activation, preventing past workspace sessions from contaminating live session views.
+  - Added clean session separator headers (`=== Session Resumed [Date/Time] [Workspace: name] ===`) when reopening an existing project.
+  - 2MB log rollover: automatically rolls `current.log` to `previous.log` upon hitting 2MB, preventing unconstrained disk growth while maintaining continuous recent history.
+- **Full Date & Time Timestamps (`YYYY-MM-DD HH:MM:SS`):**
+  - Enhanced all log line stamps from time-only (`[HH:MM:SS]`) to unambiguous standard calendar timestamps (`[YYYY-MM-DD HH:MM:SS]`), ensuring full multi-day auditability.
+- **Enhanced Diagnostic Report & "View logs" Command:**
+  - `openrouter.openDiagnosticLog` ("View logs" button in settings) directly opens the active workspace's `current.log`.
+  - `openrouter.copyDiagnosticLogs` includes the workspace name and full calendar timestamp in the export header.
+- **Complete Storage Isolation from Git & Undo:**
+  - Stored inside VS Code's internal extension storage (`AppData/Roaming/Code/User/workspaceStorage/...`), completely outside workspace repositories. Immune to `git clean`, `git reset`, branch changes, shadow-git commits, or file undos.
+
+---
+
 ## [0.4.6] - 2026-09-25
 
 ### Added
