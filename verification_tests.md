@@ -66,13 +66,19 @@ This document provides an end-to-end, rigorous manual and automated test matrix 
   - UI returns to ready state with input enabled.
   - Tokens and cost up to cancellation are accurately tracked.
 
-### TC-CHAT-03: Multi-Turn Conversation Context
-* **Goal:** Verify conversational recall across turns in the same session.
+### TC-CHAT-04: Single-Line Stream Error Card & 30-Second Auto-Retry Countdown
+* **Goal:** Verify that stream stalls and timeout errors render as a single-line status bar with an automatic 30s countdown, immediate retry button, and dismiss action.
 * **Test Steps:**
-  1. Turn 1: *"Let's build a service named AuthService in auth.ts."*
-  2. Turn 2: *"Add a method to validate tokens."*
+  1. Trigger a stream stall (e.g. model provider does not send data for 45s).
+  2. Observe the in-chat error card appearance in the message stream.
+  3. Verify it renders on a single line: `⚠️ Stream stalled (no data for 45s) | [🔁 Retry Now (30s)] [✕ Dismiss] • Auto-retrying in 30s...`.
+  4. Test countdown: observe seconds ticking down every second.
+  5. Test `[🔁 Retry Now]`: clicking immediately cancels the timer and fires a clean retry request.
+  6. Test `[✕ Dismiss]`: clicking immediately halts the timer and removes the card.
+  7. Test focus disarm: focusing the prompt textarea stops the countdown so typing is not interrupted.
 * **Expected Result:**
-  - Turn 2 correctly references `AuthService` and `auth.ts` without re-prompting.
+  - Entire error status and action controls stay on 1 single line without vertical header clutter.
+  - When countdown reaches 0s, cleanly retries without duplicate text or scrambled tokens.
 
 ---
 
@@ -168,6 +174,56 @@ This document provides an end-to-end, rigorous manual and automated test matrix 
 * **Expected Result:**
   - Main Chat preserves context of the review and writes the necessary fix code.
 
+### TC-REV-05: Pinned Context File Configuration & Path Boundary Enforcement
+* **Goal:** Verify that a workspace file can be pinned in settings, bounds are checked, and path traversal is rejected.
+* **Test Steps:**
+  1. Open Settings -> **Reviewer Model (Per-Workspace)**.
+  2. In **📌 Pinned Context File**, click **Browse...** and select a file within the workspace (e.g. `docs/architecture.md`).
+  3. Verify the relative path is displayed and the **Clear** button appears.
+  4. Attempt to manually enter a path outside the workspace (e.g. `../external.md` or absolute path outside project root).
+* **Expected Result:**
+  - Valid workspace files are stored cleanly under `openrouter.reviewer.pinnedContextFile`.
+  - Outside paths or traversal attempts trigger error notification and are rejected from settings.
+  - Reviewer header displays `📌 Pinned Context: docs/architecture.md`.
+
+### TC-REV-06: Hierarchical System Context & Reviewer Execution with Pinned Context
+* **Goal:** Ensure plan review cleanly combines Reviewer System Prompt, pinned file contents, and plan document without leaking into the user chat bubble.
+* **Test Steps:**
+  1. Have a valid workspace file pinned (e.g. `spec.md`).
+  2. Generate an implementation plan in Main Chat.
+  3. Click **Review** on the plan card.
+* **Expected Result:**
+  - Reviewer view opens with user turn reading `"Review this plan"` accompanied by the `[📄 Plan docs]` attachment card.
+  - Model system prompt receives the Reviewer System Prompt followed by `# Pinned Workspace Context (spec.md):` with full file contents, followed by `# Document Under Review (Plan docs):`.
+  - Reviewer stream completion logs in diagnostic logger (`[REVIEW  ]`) with token breakdown (`artifactTokens` and `pinnedContextTokens`).
+  - Clicking the context reset button (`🔄`) clears chat turns but **preserves** the pinned context file setting.
+
+### TC-REV-07: In-Place Retry & Downstream Truncation with Generation Lock
+* **Goal:** Ensure retrying an assistant response cleanly replaces the rejected turn in-place, truncates subsequent turns after confirmation, and locks during active streaming.
+* **Test Steps:**
+  1. In the Reviewer view, conduct a 3-turn conversation (User -> Assistant -> User 2 -> Assistant 2).
+  2. Attempt to click `🔄 Retry` on Assistant 1 while Assistant 2 is actively streaming.
+  3. Observe that `🔄 Retry` and `✏️ Edit` buttons are disabled (`disabled = true`, pointer-events none) during active streaming; only the `Stop` button works.
+  4. Wait for generation to finish, then click `🔄 Retry` on Assistant 1.
+  5. Confirm the warning modal informing that subsequent turns will be discarded.
+* **Expected Result:**
+  - Downstream turns (User 2 and Assistant 2) are removed from the view and persistent history store.
+  - Assistant 1 bubble content is reset and immediately streamed with a fresh response in-place (no stacking).
+  - Diagnostic logger outputs `'[REVIEW  ] Retrying reviewer turn...'`.
+
+### TC-REV-08: Inline Edit User Prompt with Attachment Preservation & Rewind
+* **Goal:** Ensure user prompt can be edited inline, attached documents/plans are strictly preserved, downstream turns are rewound, and actions are locked during generation.
+* **Test Steps:**
+  1. Review a plan (User 1 has attached `[📄 Plan docs]`), followed by assistant review and a follow-up question (User 2 -> Assistant 2).
+  2. Hover over User 1 prompt and click `✏️ Edit`.
+  3. Observe inline textarea with `Save & Submit` and `Cancel` buttons, alongside a warning that subsequent turns will be discarded.
+  4. Edit prompt text (e.g. *"Focus specifically on database migration risk"*), then press `Ctrl+Enter` or click `Save & Submit`.
+* **Expected Result:**
+  - User 1 bubble updates text to the new content while strictly keeping the `[📄 Plan docs]` attachment card.
+  - Downstream turns (User 2, Assistant 2) are truncated from the UI and history store.
+  - Assistant 1 is immediately streamed with a fresh review taking the updated prompt and preserved plan into account.
+  - `Edit` and `Retry` buttons are disabled while the new response streams.
+
 ---
 
 ## 5. Terminal Execution & Process Lifecycle Management
@@ -189,13 +245,30 @@ This document provides an end-to-end, rigorous manual and automated test matrix 
   - The process tree is destroyed immediately.
   - Verify Task Manager has no dangling `java.exe` or `node.exe` worker processes locking workspace files.
 
-### TC-TERM-03: Verification Command Confirmation Dialog
-* **Goal:** Ensure sensitive commands require explicit user consent.
+### TC-TERM-03: Sequential Terminal Permission Prompt Bar (`runTerminal = 'ask'`)
+* **Goal:** Ensure terminal commands pause and request explicit user confirmation via the docked permission prompt bar above the input field, executing strictly one command at a time.
 * **Test Steps:**
-  1. Prompt an action that triggers a destructive or environment-altering command (e.g. package install or delete).
+  1. Configure `openrouter.runTerminal` to `'ask'` in Settings.
+  2. Ask assistant to run a command or plan with verification steps.
+  3. Observe the `#pending-terminal-bar` docked directly above the user chat textarea inside the input container.
+  4. Verify the prompt displays the exact command string alongside `✓ Allow` and `✕ Deny` buttons.
+  5. Test `✕ Deny`: command is not executed, the bar dismisses, and the session halts execution cleanly.
+  6. Repeat with `✓ Allow`: command executes, produces output, and only then pauses for the next command if another is queued.
 * **Expected Result:**
-  - Confirmation dialog or inline approval prompt appears.
-  - Command executes only if allowed by user; halts immediately if rejected.
+  - File edit approval pipeline (`#pending-edits-bar`) remains completely untouched and independent.
+  - Commands never auto-execute blindly when configured to `'ask'`.
+  - Execution strictly waits sequentially for user confirmation on each step.
+
+### TC-TERM-04: Batched 1-Line Collapsible Terminal Command Dropdown
+* **Goal:** Verify that assistant messages with multiple terminal commands are grouped into a single 1-line dropdown bar that is collapsed by default.
+* **Test Steps:**
+  1. Prompt an instruction that returns multiple terminal commands (e.g. `npm install` followed by `npm test`).
+  2. Inspect the rendered assistant response in the chat viewport.
+* **Expected Result:**
+  - Multiple command blocks are batched into a single `<details class="terminal-command-batch-details">` container.
+  - Renders as a 1-line summary header: `▶ 💻 2 Terminal Commands... [Expand ▾]`.
+  - The dropdown is **collapsed by default** (`open = false`).
+  - Clicking the summary expands all individual command cards with copy/run actions.
 
 ---
 
@@ -217,6 +290,27 @@ This document provides an end-to-end, rigorous manual and automated test matrix 
 * **Expected Result:**
   - Loop detector identifies matching normalized signature (`executable + action`).
   - Halts after maximum allowed attempts (2 retries) and notifies user.
+
+### TC-HEAL-03: Collapsible Failure Diagnosis & Compact Single-Line Status
+* **Goal:** Ensure intermediate self-healing retries and failure diagnosis prompts do not flood or fill up the conversation viewport.
+* **Test Steps:**
+  1. Trigger a self-healing retry turn (e.g. running a test command that fails).
+  2. Inspect the rendering of `Auto-Healing Diagnosis` and terminal retry notice messages.
+* **Expected Result:**
+  - Terminal retry notices render as sleek single-line status pills without oversized headers.
+  - The `Auto-Healing Diagnosis` card displays a single-line summary with an interactive collapsible dropdown (`<details>`).
+  - The dropdown is **collapsed by default**; clicking it reveals the full error logs, code block, and diagnosis prompt.
+  - Intermediate step notes remain collapsed by default (`open = false`).
+
+### TC-HEAL-04: Results & Walkthrough Doc Persistence on Window Reload
+* **Goal:** Verify that Results docs (`📄 Results docs ready — [view]`) and walkthrough documents created during automated execution are preserved across reloads.
+* **Test Steps:**
+  1. Complete an automated plan implementation that concludes with a walkthrough document (`Results docs ready`).
+  2. Reload VS Code window (`Developer: Reload Window`) or switch chat sessions and switch back.
+* **Expected Result:**
+  - The Results doc card is rendered in the conversation upon reload.
+  - Clicking `View` opens the walkthrough document in the editor.
+  - Clicking `Review` cleanly opens the Reviewer agent with the walkthrough attached.
 
 ---
 

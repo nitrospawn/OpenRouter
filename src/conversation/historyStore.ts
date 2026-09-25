@@ -543,6 +543,34 @@ export class HistoryStore {
     await this._saveReviewerToDisk();
   }
 
+  public async truncateReviewerMessagesAfter(messageId: string): Promise<boolean> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+    const active = this.reviewerSessions.find((s) => s.id === this.activeReviewerSessionId);
+    if (!active) return false;
+    const idx = active.messages.findIndex((m) => m.id === messageId);
+    if (idx === -1) return false;
+    active.messages = active.messages.slice(0, idx + 1);
+    active.updatedAt = Date.now();
+    await this._saveReviewerToDisk();
+    return true;
+  }
+
+  public async updateReviewerMessageContent(messageId: string, newContent: string): Promise<boolean> {
+    if (!this.hasLoadedReviewer) {
+      await this.loadReviewerSessions();
+    }
+    const active = this.reviewerSessions.find((s) => s.id === this.activeReviewerSessionId);
+    if (!active) return false;
+    const msg = active.messages.find((m) => m.id === messageId);
+    if (!msg) return false;
+    msg.content = newContent;
+    active.updatedAt = Date.now();
+    await this._saveReviewerToDisk();
+    return true;
+  }
+
   public async renameReviewerSession(sessionId: string, newTitle: string): Promise<boolean> {
     if (!this.hasLoadedReviewer) {
       await this.loadReviewerSessions();

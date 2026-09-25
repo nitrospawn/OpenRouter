@@ -144,5 +144,15 @@ Provide a constructive, prioritized critique with clear, actionable recommendati
     // Resetting to undefined removes the per-workspace override, reverting to default
     await config.update('reviewer.systemPrompt', undefined, vscode.ConfigurationTarget.Workspace);
   }
+
+  public static getReviewerPinnedContextFile(): string {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    return config.get<string>('reviewer.pinnedContextFile', '');
+  }
+
+  public static async setReviewerPinnedContextFile(filePath: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('reviewer.pinnedContextFile', filePath ? filePath.trim() : undefined, vscode.ConfigurationTarget.Workspace);
+  }
 }
 

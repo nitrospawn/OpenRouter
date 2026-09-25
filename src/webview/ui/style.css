@@ -603,9 +603,87 @@ body {
   text-transform: none;
 }
 
+.message.retry-notice-message {
+  border-left: 3px solid rgba(59, 130, 246, 0.6) !important;
+  background: rgba(59, 130, 246, 0.05) !important;
+  padding: 6px 10px !important;
+  margin: 3px 0 !important;
+  font-size: 11.5px;
+}
+
+.message.retry-notice-message .message-header {
+  display: none !important;
+}
+
 .message.auto-retry-message {
   border-left: 3px solid rgba(234, 179, 8, 0.6) !important;
   background: rgba(234, 179, 8, 0.04);
+  padding: 8px 12px !important;
+  margin: 6px 0 !important;
+}
+
+.auto-retry-details {
+  border: 1px solid rgba(234, 179, 8, 0.25);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.15);
+  overflow: hidden;
+  transition: all 0.15s ease;
+}
+
+.auto-retry-details[open] {
+  border-color: rgba(234, 179, 8, 0.4);
+}
+
+.auto-retry-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--vscode-foreground);
+  background: rgba(234, 179, 8, 0.08);
+}
+
+.auto-retry-summary::-webkit-details-marker {
+  display: none;
+}
+
+.auto-retry-summary-icon {
+  font-size: 10px;
+  transition: transform 0.15s ease;
+  display: inline-block;
+  color: var(--vscode-badge-foreground, #eab308);
+}
+
+.auto-retry-details[open] .auto-retry-summary-icon {
+  transform: rotate(90deg);
+}
+
+.auto-retry-summary-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auto-retry-summary-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(234, 179, 8, 0.18);
+  color: var(--vscode-badge-foreground, #eab308);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.auto-retry-details-body {
+  padding: 10px 12px;
+  border-top: 1px solid rgba(234, 179, 8, 0.15);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .message.terminal-message {
@@ -649,7 +727,8 @@ body {
 .msg-copy-btn,
 .msg-quote-btn,
 .msg-undo-btn,
-.msg-retry-btn {
+.msg-retry-btn,
+.msg-edit-btn {
   background: transparent;
   border: none;
   color: #8b949e;
@@ -668,7 +747,8 @@ body {
 .message:hover .msg-copy-btn,
 .message:hover .msg-quote-btn,
 .message:hover .msg-undo-btn,
-.message:hover .msg-retry-btn {
+.message:hover .msg-retry-btn,
+.message:hover .msg-edit-btn {
   opacity: 0.85;
 }
 
@@ -683,6 +763,19 @@ body {
   opacity: 1;
   color: #e3b341;
   background: rgba(227, 179, 65, 0.1);
+}
+
+.msg-edit-btn:hover {
+  opacity: 1;
+  color: var(--vscode-textLink-foreground, #388bfd);
+  background: rgba(56, 139, 253, 0.1);
+}
+
+.msg-retry-btn:disabled,
+.msg-edit-btn:disabled {
+  opacity: 0.25 !important;
+  cursor: not-allowed !important;
+  pointer-events: none !important;
 }
 
 .msg-undo-btn:hover:not(:disabled) {
@@ -1834,6 +1927,128 @@ body {
   font-size: 11px;
 }
 
+/* Dedicated Pending Terminal Bar (Strict Sequential Approval) */
+.pending-terminal-bar {
+  display: flex;
+  flex-direction: column;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-left: 3px solid #3b82f6;
+  border-radius: 6px;
+  margin-bottom: 6px;
+  overflow: hidden;
+  font-size: 11px;
+}
+
+.pending-terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pending-terminal-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: #60a5fa;
+  min-width: 0;
+  flex: 1;
+}
+
+.pending-terminal-cmd {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--vscode-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.pending-terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* Terminal Command Batch Dropdown */
+.terminal-command-batch-details {
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.15);
+  margin: 6px 0;
+  overflow: hidden;
+  transition: all 0.15s ease;
+}
+
+.terminal-command-batch-details[open] {
+  border-color: rgba(59, 130, 246, 0.45);
+}
+
+.terminal-command-batch-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--vscode-foreground);
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.terminal-command-batch-summary::-webkit-details-marker {
+  display: none;
+}
+
+.terminal-command-batch-arrow {
+  font-size: 10px;
+  transition: transform 0.15s ease;
+  display: inline-block;
+  color: #60a5fa;
+}
+
+.terminal-command-batch-details[open] .terminal-command-batch-arrow {
+  transform: rotate(90deg);
+}
+
+.terminal-command-batch-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11.5px;
+}
+
+.terminal-command-batch-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(59, 130, 246, 0.18);
+  color: #60a5fa;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.terminal-command-batch-body {
+  padding: 8px 10px;
+  border-top: 1px solid rgba(59, 130, 246, 0.15);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .pending-edits-header {
   display: flex;
   align-items: center;
@@ -2012,7 +2227,7 @@ body {
   color: #e3b341;
 }
 
-/* In-Chat Stream Error Card & Retry Control */
+/* In-Chat Stream Error Card & Single-Line Auto-Retry */
 .stream-error-card {
   margin-top: 8px;
   background: rgba(248, 81, 73, 0.08);
@@ -2023,6 +2238,102 @@ body {
   flex-direction: column;
   gap: 6px;
   animation: fadeIn 0.15s ease-in;
+}
+
+.stream-error-card.single-line {
+  padding: 5px 10px;
+  border-radius: 5px;
+  background: rgba(248, 81, 73, 0.07);
+  border: 1px solid rgba(248, 81, 73, 0.25);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+.stream-error-content-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.3;
+  flex-wrap: wrap;
+}
+
+.stream-error-icon {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.stream-error-inline-msg {
+  color: var(--vscode-foreground, #cccccc);
+  opacity: 0.92;
+  font-weight: 500;
+  max-width: 380px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stream-error-divider {
+  color: rgba(255, 255, 255, 0.2);
+  user-select: none;
+  font-size: 11px;
+}
+
+.stream-error-actions-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-retry-inline {
+  background: #238636;
+  color: #ffffff;
+  border: 1px solid rgba(240, 246, 252, 0.15);
+  border-radius: 4px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 0.15s ease, transform 0.05s ease;
+  white-space: nowrap;
+}
+
+.btn-retry-inline:hover {
+  background: #2ea043;
+}
+
+.btn-retry-inline:active {
+  transform: scale(0.98);
+}
+
+.btn-dismiss-inline {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--vscode-foreground, #cccccc);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  transition: background 0.15s ease, color 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-dismiss-inline:hover {
+  background: rgba(248, 81, 73, 0.2);
+  color: #f85149;
+  border-color: rgba(248, 81, 73, 0.4);
+}
+
+.stream-error-countdown-pill {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground, #8b949e);
+  font-style: italic;
+  white-space: nowrap;
 }
 
 .stream-error-header {
@@ -2425,6 +2736,12 @@ body {
   flex-shrink: 0;
 }
 
+.reviewer-file-ref-badge.pinned {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
 .reviewer-file-ref-open-btn {
   display: inline-flex;
   align-items: center;
@@ -2445,6 +2762,171 @@ body {
 .reviewer-file-ref-open-btn:hover {
   background: var(--vscode-button-background, #2563eb);
   color: var(--vscode-button-foreground, #ffffff);
+}
+
+/* Pinned Context Strip in Reviewer Header */
+.reviewer-pinned-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  padding: 4px 8px;
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--vscode-widget-border, rgba(255, 255, 255, 0.08));
+  border-radius: 4px;
+  box-sizing: border-box;
+  min-height: 26px;
+}
+
+.reviewer-pinned-strip-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.reviewer-pinned-strip-label {
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0.85;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.reviewer-pinned-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  color: var(--vscode-textLink-foreground);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  padding: 1px 6px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+  cursor: pointer;
+  max-width: 200px;
+  transition: all 0.15s ease;
+}
+
+.reviewer-pinned-file-chip:hover {
+  background: rgba(255, 255, 255, 0.12);
+  text-decoration: underline;
+}
+
+.reviewer-pinned-empty {
+  font-size: 11px;
+  opacity: 0.55;
+  white-space: nowrap;
+  font-style: italic;
+}
+
+.reviewer-pinned-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.reviewer-pinned-action-btn {
+  background: var(--vscode-button-secondaryBackground, rgba(255, 255, 255, 0.08));
+  border: 1px solid var(--vscode-button-secondaryBorder, transparent);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  cursor: pointer;
+  font-size: 10.5px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  transition: all 0.15s ease;
+}
+
+.reviewer-pinned-action-btn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(255, 255, 255, 0.16));
+}
+
+/* Reviewer Inline Edit Container */
+.reviewer-inline-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+  width: 100%;
+}
+
+.reviewer-inline-edit-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--vscode-input-background, #1e1e1e);
+  color: var(--vscode-input-foreground, #cccccc);
+  border: 1px solid var(--vscode-focusBorder, #007fd4);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  resize: vertical;
+  min-height: 54px;
+  outline: none;
+}
+
+.reviewer-inline-edit-warning {
+  font-size: 11px;
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  background: rgba(204, 167, 0, 0.1);
+  border-left: 2px solid var(--vscode-editorWarning-foreground, #cca700);
+  padding: 3px 6px;
+  border-radius: 2px;
+}
+
+.reviewer-inline-edit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.reviewer-inline-edit-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}
+
+.reviewer-inline-edit-btn.cancel {
+  background: transparent;
+  color: var(--vscode-foreground, #cccccc);
+  border-color: var(--vscode-widget-border, rgba(255, 255, 255, 0.1));
+}
+
+.reviewer-inline-edit-btn.cancel:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.reviewer-inline-edit-btn.save {
+  background: var(--vscode-button-background, #007fd4);
+  color: var(--vscode-button-foreground, #ffffff);
+}
+
+.reviewer-inline-edit-btn.save:hover:not(:disabled) {
+  background: var(--vscode-button-hoverBackground, #026ec1);
+}
+
+.reviewer-inline-edit-btn.save:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* ==========================================================================

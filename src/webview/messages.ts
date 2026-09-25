@@ -6,6 +6,7 @@ export interface AttachedFileRef {
   filePath?: string;
   artifactType?: 'plan' | 'walkthrough';
   content?: string;
+  isPinned?: boolean;
 }
 
 export interface ChatMessageItem {
@@ -130,6 +131,7 @@ export type HostToWebviewMessage =
       reviewerModel?: string;
       reviewerReasoningEffort?: string;
       reviewerSystemPrompt?: string;
+      reviewerPinnedContextFile?: string;
     }
   | {
       type: 'REVIEWER_VIEW_DATA';
@@ -139,7 +141,8 @@ export type HostToWebviewMessage =
       messageId?: string;
       reviewerModel: string;
       reviewerReasoningEffort: string;
-      history: Array<{ role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }>;
+      reviewerPinnedContextFile?: string;
+      history: Array<{ id?: string; role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }>;
       activeSessionId?: string;
     }
   | {
@@ -190,7 +193,8 @@ export type HostToWebviewMessage =
       cancelled: boolean;
       timedOut?: boolean;
       error?: string;
-    };
+    }
+  | { type: 'PENDING_TERMINAL_COMMAND'; command: string };
 
 // Webview -> Host messages
 export type WebviewToHostMessage =
@@ -207,6 +211,7 @@ export type WebviewToHostMessage =
   | { type: 'UNDO_TURN'; messageId: string; checkpointId: string; affectedFiles: string[] }
   | { type: 'OPEN_FILE'; filePath: string }
   | { type: 'RUN_TERMINAL'; command: string; interactive?: boolean }
+  | { type: 'DENY_TERMINAL'; command: string }
   | { type: 'GET_USAGE_REPORT' }
   | { type: 'VIEW_LOGS' }
   | { type: 'EXPORT_USAGE_CSV'; records: any[] }
@@ -217,7 +222,8 @@ export type WebviewToHostMessage =
   | { type: 'RESET_PERMISSIONS' }
   | { type: 'SET_CONTEXT_SETTING'; key: 'autoSummarize' | 'fullHistoryResend'; value: boolean }
   | { type: 'SET_PRIVACY_SETTING'; key: 'redactionMode' | 'dataCollectionPolicy' | 'warnOnDataTraining'; value: any }
-  | { type: 'SET_REVIEWER_SETTING'; key: 'enabled' | 'model' | 'reasoningEffort' | 'systemPrompt'; value: any }
+  | { type: 'SET_REVIEWER_SETTING'; key: 'enabled' | 'model' | 'reasoningEffort' | 'systemPrompt' | 'pinnedContextFile'; value: any }
+  | { type: 'BROWSE_PINNED_CONTEXT_FILE' }
   | { type: 'RESET_REVIEWER_PROMPT' }
   | { type: 'PROMPT_UPDATE_KEY' }
   | { type: 'TRIGGER_CLEAR_HISTORY' }
@@ -247,7 +253,8 @@ export type WebviewToHostMessage =
         artifactType?: 'plan' | 'walkthrough';
       };
     }
-  | { type: 'RETRY_REVIEWER_MESSAGE' }
+  | { type: 'RETRY_REVIEWER_MESSAGE'; messageId?: string }
+  | { type: 'EDIT_REVIEWER_MESSAGE'; messageId: string; newContent: string }
   | { type: 'STOP_REVIEWER_STREAM' }
   | { type: 'GET_REVIEWER_SESSIONS' }
   | { type: 'NEW_REVIEWER_SESSION' }

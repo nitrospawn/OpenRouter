@@ -1,7 +1,7 @@
 # PRD: OpenRouter — Product Requirements Document (PRD)
 
 **Status:** Living Specification  
-**Version:** 0.4.0  
+**Version:** 0.4.6  
 **Name:** OpenRouter
 
 ## 1. Overview
@@ -619,8 +619,17 @@ All four directives are implemented directly within the base system prompt trans
 - **Default Prompt:** Pre-filled with a strict, comprehensive default instructing the reviewer to critique correctness, logic bugs, completeness, unhandled edge cases, security vulnerabilities, and architectural regression risks.
 - **Reset to Default Action:** A "Reset to Default" button restores the built-in default system prompt for the current workspace only, without altering any other workspace's saved reviewer prompt.
 
-### 10.5 Live Mid-Session Updates
-- In accordance with the live mid-session update principle established for permissions (§4.1), updates to any of these three settings (toggle, model/effort, system prompt) take effect immediately without requiring a window or extension reload, even if a conversation is actively open.
+### 10.5 Pinned Context File (Strictly Per-Workspace)
+- **Setting:** `openrouter.reviewer.pinnedContextFile` (String, default `""`, workspace-scoped).
+- **Behavior:**
+  - Displays a text input showing the workspace-relative path (e.g., `docs/spec.md`) and a **"Browse..."** button.
+  - Clicking **"Browse..."** opens VS Code's native file picker (`canSelectFiles: true, canSelectFolders: false`) restricted to the workspace root.
+  - Path traversal checks: paths resolving outside the active workspace folder (`..`, absolute external paths) are blocked and warned against.
+  - A **"Clear"** button allows instantly removing the pinned file setting.
+  - **Preserved on Context Reset:** Resetting reviewer context (`🔄`) clears conversation turns but strictly preserves the configured pinned context file for subsequent reviews.
+
+### 10.6 Live Mid-Session Updates
+- In accordance with the live mid-session update principle established for permissions (§4.1), updates to any of these settings (toggle, model/effort, system prompt, pinned context file) take effect immediately without requiring a window or extension reload, even if a conversation is actively open.
 
 
 ## Phase 11 — Reviewer Model Review Flow
@@ -644,9 +653,15 @@ This phase directly builds upon two foundational prerequisites:
 ---
 
 ### 11.2 What Happens on "Review"
-- **Byte-for-Byte Fidelity Transmission:**
-  - On clicking "Review", the extension extracts the exact stored `planDocument` or `walkthroughDocument` content (retrieved from `HistoryStore` or disk cache per the existing fidelity guarantee) and transmits it to the reviewer model.
-  - The request uses the current workspace's configured reviewer model, reasoning effort tier, and reviewer system prompt (Phase 10).
+- **Byte-for-Byte Fidelity Transmission & Hierarchical Payload:**
+  - On clicking "Review", the extension extracts the exact stored `planDocument` or `walkthroughDocument` content and transmits it to the reviewer model.
+  - **System Prompt Assembly:**
+    1. Primary guide: Configured Reviewer System Prompt (or default expert critique instructions).
+    2. Background reference: Pinned Workspace Context file contents (`# Pinned Workspace Context (<filename>):`) if configured.
+    3. Subject of evaluation: Document under review (`# Document Under Review (<label>):`).
+  - **User Message Presentation:**
+    - The visible user turn in the chat thread displays concise intent: `"Review this plan"` (or `"Review this walkthrough"`).
+    - The target plan/walkthrough is attached as an interactive visual reference card (`[📄 Plan docs]`).
 - **Dedicated Full-View Navigation:**
   - Opens a **separate, full view** (`view-reviewer`) within the webview container.
   - Reuses the identical top-level view navigation pattern already established for Settings (`view-settings`) and Usage Report (`view-usage`) (with clean back/forward navigation to return to `view-chat`), avoiding cluttered split-pane layouts that degrade readability on narrow sidebar configurations.
@@ -655,8 +670,8 @@ This phase directly builds upon two foundational prerequisites:
 
 ### 11.3 The Reviewer Panel
 - **Layout & Structure:**
-  - **Header Strip:** Features a `‹ Main Chat` back navigation button, view title ("Review Implementation Plan" or "Review Walkthrough"), and a pill badge displaying the active reviewer model and reasoning effort.
-  - **In-Chat File & Artifact Reference Cards (Replacing Top Preview):** Rather than pinning a bulky preview section (`#reviewer-artifact-section`) at the top of the conversation view which consumed excessive vertical space, the document under review is embedded directly into the user message turn as an interactive reference card (`.reviewer-file-ref-card`). The card displays the file/artifact name, type badge (`Plan`, `Walkthrough`, or `File`), and an `Open in Tab ↗` action that immediately opens the document in an active VS Code editor tab.
+  - **Header Strip:** Features a `‹ Main Chat` back navigation button, in-panel Reviewer model combobox selector, reasoning-effort control, context reset button (`🔄`), and a dynamic **`📌 Pinned Context:`** indicator pill displaying the workspace-pinned file (with click-to-open editor capability).
+  - **In-Chat File & Artifact Reference Cards:** Rather than pinning a bulky preview section at the top of the conversation view, the document under review is embedded directly into the user message turn as an interactive reference card (`.reviewer-file-ref-card`). The card displays the file/artifact name, type badge (`Plan`, `Walkthrough`, or amber `Pinned`), and an `Open in Tab ↗` action that immediately opens the document in an active VS Code editor tab.
   - **Reviewer Conversation Stream:** Dedicated back-and-forth chat conversation thread between the user and the reviewer model. Users can ask clarifying questions, challenge critiques, request deeper security analysis, or explore alternatives.
     - **Header Clarify Affordance:** Assistant messages in the Reviewer stream include a `Clarify` button next to `Copy` to quote the full reviewer response directly into the Reviewer's input bar as a chip.
     - **Reviewer Aspect Quoting & Sequential Numbering:** Users can highlight specific critique sentences and click `💬 Clarify Selection` on the selection toolbar to discuss that specific point without cluttering the input textarea. Chips are numbered sequentially (`Quote 1: ...`, `Quote 2: ...`) with dynamic re-indexing upon removal.

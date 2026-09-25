@@ -4,6 +4,55 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-09-25
+
+### Added
+- **Reviewer Pinned Context File (Strictly Per-Workspace):**
+  - Added `openrouter.reviewer.pinnedContextFile` configuration setting stored per-workspace (`ConfigurationTarget.Workspace`).
+  - Added dedicated Settings UI controls in the Reviewer Model section: a relative path input, native VS Code workspace file browser dialog ("Browse..."), and clear button.
+  - Path traversal protection: paths resolving outside the workspace root (e.g. `..` or absolute external paths) are blocked and warned against.
+  - Reviewer header indicator: visual `📌 Pinned Context:` pill displaying the relative file path with click-to-open editor integration.
+  - Pinned attachment badge: reviewer chat cards now support a distinct amber `Pinned` tag for pinned context files.
+- **Hierarchical System Prompt Payload Assembly:**
+  - Configured Reviewer System Prompt remains authoritative and is rendered first.
+  - Pinned context file contents are injected under `# Pinned Workspace Context (<relative_path>):`.
+  - The document under review (plan or walkthrough) follows under `# Document Under Review (<label>):`.
+  - Clean initial user prompt: clicking "Review" on a plan card now creates a clean `"Review this plan"` user turn with an attached plan document card, rather than echoing the entire system prompt.
+- **Context Reset & New Session Preservation:**
+  - Clicking the refresh/reset button (`🔄`) clears chat messages and active session state while strictly preserving the workspace pinned context file configuration.
+- **Reviewer In-Place Retry & Downstream Truncation:**
+  - Clicking `🔄 Retry` on an assistant response now cleanly replaces the rejected response in-place (no stacking) and truncates any downstream turns.
+  - Added a confirmation modal warning the user when retrying an earlier turn with subsequent downstream messages.
+- **Reviewer Inline Prompt Editing (`✏️ Edit`):**
+  - Added an `Edit` action button on user chat bubbles in the Reviewer.
+  - Interactive inline editor allows modifying user instructions directly inside the message bubble with `Save & Submit`, `Cancel`, `Ctrl+Enter`, and `Escape`.
+  - Strictly preserves attached artifacts (e.g. `Plan docs`) while updating prompt text.
+  - Automatically truncates subsequent downstream conversation turns and triggers a fresh streaming review.
+- **Generation Lock for Reviewer Actions:**
+  - Both `Edit` and `Retry` action buttons are strictly disabled (`disabled = true`, pointer-events none, dimmed opacity) while the Reviewer is actively generating text (`busy = true`).
+  - Backend message handler guards against concurrent execution; only the **Stop** button is permitted to interrupt model generation.
+- **Docked Sequential Terminal Permission Bar (`runTerminal = 'ask'`):**
+  - Added dedicated `#pending-terminal-bar` docked directly above the user chat textarea inside `.input-bar`, completely separate and isolated from the file edits approval bar.
+  - When `openrouter.runTerminal` is configured to `'ask'`, auto-execution strictly pauses at each terminal command and displays the pending command with **Allow** (`✓ Allow`) and **Deny** (`✕ Deny`) buttons.
+  - Sequential execution guarantee: commands execute strictly one at a time upon individual user confirmation; denying cancels execution and unblocks the session cleanly without running subsequent commands.
+- **Batched 1-Line Collapsible Terminal Command Dropdowns:**
+  - Assistant responses proposing multiple terminal commands within a single turn are grouped and rendered inside a sleek, single-line `<details class="terminal-command-batch-details">` dropdown (`▶ 💻 N Terminal Commands... [Expand ▾]`).
+- **1-Line Stream Error Card & 30-Second Auto-Retry Countdown:**
+  - Redesigned stream error cards (e.g. stalled responses or provider timeouts) into a sleek, ultra-compact single-line layout: `⚠️ Stream stalled (no data for 45s) | [🔁 Retry Now (30s)] [✕ Dismiss] • Auto-retrying in 30s...`.
+  - Automatically arms a 30-second countdown for stalled streams, network drops, or timeout errors, allowing unattended sessions to self-recover without manual intervention.
+  - Interactive controls: `Retry Now` triggers immediately on click; `✕ Dismiss` halts the timer and cleans up the error; focusing the prompt textarea immediately disarms the timer so it never interrupts the user while typing.
+- **Results & Walkthrough Doc Persistence on Reload:**
+  - Fixed an over-aggressive history filter in `_loadChatHistory()` that previously suppressed assistant turns created during automated execution.
+  - Results docs (`📄 Results docs ready — [view]`), walkthrough documents, and plans are now strictly preserved and rendered on window reloads and session switches.
+- **Collapsible Failure Diagnosis & Compact Self-Healing Retries:**
+  - Replaced giant uncollapsed diagnostic error dumps (`Auto-Healing Diagnosis` with 40+ lines of raw compiler/test output) with sleek, compact status cards featuring an interactive collapsible dropdown (`<details>`).
+  - Intermediate commentary step notes now stay cleanly collapsed by default (`open = false`), keeping the chat focused on user prompts and final artifacts.
+  - Terminal and file edit retry notices render as streamlined single-line status pills, preventing repetitive retry blocks from flooding the viewport.
+- **Enhanced Reviewer Diagnostic Logging & Monitoring:**
+  - Added granular `'REVIEW'` diagnostic logging covering: pinned context updates and clears, file read size and token estimates, path rejection warnings, stream start/completion/cancellation metrics, context reset operations, and in-place retry/edit rewinds.
+
+---
+
 ## [0.4.5] - 2026-09-25
 
 ### Fixed

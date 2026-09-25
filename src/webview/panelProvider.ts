@@ -41,7 +41,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
   private _activeAbortController?: AbortController;
   private _isUserCancelled: boolean = false;
   private _reviewerCommentController?: ReviewerCommentController;
-  private _reviewerHistory: Array<{ role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }> = [];
+  private _reviewerHistory: Array<{ id?: string; role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }> = [];
   private _activeReviewerAbortController?: AbortController;
   private _isReviewerUserCancelled: boolean = false;
   private _activeReviewerModelOverride?: string;
@@ -469,7 +469,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         case 'RETRY_REVIEWER_MESSAGE': {
-          await this._handleRetryReviewerMessage();
+          await this._handleRetryReviewerMessage(data.messageId);
+          break;
+        }
+
+        case 'EDIT_REVIEWER_MESSAGE': {
+          await this._handleEditReviewerMessage(data.messageId, data.newContent);
           break;
         }
 
@@ -487,6 +492,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         case 'SWITCH_REVIEWER_SESSION': {
           const msgs = await this._historyStore.switchReviewerSession(data.sessionId);
           this._reviewerHistory = msgs.map((m) => ({
+            id: m.id,
             role: m.role as 'user' | 'assistant',
             content: m.content,
             attachedFile: m.attachedFile,
@@ -509,6 +515,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             artifactContent: activeSession.artifactContent || '',
             reviewerModel,
             reviewerReasoningEffort,
+            reviewerPinnedContextFile: Configuration.getReviewerPinnedContextFile(),
             history: [...this._reviewerHistory],
             activeSessionId: activeSession.id,
           });
@@ -534,6 +541,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           this._activeReviewerArtifactContent = undefined;
           this._activeReviewerArtifactType = undefined;
           this._activeReviewerArtifactName = undefined;
+          const currentPinned = Configuration.getReviewerPinnedContextFile();
+          logger.info('REVIEW', `Reviewer context reset (pinned context preserved: ${currentPinned || 'none'})`);
           await this._historyStore.clearActiveReviewerSession();
           await this._handleOpenDirectReviewer();
           break;
@@ -1408,6 +1417,25 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           break;
         }
 
+        case 'DENY_TERMINAL': {
+          logger.warn('PERM', `User denied terminal command: ${data.command}`);
+          this._postMessage({ type: 'SET_BUSY', busy: false });
+          const denyNotice = {
+            id: `${Date.now()}-term-denied`,
+            role: 'system' as const,
+            content: `⚠️ Terminal command \`${data.command}\` was cancelled by the user.`,
+            timestamp: Date.now(),
+          };
+          if (this._historyStore?.appendMessage) {
+            await this._historyStore.appendMessage(denyNotice);
+          }
+          this._postMessage({
+            type: 'MESSAGE_RECEIVED',
+            message: denyNotice,
+          });
+          break;
+        }
+
         case 'GET_USAGE_REPORT':
           await this._sendUsageReportData();
           break;
@@ -1503,18 +1531,80 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         case 'SET_REVIEWER_SETTING':
           if (data.key === 'enabled') {
             await Configuration.setReviewerEnabled(data.value);
+            logger.info('REVIEW', `Reviewer enabled setting changed to: ${data.value}`);
           } else if (data.key === 'model') {
             await Configuration.setReviewerModel(data.value);
+            logger.info('REVIEW', `Reviewer model setting changed to: ${data.value}`);
           } else if (data.key === 'reasoningEffort') {
             await Configuration.setReviewerReasoningEffort(data.value);
+            logger.info('REVIEW', `Reviewer reasoning effort changed to: ${data.value}`);
           } else if (data.key === 'systemPrompt') {
             await Configuration.setReviewerSystemPrompt(data.value);
+            logger.info('REVIEW', `Reviewer system prompt updated`);
+          } else if (data.key === 'pinnedContextFile') {
+            await Configuration.setReviewerPinnedContextFile(data.value);
+            logger.info('REVIEW', data.value ? `Reviewer pinned context file updated to: ${data.value}` : 'Reviewer pinned context file cleared');
+            const { activeSession } = await this._historyStore.loadReviewerSessions();
+            this._postMessage({
+              type: 'REVIEWER_VIEW_DATA',
+              artifactType: activeSession.artifactType || 'standalone',
+              artifactContent: activeSession.artifactContent || '',
+              reviewerModel: this._activeReviewerModelOverride || Configuration.getReviewerModel(),
+              reviewerReasoningEffort: this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort(),
+              reviewerPinnedContextFile: data.value ? String(data.value).trim() : '',
+              history: [...this._reviewerHistory],
+              activeSessionId: activeSession.id,
+            });
           }
           await this._sendSettingsData();
           break;
 
+        case 'BROWSE_PINNED_CONTEXT_FILE': {
+          const workspaceFolders = vscode.workspace.workspaceFolders;
+          if (!workspaceFolders || workspaceFolders.length === 0) {
+            vscode.window.showWarningMessage('No workspace folder open to select a pinned context file from.');
+            break;
+          }
+          const rootUri = workspaceFolders[0].uri;
+          const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: false,
+            defaultUri: rootUri,
+            openLabel: 'Pin File to Reviewer',
+          });
+          if (uris && uris.length > 0) {
+            const selectedUri = uris[0];
+            const rootFsPath = rootUri.fsPath;
+            const selectedFsPath = selectedUri.fsPath;
+            const relative = path.relative(rootFsPath, selectedFsPath);
+            if (relative.startsWith('..') || path.isAbsolute(relative)) {
+              vscode.window.showErrorMessage('Pinned context file must be located inside the workspace.');
+              logger.warn('REVIEW', `Rejected pinned context file outside workspace: ${selectedFsPath}`);
+            } else {
+              const normalized = relative.replace(/\\/g, '/');
+              await Configuration.setReviewerPinnedContextFile(normalized);
+              logger.info('REVIEW', `User pinned context file selected: ${normalized}`);
+              await this._sendSettingsData();
+              const { activeSession } = await this._historyStore.loadReviewerSessions();
+              this._postMessage({
+                type: 'REVIEWER_VIEW_DATA',
+                artifactType: activeSession.artifactType || 'standalone',
+                artifactContent: activeSession.artifactContent || '',
+                reviewerModel: this._activeReviewerModelOverride || Configuration.getReviewerModel(),
+                reviewerReasoningEffort: this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort(),
+                reviewerPinnedContextFile: normalized,
+                history: [...this._reviewerHistory],
+                activeSessionId: activeSession.id,
+              });
+            }
+          }
+          break;
+        }
+
         case 'RESET_REVIEWER_PROMPT':
           await Configuration.resetReviewerSystemPrompt();
+          logger.info('REVIEW', 'Reviewer system prompt reset to default');
           await this._sendSettingsData();
           break;
 
@@ -1613,6 +1703,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const reviewerModel = Configuration.getReviewerModel();
     const reviewerReasoningEffort = Configuration.getReviewerReasoningEffort();
     const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
+    const reviewerPinnedContextFile = Configuration.getReviewerPinnedContextFile();
 
     const formatted = this._cachedModels.map((m) => {
       // Model supports ZDR if top_provider does not allow data collection or explicit support flag
@@ -1646,6 +1737,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       reviewerModel,
       reviewerReasoningEffort,
       reviewerSystemPrompt,
+      reviewerPinnedContextFile,
     });
   }
 
@@ -1672,7 +1764,21 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       activeSessionId: activeSession.id,
       lastTotalTokens: activeSession.lastTotalTokens,
       messages: activeSession.messages
-        .filter((h) => !h.isAutoFollowUp && !(h.role === 'system' && typeof h.content === 'string' && h.content.startsWith('✓ **Ran in terminal:')))
+        .filter((h) => {
+          // Always preserve assistant messages (especially those with walkthroughDocument or planDocument)
+          if (h.role === 'assistant') {
+            return true;
+          }
+          // Filter out internal synthetic prompts used for background auto-followups
+          if (h.role === 'system' && h.isAutoFollowUp) {
+            return false;
+          }
+          // Filter out legacy terminal marker system messages
+          if (h.role === 'system' && typeof h.content === 'string' && h.content.startsWith('✓ **Ran in terminal:')) {
+            return false;
+          }
+          return true;
+        })
         .map((h) => ({
           id: h.id,
           role: h.role,
@@ -2363,7 +2469,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           executionDurationMs,
           totalTokens: usage?.total_tokens,
           isIntermediateStep,
-          isAutoFollowUp: retryContext?.isAutoFollowUp,
+          isAutoFollowUp: Boolean(retryContext?.isAutoFollowUp && !walkthroughDocument && !planDocument),
         });
 
         // Proactively persist artifact .md files to disk immediately upon generation
@@ -3085,6 +3191,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           // In 'ask' mode, side-effecting commands render interactive UI cards for user approval.
           // Also skip auto-running if user explicitly asked to run by themselves or not to run.
           if (!isReadOnlyCmd && (!isRunTerminalAllowed || userRequestedManual)) {
+            this._postMessage({
+              type: 'PENDING_TERMINAL_COMMAND',
+              command,
+            });
             continue;
           }
 
@@ -3572,6 +3682,35 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     return false;
   }
 
+  private async _loadPinnedContextContent(): Promise<{ relativePath: string; content: string } | null> {
+    const pinnedPath = Configuration.getReviewerPinnedContextFile();
+    if (!pinnedPath) {
+      return null;
+    }
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return null;
+    }
+    try {
+      const rootUri = workspaceFolders[0].uri;
+      const targetUri = vscode.Uri.joinPath(rootUri, pinnedPath);
+      // Ensure file doesn't resolve outside workspace root
+      const relative = path.relative(rootUri.fsPath, targetUri.fsPath);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) {
+        logger.warn('REVIEW', `Pinned context file path traversal rejected: ${pinnedPath}`);
+        return null;
+      }
+      const raw = await vscode.workspace.fs.readFile(targetUri);
+      const content = Buffer.from(raw).toString('utf8');
+      const tokenEst = Math.round(content.length / 4);
+      logger.info('REVIEW', `Loaded pinned context file: ${pinnedPath} (~${content.length} chars / ~${tokenEst} tokens)`);
+      return { relativePath: pinnedPath, content };
+    } catch (err: any) {
+      logger.warn('REVIEW', `Failed to read pinned context file (${pinnedPath}): ${err?.message || err}`);
+      return null;
+    }
+  }
+
   private async _handleOpenDirectReviewer(): Promise<void> {
     if (!Configuration.getReviewerEnabled()) {
       return;
@@ -3579,6 +3718,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
     const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
     const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
+    const reviewerPinnedContextFile = Configuration.getReviewerPinnedContextFile();
 
     const { activeSession } = await this._historyStore.loadReviewerSessions();
     if (activeSession.artifactContent && (activeSession.artifactType === 'plan' || activeSession.artifactType === 'walkthrough')) {
@@ -3590,6 +3730,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     }
 
     this._reviewerHistory = activeSession.messages.map((m) => ({
+      id: m.id,
       role: m.role as 'user' | 'assistant',
       content: m.content,
       attachedFile: m.attachedFile,
@@ -3602,6 +3743,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       artifactContent: activeSession.artifactContent || '',
       reviewerModel,
       reviewerReasoningEffort,
+      reviewerPinnedContextFile,
       history: [...this._reviewerHistory],
       activeSessionId: activeSession.id,
     });
@@ -3668,6 +3810,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     // Sync in-memory history from the persisted active session if it hasn't been loaded yet.
     if (this._reviewerHistory.length === 0 && activeSession.messages.length > 0) {
       this._reviewerHistory = activeSession.messages.map((m) => ({
+        id: m.id,
         role: m.role as 'user' | 'assistant',
         content: m.content,
         attachedFile: m.attachedFile,
@@ -3695,6 +3838,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       // Send REVIEWER_VIEW_DATA first so the panel fully initializes (history rendered,
       // model name shown, reasoning effort control visible) even on a cold-start push
       // where the reviewer tab was never opened this session.
+      const reviewerPinnedContextFile = Configuration.getReviewerPinnedContextFile();
       this._postMessage({
         type: 'REVIEWER_VIEW_DATA',
         artifactType,
@@ -3703,6 +3847,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         messageId,
         reviewerModel,
         reviewerReasoningEffort,
+        reviewerPinnedContextFile,
         history: [...this._reviewerHistory],
         activeSessionId: activeSession.id,
       });
@@ -3732,13 +3877,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     activeSession.artifactContent = prepared.content;
     await this._historyStore.saveReviewerSessions();
 
-    // The initial user turn displays the configured Reviewer System Prompt so the user sees the exact critique instructions.
-    const initialUserPrompt = reviewerSystemPrompt;
-    this._reviewerHistory = [{ role: 'user', content: initialUserPrompt, attachedFile: attachedFileRef }];
+    const reviewerPinnedContextFile = Configuration.getReviewerPinnedContextFile();
+    const initialUserPrompt = artifactType === 'plan' ? 'Review this plan' : 'Review this walkthrough';
+    logger.info('REVIEW', `Starting review for ${artifactType} — model: ${reviewerModel}, reasoningEffort: ${reviewerReasoningEffort}, pinnedContext: ${reviewerPinnedContextFile || 'none'}`);
+
+    const userMsgId = `${Date.now()}-user`;
+    this._reviewerHistory = [{ id: userMsgId, role: 'user', content: initialUserPrompt, attachedFile: attachedFileRef }];
     this._lastReviewerUserPrompt = initialUserPrompt;
 
     await this._historyStore.appendReviewerMessage({
-      id: `${Date.now()}-user`,
+      id: userMsgId,
       role: 'user',
       content: initialUserPrompt,
       timestamp: Date.now(),
@@ -3754,6 +3902,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       messageId,
       reviewerModel,
       reviewerReasoningEffort,
+      reviewerPinnedContextFile,
       history: [...this._reviewerHistory],
       activeSessionId: activeSession.id,
     });
@@ -3835,11 +3984,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
       : undefined;
 
-    this._reviewerHistory.push({ role: 'user', content: userText, attachedFile: storedRef });
+    const userMsgId = `${Date.now()}-user`;
+    this._reviewerHistory.push({ id: userMsgId, role: 'user', content: userText, attachedFile: storedRef });
     this._lastReviewerUserPrompt = userText;
 
     await this._historyStore.appendReviewerMessage({
-      id: `${Date.now()}-user`,
+      id: userMsgId,
       role: 'user',
       content: userText,
       timestamp: Date.now(),
@@ -3849,12 +3999,122 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     await this._streamReviewerResponse(reviewerModel, reviewerReasoningEffort, reviewerSystemPrompt);
   }
 
-  private async _handleRetryReviewerMessage(): Promise<void> {
+  private async _handleRetryReviewerMessage(messageId?: string): Promise<void> {
+    if (this._activeReviewerAbortController) {
+      return;
+    }
     const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
     const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
     const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
 
-    // Re-run stream with the current conversation history
+    const { activeSession } = await this._historyStore.loadReviewerSessions();
+    if (!activeSession || activeSession.messages.length === 0) {
+      return;
+    }
+
+    let targetIdx = -1;
+    if (messageId) {
+      targetIdx = activeSession.messages.findIndex((m) => m.id === messageId);
+    }
+    if (targetIdx === -1) {
+      // Default to the last user message
+      for (let i = activeSession.messages.length - 1; i >= 0; i--) {
+        if (activeSession.messages[i].role === 'user') {
+          targetIdx = i;
+          break;
+        }
+      }
+    }
+    if (targetIdx === -1) {
+      return;
+    }
+
+    const targetMsg = activeSession.messages[targetIdx];
+    const subsequentCount = activeSession.messages.length - 1 - targetIdx;
+
+    if (subsequentCount > 1) {
+      const answer = await vscode.window.showWarningMessage(
+        `Retrying from this prompt will remove ${subsequentCount} subsequent messages in this session. Proceed?`,
+        { modal: true },
+        'Proceed'
+      );
+      if (answer !== 'Proceed') {
+        return;
+      }
+    }
+
+    await this._historyStore.truncateReviewerMessagesAfter(targetMsg.id);
+    this._reviewerHistory = this._reviewerHistory.slice(0, targetIdx + 1);
+
+    this._postMessage({
+      type: 'REVIEWER_VIEW_DATA',
+      artifactType: activeSession.artifactType || 'standalone',
+      artifactContent: activeSession.artifactContent || '',
+      reviewerModel,
+      reviewerReasoningEffort,
+      reviewerPinnedContextFile: Configuration.getReviewerPinnedContextFile(),
+      history: [...this._reviewerHistory],
+      activeSessionId: activeSession.id,
+    });
+
+    await this._streamReviewerResponse(reviewerModel, reviewerReasoningEffort, reviewerSystemPrompt);
+  }
+
+  private async _handleEditReviewerMessage(messageId: string, newContent: string): Promise<void> {
+    if (this._activeReviewerAbortController) {
+      return;
+    }
+    const cleanContent = newContent.trim();
+    if (!cleanContent) {
+      return;
+    }
+
+    const reviewerModel = this._activeReviewerModelOverride || Configuration.getReviewerModel();
+    const reviewerReasoningEffort = this._activeReviewerReasoningEffortOverride || Configuration.getReviewerReasoningEffort();
+    const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
+
+    const { activeSession } = await this._historyStore.loadReviewerSessions();
+    if (!activeSession || activeSession.messages.length === 0) {
+      return;
+    }
+
+    const targetIdx = activeSession.messages.findIndex((m) => m.id === messageId);
+    if (targetIdx === -1) {
+      return;
+    }
+
+    const subsequentCount = activeSession.messages.length - 1 - targetIdx;
+    if (subsequentCount > 1) {
+      const answer = await vscode.window.showWarningMessage(
+        `Editing this prompt will remove ${subsequentCount} subsequent messages in this session. Proceed?`,
+        { modal: true },
+        'Proceed'
+      );
+      if (answer !== 'Proceed') {
+        return;
+      }
+    }
+
+    await this._historyStore.updateReviewerMessageContent(messageId, cleanContent);
+    await this._historyStore.truncateReviewerMessagesAfter(messageId);
+
+    this._reviewerHistory = this._reviewerHistory.slice(0, targetIdx + 1);
+    if (this._reviewerHistory[targetIdx]) {
+      this._reviewerHistory[targetIdx].content = cleanContent;
+    }
+    this._lastReviewerUserPrompt = cleanContent;
+
+    this._postMessage({
+      type: 'REVIEWER_VIEW_DATA',
+      artifactType: activeSession.artifactType || 'standalone',
+      artifactContent: activeSession.artifactContent || '',
+      reviewerModel,
+      reviewerReasoningEffort,
+      reviewerPinnedContextFile: Configuration.getReviewerPinnedContextFile(),
+      history: [...this._reviewerHistory],
+      activeSessionId: activeSession.id,
+    });
+
     await this._streamReviewerResponse(reviewerModel, reviewerReasoningEffort, reviewerSystemPrompt);
   }
 
@@ -3879,12 +4139,26 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     this._activeReviewerAbortController = abortController;
 
     let effectiveSystemPrompt = systemPrompt;
+    let pinnedTokenEst = 0;
+    const pinned = await this._loadPinnedContextContent();
+    if (pinned) {
+      pinnedTokenEst = Math.round(pinned.content.length / 4);
+      effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n# Pinned Workspace Context (${pinned.relativePath}):\n[Active Pinned Workspace Context: The file '${pinned.relativePath}' is pinned by the user as authoritative project baseline guidelines. It is read-only and loaded fresh from disk. Always consult its rules when reviewing documents or answering questions. If the user refers to 'pinned context' or 'pinned rules', cite this file.]\n${pinned.content}`;
+    } else {
+      effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n[Pinned Workspace Context: None. No workspace file is currently pinned for this review session. If the user refers to pinned context or rules, inform them that no pinned file is currently attached and they can pin one via the 'Pin File' button at the top of the reviewer window.]`;
+    }
+
     if (this._activeReviewerArtifactContent) {
       const artifactLabel =
         this._activeReviewerArtifactName ||
         (this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs');
-      effectiveSystemPrompt = `${systemPrompt}\n\n# Document Under Review (${artifactLabel}):\n${this._activeReviewerArtifactContent}`;
+      effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n# Document Under Review (${artifactLabel}):\n${this._activeReviewerArtifactContent}`;
     }
+
+    logger.info(
+      'REVIEW',
+      `Reviewer stream start — model: ${model}, effort: ${reasoningEffort || 'default'}, artifact: ~${artifactTokenEst} tokens, pinnedContext: ~${pinnedTokenEst} tokens (${pinned?.relativePath || 'none'})`
+    );
 
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       { role: 'system', content: effectiveSystemPrompt },
@@ -3922,14 +4196,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         if (this._isReviewerUserCancelled || abortController.signal.aborted) {
           this._activeReviewerAbortController = undefined;
           this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
+          logger.info('REVIEW', 'Reviewer stream cancelled by user');
           return;
         }
         this._activeReviewerAbortController = undefined;
         const executionDurationMs = Date.now() - reviewerStartTime;
-        this._reviewerHistory.push({ role: 'assistant', content: accumulatedChunk, executionDurationMs });
+        const asstMsgId = `${Date.now()}-assistant`;
+        this._reviewerHistory.push({ id: asstMsgId, role: 'assistant', content: accumulatedChunk, executionDurationMs });
 
         await this._historyStore.appendReviewerMessage({
-          id: `${Date.now()}-assistant`,
+          id: asstMsgId,
           role: 'assistant',
           content: accumulatedChunk,
           model,
@@ -3964,6 +4240,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           });
         }
 
+        logger.info(
+          'REVIEW',
+          `Reviewer stream finished in ${executionDurationMs}ms (prompt_tokens: ${usage?.prompt_tokens ?? 'N/A'}, completion_tokens: ${usage?.completion_tokens ?? 'N/A'})`
+        );
+
         this._postMessage({
           type: 'REVIEWER_STREAM_DONE',
           executionDurationMs,
@@ -3975,6 +4256,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       (err) => {
         this._activeReviewerAbortController = undefined;
         this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
+
+        logger.error('REVIEW', `Reviewer stream error: ${err?.message || err}`);
 
         const isPartial = accumulatedChunk.trim().length > 0;
         if (isPartial) {
@@ -4112,6 +4395,21 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             </div>
           </div>
           <div id="pending-edits-list" class="pending-edits-list"></div>
+        </div>
+
+        <!-- Dedicated Pending Terminal Permission Bar (Sequential Approval) -->
+        <div id="pending-terminal-bar" class="pending-terminal-bar hidden">
+          <div class="pending-terminal-header">
+            <div class="pending-terminal-title">
+              <span class="pending-terminal-icon">💻</span>
+              <span class="pending-terminal-label">Terminal Permission:</span>
+              <code id="pending-terminal-cmd" class="pending-terminal-cmd"></code>
+            </div>
+            <div class="pending-terminal-actions">
+              <button id="allow-terminal-btn" class="btn btn-sm btn-primary">✓ Allow &amp; Run</button>
+              <button id="deny-terminal-btn" class="btn btn-sm secondary">✕ Deny / Cancel</button>
+            </div>
+          </div>
         </div>
 
         <!-- Context Preview Pill (PRD Phase 7 §7.2) -->
@@ -4373,6 +4671,21 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             </div>
           </div>
 
+          <!-- Pinned Context File (Strictly Per-Workspace) -->
+          <div class="reviewer-field-group">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+              <label class="settings-field-label" style="margin-bottom:0;">📌 Pinned Context File</label>
+              <button id="clear-reviewer-pinned-btn" class="btn secondary hidden" style="font-size:11px; padding:2px 8px;" title="Clear pinned context file">Clear</button>
+            </div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <input type="text" id="reviewer-pinned-file-input" class="settings-input" placeholder="e.g. docs/spec.md (relative to workspace)" style="flex:1; font-size:11.5px; padding:4px 8px;" />
+              <button id="browse-reviewer-pinned-btn" class="btn secondary" style="font-size:11px; padding:4px 10px; white-space:nowrap;" title="Select a file from active workspace">Browse...</button>
+            </div>
+            <span style="font-size:10.5px; opacity:0.65; margin-top:2px;">
+              File from this workspace automatically loaded into reviewer context on every review.
+            </span>
+          </div>
+
           <!-- Editable Reviewer System Prompt -->
           <div class="reviewer-field-group">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
@@ -4430,6 +4743,21 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
           <!-- Start Fresh / Context Reset Action -->
           <button id="reviewer-reset-context-btn" class="icon-btn" title="Start fresh from here (reset reviewer context)" style="font-size:12px; padding:3px 6px;">🔄</button>
+        </div>
+
+        <!-- Pinned Context Strip (Always visible at top of reviewer chat window) -->
+        <div id="reviewer-pinned-bar" class="reviewer-pinned-strip">
+          <div class="reviewer-pinned-strip-left">
+            <span class="reviewer-pinned-strip-label" title="Workspace file automatically pinned into reviewer context">📌 Pinned Context:</span>
+            <span id="reviewer-pinned-file-chip" class="reviewer-pinned-file-chip hidden" title="Click to view file in editor"></span>
+            <span id="reviewer-pinned-empty-label" class="reviewer-pinned-empty">None</span>
+          </div>
+          <div class="reviewer-pinned-actions">
+            <button id="reviewer-pinned-browse-btn" class="reviewer-pinned-action-btn" title="Choose or change pinned workspace file">
+              <span id="reviewer-pinned-browse-text">Pin File</span>
+            </button>
+            <button id="reviewer-pinned-clear-btn" class="reviewer-pinned-action-btn hidden" title="Unpin context file">✕</button>
+          </div>
         </div>
 
         <!-- Drop-with-notice warning banner for in-panel model switch -->

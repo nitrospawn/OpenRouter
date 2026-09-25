@@ -622,6 +622,13 @@ const rejectAllEditsBtn = document.getElementById('reject-all-edits-btn') as HTM
 // Map of currently pending (unresolved) edit proposals
 const pendingEditsMap = new Map<string, { editId: string; filePath: string; newContent: string; cardEl?: HTMLElement }>();
 
+// Dedicated Pending Terminal Bar References (Strict Sequential Approval)
+const pendingTerminalBar = document.getElementById('pending-terminal-bar') as HTMLDivElement;
+const pendingTerminalCmdEl = document.getElementById('pending-terminal-cmd') as HTMLElement;
+const allowTerminalBtn = document.getElementById('allow-terminal-btn') as HTMLButtonElement;
+const denyTerminalBtn = document.getElementById('deny-terminal-btn') as HTMLButtonElement;
+let currentPendingTerminalCommand: string | null = null;
+
 // Privacy Settings DOM References
 const chkStrictZdr = document.getElementById('chk-strict-zdr') as HTMLInputElement;
 const chkWarnTraining = document.getElementById('chk-warn-training') as HTMLInputElement;
@@ -637,10 +644,70 @@ const reviewerReasoningContainer = document.getElementById('reviewer-reasoning-c
 const reviewerReasoningSelect = document.getElementById('reviewer-reasoning-select') as HTMLSelectElement;
 const reviewerSystemPrompt = document.getElementById('reviewer-system-prompt') as HTMLTextAreaElement;
 const resetReviewerPromptBtn = document.getElementById('reset-reviewer-prompt-btn') as HTMLButtonElement;
+const reviewerPinnedFileInput = document.getElementById('reviewer-pinned-file-input') as HTMLInputElement;
+const browseReviewerPinnedBtn = document.getElementById('browse-reviewer-pinned-btn') as HTMLButtonElement;
+const clearReviewerPinnedBtn = document.getElementById('clear-reviewer-pinned-btn') as HTMLButtonElement;
+const reviewerPinnedBar = document.getElementById('reviewer-pinned-bar') as HTMLDivElement;
+const reviewerPinnedFileChip = document.getElementById('reviewer-pinned-file-chip') as HTMLSpanElement;
+const reviewerPinnedEmptyLabel = document.getElementById('reviewer-pinned-empty-label') as HTMLSpanElement;
+const reviewerPinnedBrowseBtn = document.getElementById('reviewer-pinned-browse-btn') as HTMLButtonElement;
+const reviewerPinnedBrowseText = document.getElementById('reviewer-pinned-browse-text') as HTMLSpanElement;
+const reviewerPinnedClearBtn = document.getElementById('reviewer-pinned-clear-btn') as HTMLButtonElement;
 
 let currentReviewerModelId = '';
 let currentReviewerReasoningEffort = 'medium';
+let currentReviewerPinnedFile = '';
 let isReviewerEnabled = false;
+
+function updateReviewerPinnedHeader(filePath?: string) {
+  const file = (filePath !== undefined ? filePath : currentReviewerPinnedFile || '').trim();
+  currentReviewerPinnedFile = file;
+
+  if (reviewerPinnedFileInput && reviewerPinnedFileInput.value !== file) {
+    reviewerPinnedFileInput.value = file;
+  }
+  if (clearReviewerPinnedBtn) {
+    if (file) {
+      clearReviewerPinnedBtn.classList.remove('hidden');
+    } else {
+      clearReviewerPinnedBtn.classList.add('hidden');
+    }
+  }
+
+  if (reviewerPinnedBar) {
+    if (file) {
+      if (reviewerPinnedFileChip) {
+        reviewerPinnedFileChip.classList.remove('hidden');
+        reviewerPinnedFileChip.textContent = file;
+        reviewerPinnedFileChip.title = `Click to view ${file} in editor`;
+      }
+      if (reviewerPinnedEmptyLabel) {
+        reviewerPinnedEmptyLabel.classList.add('hidden');
+      }
+      if (reviewerPinnedBrowseText) {
+        reviewerPinnedBrowseText.textContent = 'Change';
+      }
+      if (reviewerPinnedClearBtn) {
+        reviewerPinnedClearBtn.classList.remove('hidden');
+      }
+    } else {
+      if (reviewerPinnedFileChip) {
+        reviewerPinnedFileChip.classList.add('hidden');
+        reviewerPinnedFileChip.textContent = '';
+        reviewerPinnedFileChip.title = '';
+      }
+      if (reviewerPinnedEmptyLabel) {
+        reviewerPinnedEmptyLabel.classList.remove('hidden');
+      }
+      if (reviewerPinnedBrowseText) {
+        reviewerPinnedBrowseText.textContent = 'Pin File';
+      }
+      if (reviewerPinnedClearBtn) {
+        reviewerPinnedClearBtn.classList.add('hidden');
+      }
+    }
+  }
+}
 
 // Direct Reviewer Toggle Button (Main Chat Header)
 const reviewerToggleBtn = document.getElementById('reviewer-toggle-btn') as HTMLButtonElement;
@@ -1879,7 +1946,12 @@ window.addEventListener('message', (event) => {
       break;
     }
 
+    case 'PENDING_TERMINAL_COMMAND':
+      setPendingTerminalCommand(msg.command);
+      break;
+
     case 'TERMINAL_RESULT': {
+      setPendingTerminalCommand(null);
       const allCards = Array.from(document.querySelectorAll<HTMLElement>('.terminal-card'));
       allCards.filter((c) => c.dataset.command === msg.command).forEach((card) => {
         const runBtn = card.querySelector('.terminal-run-btn') as HTMLButtonElement | null;
@@ -2001,39 +2073,139 @@ window.addEventListener('message', (event) => {
         activeAssistantContentEl && (activeAssistantContentEl.textContent || '').trim().length > 0
       );
 
-      // Render an in-chat error card with a retry button
+      // Render a sleek, compact 1-line stream error card with countdown auto-retry
       const errorCard = document.createElement('div');
-      errorCard.className = 'stream-error-card';
-      errorCard.innerHTML = `
-        <div class="stream-error-header">
-          <span>⚠️</span>
-          <span>Request Issue</span>
-        </div>
-        <div class="stream-error-msg">${escapeHtml(msg.message)}</div>
-      `;
+      errorCard.className = 'stream-error-card single-line';
+
+      let autoRetryTimer: any = null;
+      let remainingSeconds = 30;
+      let isDisarmed = false;
+
+      const clearCountdown = () => {
+        isDisarmed = true;
+        if (autoRetryTimer) {
+          clearInterval(autoRetryTimer);
+          autoRetryTimer = null;
+        }
+      };
+
+      // Truncate or clean the message for inline display
+      const cleanErrorMsg = (msg.message || 'Stream failed')
+        .replace(/^Request failed:\s*/i, '')
+        .replace(/^[⚠️!\s]+/, '');
+
+      const isStalledOrTimeout =
+        cleanErrorMsg.toLowerCase().includes('stalled') ||
+        cleanErrorMsg.toLowerCase().includes('timed out') ||
+        cleanErrorMsg.toLowerCase().includes('network') ||
+        cleanErrorMsg.toLowerCase().includes('econnreset') ||
+        cleanErrorMsg.toLowerCase().includes('connection lost');
+
+      const triggerRetry = () => {
+        if (isDisarmed) return;
+        clearCountdown();
+        if (!lastSentMessage) return;
+        errorCard.remove();
+        vscode.postMessage({
+          type: 'SEND_MESSAGE',
+          content: lastSentMessage.content,
+          modelId: lastSentMessage.modelId || currentModelId,
+          images: lastSentMessage.images,
+          reasoningEffort: lastSentMessage.reasoningEffort,
+          isRetry: true,
+        });
+      };
+
+      const dismissError = () => {
+        clearCountdown();
+        errorCard.remove();
+      };
 
       if (msg.canRetry && lastSentMessage) {
-        const actionsDiv = document.createElement('div');
-        actionsDiv.className = 'stream-error-actions';
+        errorCard.innerHTML = `
+          <div class="stream-error-content-row">
+            <span class="stream-error-icon">⚠️</span>
+            <span class="stream-error-inline-msg" title="${escapeHtml(msg.message)}">${escapeHtml(cleanErrorMsg)}</span>
+            <span class="stream-error-divider">|</span>
+            <div class="stream-error-actions-inline">
+              <button class="btn-retry-inline" title="Retry immediately">
+                <span>🔁</span>
+                <span class="retry-btn-label">Retry Now (${remainingSeconds}s)</span>
+              </button>
+              <button class="btn-dismiss-inline" title="Cancel retry and dismiss">✕ Dismiss</button>
+            </div>
+            <span class="stream-error-countdown-pill">• Auto-retrying in ${remainingSeconds}s...</span>
+          </div>
+        `;
 
-        const retryBtn = document.createElement('button');
-        retryBtn.className = 'btn-retry';
-        retryBtn.innerHTML = `<span>⎌</span><span>Retry Request</span>`;
-        retryBtn.addEventListener('click', () => {
-          if (!lastSentMessage) return;
-          errorCard.remove();
-          vscode.postMessage({
-            type: 'SEND_MESSAGE',
-            content: lastSentMessage.content,
-            modelId: lastSentMessage.modelId || currentModelId,
-            images: lastSentMessage.images,
-            reasoningEffort: lastSentMessage.reasoningEffort,
-            isRetry: true,
-          });
+        const retryBtn = errorCard.querySelector('.btn-retry-inline') as HTMLButtonElement;
+        const dismissBtn = errorCard.querySelector('.btn-dismiss-inline') as HTMLButtonElement;
+        const retryLabel = errorCard.querySelector('.retry-btn-label') as HTMLSpanElement;
+        const countdownPill = errorCard.querySelector('.stream-error-countdown-pill') as HTMLSpanElement;
+
+        retryBtn?.addEventListener('click', () => {
+          triggerRetry();
         });
 
-        actionsDiv.appendChild(retryBtn);
-        errorCard.appendChild(actionsDiv);
+        dismissBtn?.addEventListener('click', () => {
+          dismissError();
+        });
+
+        // Only start the countdown automatically for stalled/timeout or network issues
+        if (isStalledOrTimeout) {
+          const startTime = Date.now();
+          const targetDurationMs = 30000;
+
+          autoRetryTimer = setInterval(() => {
+            if (isDisarmed) return;
+            const elapsed = Date.now() - startTime;
+            const left = Math.max(0, Math.ceil((targetDurationMs - elapsed) / 1000));
+            remainingSeconds = left;
+
+            if (retryLabel) {
+              retryLabel.textContent = `Retry Now (${remainingSeconds}s)`;
+            }
+            if (countdownPill) {
+              countdownPill.textContent = `• Auto-retrying in ${remainingSeconds}s...`;
+            }
+
+            if (left <= 0) {
+              clearCountdown();
+              triggerRetry();
+            }
+          }, 1000);
+
+          // Disarm auto-retry timer if user focuses prompt input
+          if (promptInput) {
+            promptInput.addEventListener(
+              'focus',
+              () => {
+                if (!isDisarmed) {
+                  clearCountdown();
+                  if (retryLabel) retryLabel.textContent = 'Retry Now';
+                  if (countdownPill) countdownPill.textContent = '• Auto-retry cancelled';
+                }
+              },
+              { once: true }
+            );
+          }
+        } else {
+          // Non-timeout errors show button without auto-countdown
+          if (retryLabel) retryLabel.textContent = 'Retry Now';
+          if (countdownPill) countdownPill.remove();
+        }
+      } else {
+        errorCard.innerHTML = `
+          <div class="stream-error-content-row">
+            <span class="stream-error-icon">⚠️</span>
+            <span class="stream-error-inline-msg" title="${escapeHtml(msg.message)}">${escapeHtml(cleanErrorMsg)}</span>
+            <button class="btn-dismiss-inline" title="Dismiss">✕ Dismiss</button>
+          </div>
+        `;
+        const dismissBtn = errorCard.querySelector('.btn-dismiss-inline') as HTMLButtonElement;
+        dismissBtn?.addEventListener('click', () => {
+          errorCard.remove();
+        });
       }
 
       if (!hadPartialContent) {
@@ -2262,9 +2434,8 @@ export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, b
   // 4. Create details drawer
   const details = document.createElement('details');
   details.className = 'intermediate-step-details';
-  if (hasErrorOrWarning) {
-    (details as any).open = true;
-  }
+  // Keep collapsed by default to prevent filling up the viewport
+  (details as any).open = false;
 
   const summary = document.createElement('summary');
   summary.className = 'intermediate-step-summary';
@@ -2353,9 +2524,11 @@ function renderTerminalRunAction(command: string, parentEl: HTMLElement) {
     const runBtn = document.createElement('button');
     runBtn.className = 'btn terminal-run-btn';
     runBtn.textContent = '▶ Run Command';
+    setPendingTerminalCommand(command);
     runBtn.addEventListener('click', () => {
       runBtn.disabled = true;
       runBtn.textContent = '⏳ Running...';
+      setPendingTerminalCommand(null);
       vscode.postMessage({ type: 'RUN_TERMINAL', command });
     });
     actions.appendChild(runBtn);
@@ -2458,6 +2631,37 @@ function updatePendingEditsBar() {
     row.appendChild(info);
     row.appendChild(actions);
     pendingEditsList.appendChild(row);
+  });
+}
+
+function setPendingTerminalCommand(cmd: string | null) {
+  if (!pendingTerminalBar || !pendingTerminalCmdEl) return;
+  if (!cmd) {
+    pendingTerminalBar.classList.add('hidden');
+    currentPendingTerminalCommand = null;
+    return;
+  }
+  currentPendingTerminalCommand = cmd;
+  pendingTerminalCmdEl.textContent = cmd;
+  pendingTerminalCmdEl.title = cmd;
+  pendingTerminalBar.classList.remove('hidden');
+}
+
+if (allowTerminalBtn) {
+  allowTerminalBtn.addEventListener('click', () => {
+    if (!currentPendingTerminalCommand) return;
+    const cmd = currentPendingTerminalCommand;
+    setPendingTerminalCommand(null);
+    vscode.postMessage({ type: 'RUN_TERMINAL', command: cmd, interactive: false });
+  });
+}
+
+if (denyTerminalBtn) {
+  denyTerminalBtn.addEventListener('click', () => {
+    if (!currentPendingTerminalCommand) return;
+    const cmd = currentPendingTerminalCommand;
+    setPendingTerminalCommand(null);
+    vscode.postMessage({ type: 'DENY_TERMINAL', command: cmd });
   });
 }
 
@@ -3032,6 +3236,78 @@ function renderInlineMarkdown(text: string, container: HTMLElement) {
   }
 }
 
+function isTerminalLang(l: string): boolean {
+  return ['cmd', 'bash', 'sh', 'shell', 'powershell', 'zsh'].includes(l.toLowerCase().trim());
+}
+
+function renderBatchedTerminalCommand(lang: string, code: string, container: HTMLElement, actionVerb: string) {
+  const lastChild = container.lastElementChild as HTMLElement | null;
+  let batchDetails: HTMLDetailsElement;
+  let batchBody: HTMLElement;
+  let batchSummaryTitle: HTMLElement;
+  let batchBadge: HTMLElement;
+
+  if (lastChild && lastChild.classList.contains('terminal-command-batch-details')) {
+    batchDetails = lastChild as HTMLDetailsElement;
+    batchBody = batchDetails.querySelector('.terminal-command-batch-body') as HTMLElement;
+    batchSummaryTitle = batchDetails.querySelector('.terminal-command-batch-title') as HTMLElement;
+    batchBadge = batchDetails.querySelector('.terminal-command-batch-badge') as HTMLElement;
+    const currentCount = parseInt(batchDetails.dataset.commandCount || '1', 10) + 1;
+    batchDetails.dataset.commandCount = String(currentCount);
+
+    const firstCmd = batchDetails.dataset.firstCommand || code.trim().split(/\r?\n/)[0];
+    const preview = firstCmd.length > 35 ? firstCmd.slice(0, 32) + '...' : firstCmd;
+    if (batchSummaryTitle) {
+      batchSummaryTitle.textContent = `${currentCount} Terminal Commands (${preview}, +${currentCount - 1} more)`;
+    }
+    if (batchBadge) {
+      batchBadge.textContent = 'Expand ▾';
+    }
+  } else {
+    batchDetails = document.createElement('details');
+    batchDetails.className = 'terminal-command-batch-details';
+    batchDetails.open = false; // Strictly collapsed by default!
+    batchDetails.dataset.commandCount = '1';
+    const firstLine = code.trim().split(/\r?\n/)[0] || 'command';
+    batchDetails.dataset.firstCommand = firstLine;
+
+    const summary = document.createElement('summary');
+    summary.className = 'terminal-command-batch-summary';
+    summary.title = 'Click to expand/collapse terminal commands';
+
+    const arrow = document.createElement('span');
+    arrow.className = 'terminal-command-batch-arrow';
+    arrow.textContent = '▸';
+
+    const icon = document.createElement('span');
+    icon.className = 'terminal-command-batch-icon';
+    icon.textContent = '💻';
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'terminal-command-batch-title';
+    const preview = firstLine.length > 40 ? firstLine.slice(0, 37) + '...' : firstLine;
+    titleSpan.textContent = `Terminal: ${preview}`;
+
+    const badge = document.createElement('span');
+    badge.className = 'terminal-command-batch-badge';
+    badge.textContent = 'Expand ▾';
+
+    summary.appendChild(arrow);
+    summary.appendChild(icon);
+    summary.appendChild(titleSpan);
+    summary.appendChild(badge);
+
+    batchBody = document.createElement('div');
+    batchBody.className = 'terminal-command-batch-body';
+
+    batchDetails.appendChild(summary);
+    batchDetails.appendChild(batchBody);
+    container.appendChild(batchDetails);
+  }
+
+  renderCodeBlock(lang, code, batchBody, document, { actionVerb });
+}
+
 function renderMarkdownAndCode(text: string, container: HTMLElement, actionVerb: string) {
   if (!text) return;
   const fenceRegex = /```([^\r\n]*)\r?\n([\s\S]*?)```/g;
@@ -3046,7 +3322,11 @@ function renderMarkdownAndCode(text: string, container: HTMLElement, actionVerb:
 
     const lang = (match[1] || 'text').trim();
     const code = match[2];
-    renderCodeBlock(lang, code, container, document, { actionVerb });
+    if (isTerminalLang(lang)) {
+      renderBatchedTerminalCommand(lang, code, container, actionVerb);
+    } else {
+      renderCodeBlock(lang, code, container, document, { actionVerb });
+    }
 
     lastIndex = fenceRegex.lastIndex;
   }
@@ -3061,7 +3341,11 @@ function renderMarkdownAndCode(text: string, container: HTMLElement, actionVerb:
       }
       const lang = (openFenceMatch[1] || 'text').trim();
       const code = openFenceMatch[2];
-      renderCodeBlock(lang, code, container, document, { actionVerb });
+      if (isTerminalLang(lang)) {
+        renderBatchedTerminalCommand(lang, code, container, actionVerb);
+      } else {
+        renderCodeBlock(lang, code, container, document, { actionVerb });
+      }
     } else {
       renderMarkdownBlocks(remaining, container);
     }
@@ -3537,6 +3821,38 @@ function updateAllUndoButtonsAvailability() {
   });
 }
 
+function renderAutoRetryDiagnosisCard(
+  content: string,
+  bodyEl: HTMLElement,
+  role: string,
+  isHistory = false,
+  messageId?: string
+) {
+  const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const firstLine = lines[0] || 'Diagnosing failure and initiating self-healing retry...';
+
+  const details = document.createElement('details');
+  details.className = 'auto-retry-details';
+  details.open = false;
+
+  const summary = document.createElement('summary');
+  summary.className = 'auto-retry-summary';
+  summary.title = 'Click to expand/collapse diagnostic logs and error details';
+  summary.innerHTML = `
+    <span class="auto-retry-summary-icon">▸</span>
+    <span class="auto-retry-summary-text">${escapeHtml(firstLine)}</span>
+    <span class="auto-retry-summary-badge">View logs &amp; details</span>
+  `;
+
+  const detailsBody = document.createElement('div');
+  detailsBody.className = 'auto-retry-details-body';
+  renderFormattedContent(content, detailsBody, role, isHistory, messageId);
+
+  details.appendChild(summary);
+  details.appendChild(detailsBody);
+  bodyEl.appendChild(details);
+}
+
 export function appendMessage(
   role: string,
   content: string,
@@ -3600,17 +3916,29 @@ export function appendMessage(
     }
   }
 
-  const isTerminalCard =
-    content.includes('Ran in terminal') ||
+  const isRetryNotice =
     content.startsWith('🔄 Terminal command') ||
+    content.startsWith('🔄 File edit to') ||
     content.startsWith('⚠️ Terminal command');
+
+  if (isRetryNotice) {
+    const lastMsg = messagesContainer.lastElementChild as HTMLElement | null;
+    if (lastMsg && lastMsg.dataset.rawContent === content) {
+      // Consecutive duplicate retry notice, skip rendering duplicate
+      return;
+    }
+  }
+  const isTerminalCard =
+    (content.includes('Ran in terminal') || isRetryNotice) && !isAutoRetry;
   const isEditorCard =
     content.includes('Applied:') ||
     content.startsWith('⚠️ Failed to auto-apply') ||
     content.startsWith('⚠️ This edit was not applied');
 
   const msgEl = document.createElement('div');
-  msgEl.className = isAutoRetry
+  msgEl.className = isRetryNotice
+    ? `message ${role} retry-notice-message`
+    : isAutoRetry
     ? `message ${role} auto-retry-message`
     : isTerminalCard
     ? `message ${role} terminal-message`
@@ -3934,6 +4262,8 @@ export function appendMessage(
     bodyEl.appendChild(wrapper);
   } else if (isTerminalCard) {
     renderTerminalCardContent(displayContent, bodyEl);
+  } else if (isAutoRetry) {
+    renderAutoRetryDiagnosisCard(displayContent, bodyEl, role, isHistory, messageId);
   } else {
     renderFormattedContent(displayContent, bodyEl, role, isHistory, messageId);
   }
@@ -4740,6 +5070,9 @@ function renderSettings(data: any) {
   if (reviewerSystemPrompt) {
     reviewerSystemPrompt.value = data.reviewerSystemPrompt || '';
   }
+
+  currentReviewerPinnedFile = data.reviewerPinnedContextFile || '';
+  updateReviewerPinnedHeader(currentReviewerPinnedFile);
 }
 
 // Phase 10: Reviewer Settings Event Listeners
@@ -4765,6 +5098,69 @@ if (chkReviewerEnabled) {
       type: 'SET_REVIEWER_SETTING',
       key: 'enabled',
       value: enabled,
+    });
+  });
+}
+
+if (reviewerPinnedFileInput) {
+  reviewerPinnedFileInput.addEventListener('change', () => {
+    const val = reviewerPinnedFileInput.value.trim();
+    currentReviewerPinnedFile = val;
+    updateReviewerPinnedHeader(val);
+    vscode.postMessage({
+      type: 'SET_REVIEWER_SETTING',
+      key: 'pinnedContextFile',
+      value: val,
+    });
+  });
+}
+
+if (browseReviewerPinnedBtn) {
+  browseReviewerPinnedBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'BROWSE_PINNED_CONTEXT_FILE' });
+  });
+}
+
+if (clearReviewerPinnedBtn) {
+  clearReviewerPinnedBtn.addEventListener('click', () => {
+    currentReviewerPinnedFile = '';
+    updateReviewerPinnedHeader('');
+    vscode.postMessage({
+      type: 'SET_REVIEWER_SETTING',
+      key: 'pinnedContextFile',
+      value: '',
+    });
+  });
+}
+
+if (reviewerPinnedFileChip) {
+  reviewerPinnedFileChip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (currentReviewerPinnedFile) {
+      vscode.postMessage({
+        type: 'OPEN_FILE',
+        filePath: currentReviewerPinnedFile,
+      });
+    }
+  });
+}
+
+if (reviewerPinnedBrowseBtn) {
+  reviewerPinnedBrowseBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    vscode.postMessage({ type: 'BROWSE_PINNED_CONTEXT_FILE' });
+  });
+}
+
+if (reviewerPinnedClearBtn) {
+  reviewerPinnedClearBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    currentReviewerPinnedFile = '';
+    updateReviewerPinnedHeader('');
+    vscode.postMessage({
+      type: 'SET_REVIEWER_SETTING',
+      key: 'pinnedContextFile',
+      value: '',
     });
   });
 }
@@ -4804,7 +5200,8 @@ function openReviewerView(data: {
   messageId?: string;
   reviewerModel: string;
   reviewerReasoningEffort: string;
-  history: Array<{ role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }>;
+  reviewerPinnedContextFile?: string;
+  history: Array<{ id?: string; role: 'user' | 'assistant'; content: string; attachedFile?: AttachedFileRef; executionDurationMs?: number }>;
   activeSessionId?: string;
 }) {
   currentReviewerArtifact = {
@@ -4832,6 +5229,12 @@ function openReviewerView(data: {
   }
   updateReviewerPanelReasoningControl(activeReviewerModelId);
 
+  // Update Pinned Context indicator strip in reviewer header
+  if (data.reviewerPinnedContextFile !== undefined) {
+    currentReviewerPinnedFile = data.reviewerPinnedContextFile;
+  }
+  updateReviewerPinnedHeader(currentReviewerPinnedFile);
+
   // Keep top artifact preview hidden; file reference is embedded directly in chat messages
   if (reviewerArtifactSection) {
     reviewerArtifactSection.classList.add('hidden');
@@ -4850,7 +5253,7 @@ function openReviewerView(data: {
       activeReviewerAssistantEl,
       () => {
         data.history.forEach((m) => {
-          appendReviewerMessage(m.role as 'user' | 'assistant', m.content, false, m.attachedFile, m.executionDurationMs);
+          appendReviewerMessage(m.role as 'user' | 'assistant', m.content, false, m.attachedFile, m.executionDurationMs, m.id);
         });
       }
     );
@@ -4860,7 +5263,7 @@ function openReviewerView(data: {
     reviewerChatInputController.clearAttachments();
     reviewerChatInputController.setValue('');
     data.history.forEach((m) => {
-      appendReviewerMessage(m.role as 'user' | 'assistant', m.content, false, m.attachedFile, m.executionDurationMs);
+      appendReviewerMessage(m.role as 'user' | 'assistant', m.content, false, m.attachedFile, m.executionDurationMs, m.id);
     });
   }
 
@@ -5050,16 +5453,112 @@ function quoteAspectToReviewerInput(aspectText: string) {
   reviewerPromptInput.focus();
 }
 
+function startReviewerInlineEdit(msgEl: HTMLElement, bodyEl: HTMLElement) {
+  if (msgEl.querySelector('.reviewer-inline-edit')) return;
+
+  const rawText = msgEl.dataset.rawContent || '';
+
+  // Count downstream messages
+  let subsequentCount = 0;
+  let next = msgEl.nextElementSibling;
+  while (next) {
+    if (next.classList.contains('message')) {
+      subsequentCount++;
+    }
+    next = next.nextElementSibling;
+  }
+
+  const editContainer = document.createElement('div');
+  editContainer.className = 'reviewer-inline-edit';
+
+  const textarea = document.createElement('textarea');
+  textarea.className = 'reviewer-inline-edit-textarea';
+  textarea.value = rawText;
+
+  const actionsRow = document.createElement('div');
+  actionsRow.className = 'reviewer-inline-edit-actions';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'reviewer-inline-edit-btn cancel';
+  cancelBtn.textContent = 'Cancel';
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'reviewer-inline-edit-btn save';
+  saveBtn.textContent = 'Save & Submit';
+
+  const updateSaveDisabled = () => {
+    saveBtn.disabled = !textarea.value.trim();
+  };
+  textarea.addEventListener('input', updateSaveDisabled);
+  updateSaveDisabled();
+
+  const closeEditor = () => {
+    editContainer.remove();
+    bodyEl.style.display = '';
+  };
+
+  cancelBtn.addEventListener('click', closeEditor);
+
+  const submitEdit = () => {
+    const newContent = textarea.value.trim();
+    if (!newContent) return;
+    if (newContent === rawText.trim()) {
+      closeEditor();
+      return;
+    }
+    closeEditor();
+    vscode.postMessage({
+      type: 'EDIT_REVIEWER_MESSAGE',
+      messageId: msgEl.dataset.messageId || '',
+      newContent,
+    });
+  };
+
+  saveBtn.addEventListener('click', submitEdit);
+
+  textarea.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeEditor();
+    } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      submitEdit();
+    }
+  });
+
+  editContainer.appendChild(textarea);
+
+  if (subsequentCount > 1) {
+    const warningEl = document.createElement('div');
+    warningEl.className = 'reviewer-inline-edit-warning';
+    warningEl.textContent = `⚠️ Saving changes will discard ${subsequentCount} subsequent messages in this session.`;
+    editContainer.appendChild(warningEl);
+  }
+
+  actionsRow.appendChild(cancelBtn);
+  actionsRow.appendChild(saveBtn);
+  editContainer.appendChild(actionsRow);
+
+  bodyEl.style.display = 'none';
+  msgEl.appendChild(editContainer);
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
 function appendReviewerMessage(
   role: 'user' | 'assistant',
   content: string,
   isIncomplete = false,
   attachedFile?: AttachedFileRef,
-  executionDurationMs?: number
+  executionDurationMs?: number,
+  messageId?: string
 ): HTMLElement {
   const msgEl = document.createElement('div');
   msgEl.className = `message ${role}`;
   msgEl.dataset.rawContent = content;
+  if (messageId) {
+    msgEl.dataset.messageId = messageId;
+  }
 
   const headerEl = document.createElement('div');
   headerEl.className = 'message-header';
@@ -5116,8 +5615,27 @@ function appendReviewerMessage(
   });
   headerActions.appendChild(copyBtn);
 
-  // Retry button on user messages — lets the user re-run this prompt when the reviewer gets stuck
+  // Edit and Retry buttons on user messages
   if (role === 'user') {
+    const editBtn = document.createElement('button');
+    editBtn.className = 'msg-edit-btn';
+    editBtn.title = 'Edit prompt';
+    editBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+      </svg>
+      <span>Edit</span>
+    `;
+    if (reviewerStopBtn && !reviewerStopBtn.classList.contains('hidden')) {
+      editBtn.disabled = true;
+    }
+    editBtn.addEventListener('click', () => {
+      if (editBtn.disabled) return;
+      startReviewerInlineEdit(msgEl, bodyEl);
+    });
+    headerActions.appendChild(editBtn);
+
     const retryBtn = document.createElement('button');
     retryBtn.className = 'msg-retry-btn';
     retryBtn.title = 'Retry — re-run this prompt with the reviewer';
@@ -5128,8 +5646,12 @@ function appendReviewerMessage(
       </svg>
       <span>Retry</span>
     `;
+    if (reviewerStopBtn && !reviewerStopBtn.classList.contains('hidden')) {
+      retryBtn.disabled = true;
+    }
     retryBtn.addEventListener('click', () => {
-      vscode.postMessage({ type: 'RETRY_REVIEWER_MESSAGE' });
+      if (retryBtn.disabled) return;
+      vscode.postMessage({ type: 'RETRY_REVIEWER_MESSAGE', messageId: msgEl.dataset.messageId });
     });
     headerActions.appendChild(retryBtn);
   }
@@ -5172,9 +5694,11 @@ function appendReviewerMessage(
     metaEl.appendChild(nameSpan);
 
     const badgeSpan = document.createElement('span');
-    badgeSpan.className = 'reviewer-file-ref-badge';
+    badgeSpan.className = `reviewer-file-ref-badge${attachedFile.isPinned ? ' pinned' : ''}`;
     badgeSpan.textContent =
-      attachedFile.artifactType === 'plan'
+      attachedFile.isPinned
+        ? 'Pinned'
+        : attachedFile.artifactType === 'plan'
         ? 'Plan'
         : attachedFile.artifactType === 'walkthrough'
         ? 'Walkthrough'
@@ -5534,6 +6058,11 @@ function handleSetReviewerBusy(busy: boolean) {
     reviewerProgressManager.cleanupImmediate();
     reviewerProgressManager = null;
   }
+  const retryBtns = reviewerMessages.querySelectorAll<HTMLButtonElement>('.msg-retry-btn');
+  retryBtns.forEach((b) => (b.disabled = busy));
+  const editBtns = reviewerMessages.querySelectorAll<HTMLButtonElement>('.msg-edit-btn');
+  editBtns.forEach((b) => (b.disabled = busy));
+
   if (busy) {
     reviewerSendBtn.classList.add('hidden');
     reviewerStopBtn.classList.remove('hidden');
@@ -5585,6 +6114,7 @@ function switchToReviewerView() {
   viewUsage.classList.add('hidden');
   viewReviewer.classList.remove('hidden');
   flushReviewerStreamRender();
+  updateReviewerPinnedHeader(currentReviewerPinnedFile);
   reviewerScrollController.scrollToBottom(true);
   if (reviewerPromptInput) {
     reviewerChatInputController.focus();

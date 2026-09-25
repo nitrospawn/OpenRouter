@@ -1,5 +1,8 @@
 import test from 'node:test';
 import * as assert from 'node:assert';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import * as fs from 'node:fs';
 import * as vscode from 'vscode';
 import { Configuration } from '../src/settings/configuration';
 import { ArtifactDocumentManager } from '../src/editor/artifactDocumentManager';
@@ -317,10 +320,14 @@ test('Reviewer Sessions: Independent session lifecycle (create, load, switch, re
 
   // 2. Append messages to reviewer session
   await historyStore.appendReviewerMessage({
+    id: 'test-user-msg-1',
+    timestamp: Date.now(),
     role: 'user',
     content: 'Review this architecture proposal',
   });
   await historyStore.appendReviewerMessage({
+    id: 'test-asst-msg-1',
+    timestamp: Date.now(),
     role: 'assistant',
     content: 'The proposal looks feasible.',
   });
@@ -1048,7 +1055,7 @@ test('Phase 11 Gap: Reviewer and Main Chat input bars render distinct file-attac
   // Implement controller simulation matching createChatInputController in main.ts
   type Attachment = { id: string; name: string; data: string; isImage: boolean };
   let attachmentsList: Attachment[] = [];
-  let sentMessagePayload: string | null = null;
+  let sentMessagePayload: string = '';
 
   function handleImageFile(file: { name: string; data: string; type: string }) {
     if (!file.type.startsWith('image/')) return;
@@ -1290,7 +1297,7 @@ test('Reviewer Session Continuity: Repeat Review click attaches artifact without
   let streamCallCount = 0;
   let lastCapturedOutgoingMessages: Array<{ role: string; content: string }> = [];
   const originalSendChatCompletionStream = OpenRouterClient.sendChatCompletionStream;
-  OpenRouterClient.sendChatCompletionStream = async (
+  (OpenRouterClient as any).sendChatCompletionStream = async (
     _apiKey: string,
     _model: string,
     messages: any[],
@@ -1332,13 +1339,13 @@ test('Reviewer Session Continuity: Repeat Review click attaches artifact without
     );
     const firstSessionId = sessionsAfterFirstReview.activeSession.id;
 
-    // Verify visible user turn displays configured Reviewer System Prompt (not generic placeholder, not raw plan)
+    // Verify visible user turn displays concise review prompt (not raw plan)
     const initialUserMsg = sessionsAfterFirstReview.activeSession.messages[0];
     assert.strictEqual(initialUserMsg.role, 'user');
     assert.strictEqual(
       initialUserMsg.content,
-      customSystemPrompt,
-      'First Review click must show configured reviewer system prompt as the visible user turn'
+      'Review this plan',
+      'First Review click must show Review this plan as the visible user turn'
     );
     assert.strictEqual(
       initialUserMsg.content.includes(planMarkdown),
@@ -1607,8 +1614,8 @@ export function verifyJwt(token: string) { return true; }
     assert.strictEqual(storedUserMessage.role, 'user');
     assert.strictEqual(
       storedUserMessage.content,
-      'You are a meticulous reviewer model.',
-      'Stored initial user turn must match the configured Reviewer System Prompt text'
+      'Review this plan',
+      'Stored initial user turn must be Review this plan'
     );
     assert.strictEqual(
       storedUserMessage.content.includes(rawPlanDocument),
@@ -1631,8 +1638,8 @@ export function verifyJwt(token: string) { return true; }
     );
     assert.strictEqual(
       reviewerDataEvent.history[0].content,
-      'You are a meticulous reviewer model.',
-      'Chat bubble history must display the configured Reviewer System Prompt text'
+      'Review this plan',
+      'Chat bubble history must display Review this plan'
     );
     assert.strictEqual(
       reviewerDataEvent.history[0].content.includes(rawPlanDocument),
@@ -1658,8 +1665,8 @@ export function verifyJwt(token: string) { return true; }
     assert.ok(userMessage, 'Outgoing request must contain a user message');
     assert.strictEqual(
       userMessage.content,
-      'You are a meticulous reviewer model.',
-      'Outgoing user message turn must be the configured Reviewer System Prompt text'
+      'Review this plan',
+      'Outgoing user message turn must be Review this plan'
     );
   } finally {
     OpenRouterClient.sendChatCompletionStream = originalSendChatCompletionStream;
@@ -1730,8 +1737,8 @@ test('Reviewer Walkthrough Review: Initial user turn uses configured Reviewer Sy
     const storedUserMessage = activeSession.messages[0];
     assert.strictEqual(
       storedUserMessage.content,
-      'Custom Walkthrough Reviewer Instructions: Verify edge cases.',
-      'Stored user turn on walkthrough must match configured Reviewer System Prompt'
+      'Review this walkthrough',
+      'Stored user turn on walkthrough must be Review this walkthrough'
     );
     assert.strictEqual(
       storedUserMessage.content.includes(rawWalkthroughDocument),
@@ -1744,7 +1751,7 @@ test('Reviewer Walkthrough Review: Initial user turn uses configured Reviewer Sy
     assert.strictEqual(reviewerDataEvent.artifactContent, rawWalkthroughDocument);
     assert.strictEqual(
       reviewerDataEvent.history[0].content,
-      'Custom Walkthrough Reviewer Instructions: Verify edge cases.'
+      'Review this walkthrough'
     );
 
     const systemMessage = capturedOutgoingMessages.find((m) => m.role === 'system');
@@ -1842,7 +1849,7 @@ test('Reviewer Phase 21: Follow-up user turn with attached plan grounds document
     assert.strictEqual(storedFollowUp.content.includes(updatedPlanMarkdown), false, 'Raw plan must not be in stored message content');
     assert.ok(storedFollowUp.attachedFile, 'Stored message must retain attachedFile metadata');
     assert.strictEqual(storedFollowUp.attachedFile?.name, 'Plan docs');
-    assert.strictEqual(storedFollowUp.attachedFile?.content, updatedPlanMarkdown, 'Stored attachedFile must retain content');
+    assert.strictEqual((storedFollowUp.attachedFile as any)?.content, updatedPlanMarkdown, 'Stored attachedFile must retain content');
 
     // 4. In outgoing messages sent to model: user turn must be augmented with attached document context
     const outgoingUserMsgs = capturedOutgoingMessages.filter((m) => m.role === 'user');
@@ -1861,6 +1868,289 @@ test('Reviewer Phase 21: Follow-up user turn with attached plan grounds document
     assert.ok(systemMsg.content.includes(updatedPlanMarkdown));
   } finally {
     OpenRouterClient.sendChatCompletionStream = originalSendChatCompletionStream;
+  }
+});
+
+test('Reviewer Pinned Context: Loads workspace pinned file into system prompt and preserves across context reset', async () => {
+  const { OpenRouterPanelProvider } = require('../src/webview/panelProvider');
+  const historyStore = new HistoryStore();
+  const secretStore = { getApiKey: async () => 'test-api-key' } as any;
+  const permissionManager = {} as any;
+  const usageStore = new UsageStore();
+  const storageUri = vscode.Uri.file('C:/mock/storage');
+
+  (vscode.workspace as any)._currentWorkspaceKey = 'reviewer-pinned-context-test';
+  await Configuration.setReviewerEnabled(true);
+  await Configuration.setReviewerModel('google/gemini-2.5-flash');
+  await Configuration.setReviewerSystemPrompt('You are an expert reviewer model.');
+
+  const provider = new OpenRouterPanelProvider(
+    vscode.Uri.file('c:/mock/extension') as any,
+    secretStore,
+    historyStore,
+    permissionManager,
+    usageStore,
+    storageUri
+  );
+
+  const pinnedRelativePath = 'docs/architecture_rules.md';
+  const pinnedContent = '# Architecture Rules\n1. Strictly clean architecture\n2. No global leaks';
+
+  // Mock _loadPinnedContextContent for this unit test
+  (provider as any)._loadPinnedContextContent = async () => ({
+    relativePath: pinnedRelativePath,
+    content: pinnedContent,
+  });
+
+  // Set pinned context file setting
+  await Configuration.setReviewerPinnedContextFile(pinnedRelativePath);
+  assert.strictEqual(
+    Configuration.getReviewerPinnedContextFile(),
+    pinnedRelativePath,
+    'Pinned context file setting must be saved per workspace'
+  );
+
+  const planMsgId = 'msg-plan-pinned-context-test';
+  const planMarkdown = '## Plan\nStep 1: Build\nStep 2: Verify';
+  await historyStore.appendMessage({
+    id: planMsgId,
+    role: 'assistant',
+    content: 'Plan ready',
+    planDocument: planMarkdown,
+    timestamp: Date.now(),
+  });
+
+  const capturedOutgoingMessages: any[] = [];
+  const originalSendChatCompletionStream = OpenRouterClient.sendChatCompletionStream;
+  (OpenRouterClient as any).sendChatCompletionStream = async (
+    _apiKey: string,
+    _model: string,
+    messages: any[],
+    onChunk: (chunk: string) => void,
+    onDone: (usage: any) => Promise<void>
+  ) => {
+    capturedOutgoingMessages.push(...messages);
+    onChunk('Looks good according to rules');
+    await onDone({ prompt_tokens: 25, completion_tokens: 10, total_tokens: 35 });
+  };
+
+  try {
+    // 1. Trigger review
+    await (provider as any)._handleStartReview('plan', planMsgId);
+
+    // Assert outgoing system message contains both pinned context file content AND the plan document
+    const systemMsg = capturedOutgoingMessages.find((m) => m.role === 'system');
+    assert.ok(systemMsg, 'Outgoing request must have system message');
+    assert.ok(
+      systemMsg.content.includes('# Pinned Workspace Context (docs/architecture_rules.md):'),
+      'System prompt must include pinned context header'
+    );
+    assert.ok(
+      systemMsg.content.includes('Active Pinned Workspace Context: The file \'docs/architecture_rules.md\' is pinned by the user as authoritative project baseline guidelines.'),
+      'System prompt must include model awareness framing'
+    );
+    assert.ok(
+      systemMsg.content.includes('Strictly clean architecture'),
+      'System prompt must include pinned file contents'
+    );
+    assert.ok(
+      systemMsg.content.includes(planMarkdown),
+      'System prompt must include the plan under review'
+    );
+
+    // 2. Trigger context reset: chat history is cleared, but pinned file setting is preserved
+    await historyStore.clearActiveReviewerSession();
+    const { activeSession } = await historyStore.loadReviewerSessions();
+    assert.strictEqual(activeSession.messages.length, 0, 'Active session messages must be cleared');
+    assert.strictEqual(
+      Configuration.getReviewerPinnedContextFile(),
+      pinnedRelativePath,
+      'Pinned context file configuration must be preserved across reviewer context reset'
+    );
+  } finally {
+    OpenRouterClient.sendChatCompletionStream = originalSendChatCompletionStream;
+    await Configuration.setReviewerPinnedContextFile('');
+  }
+});
+
+test('Reviewer In-Place Retry: truncates old assistant response and streams fresh replacement', async () => {
+  const { OpenRouterPanelProvider } = require('../src/webview/panelProvider');
+  const historyStore = new HistoryStore();
+  const secretStore = { getApiKey: async () => 'test-api-key' } as any;
+  const permissionManager = {} as any;
+  const usageStore = new UsageStore();
+  const storageUri = vscode.Uri.file('C:/mock/storage');
+
+  (vscode.workspace as any)._currentWorkspaceKey = 'reviewer-retry-test';
+  await Configuration.setReviewerEnabled(true);
+  await Configuration.setReviewerModel('google/gemini-2.5-flash');
+
+  const provider = new OpenRouterPanelProvider(
+    vscode.Uri.file('c:/mock/extension') as any,
+    secretStore,
+    historyStore,
+    permissionManager,
+    usageStore,
+    storageUri
+  );
+
+  let streamCount = 0;
+  const originalSend = OpenRouterClient.sendChatCompletionStream;
+  (OpenRouterClient as any).sendChatCompletionStream = async (
+    _apiKey: string,
+    _model: string,
+    _messages: any[],
+    onChunk: (chunk: string) => void,
+    onDone: (usage: any) => Promise<void>
+  ) => {
+    streamCount++;
+    onChunk(`Critique version ${streamCount}`);
+    await onDone({ prompt_tokens: 20, completion_tokens: 15, total_tokens: 35 });
+  };
+
+  try {
+    // 1. Start initial review
+    const planMsgId = 'msg-plan-retry-test';
+    await historyStore.appendMessage({
+      id: planMsgId,
+      role: 'assistant',
+      content: 'Plan ready',
+      planDocument: '## Database Plan',
+      timestamp: Date.now(),
+    });
+
+    await (provider as any)._handleStartReview('plan', planMsgId);
+    let { activeSession } = await historyStore.loadReviewerSessions();
+    assert.strictEqual(activeSession.messages.length, 2, 'Initial review must produce 1 user and 1 assistant message');
+    assert.strictEqual(activeSession.messages[0].role, 'user');
+    assert.strictEqual(activeSession.messages[1].role, 'assistant');
+    assert.strictEqual(activeSession.messages[1].content, 'Critique version 1');
+
+    const firstUserMsgId = activeSession.messages[0].id;
+
+    // 2. Trigger retry on that user prompt
+    await (provider as any)._handleRetryReviewerMessage(firstUserMsgId);
+
+    const reloaded = await historyStore.loadReviewerSessions();
+    activeSession = reloaded.activeSession;
+
+    // Messages length must still be 2 (old assistant response was cleanly replaced, not stacked!)
+    assert.strictEqual(activeSession.messages.length, 2, 'In-place retry must replace assistant response without stacking');
+    assert.strictEqual(activeSession.messages[0].id, firstUserMsgId);
+    assert.strictEqual(activeSession.messages[1].content, 'Critique version 2');
+  } finally {
+    OpenRouterClient.sendChatCompletionStream = originalSend;
+  }
+});
+
+test('Reviewer Inline Edit: updates prompt text, preserves attached plan artifact, and regenerates response', async () => {
+  const { OpenRouterPanelProvider } = require('../src/webview/panelProvider');
+  const historyStore = new HistoryStore();
+  const secretStore = { getApiKey: async () => 'test-api-key' } as any;
+  const permissionManager = {} as any;
+  const usageStore = new UsageStore();
+  const storageUri = vscode.Uri.file('C:/mock/storage');
+
+  (vscode.workspace as any)._currentWorkspaceKey = 'reviewer-edit-test';
+  await Configuration.setReviewerEnabled(true);
+  await Configuration.setReviewerModel('google/gemini-2.5-flash');
+
+  const provider = new OpenRouterPanelProvider(
+    vscode.Uri.file('c:/mock/extension') as any,
+    secretStore,
+    historyStore,
+    permissionManager,
+    usageStore,
+    storageUri
+  );
+
+  let streamCount = 0;
+  const originalSend = OpenRouterClient.sendChatCompletionStream;
+  (OpenRouterClient as any).sendChatCompletionStream = async (
+    _apiKey: string,
+    _model: string,
+    _messages: any[],
+    onChunk: (chunk: string) => void,
+    onDone: (usage: any) => Promise<void>
+  ) => {
+    streamCount++;
+    onChunk(`Critique response ${streamCount}`);
+    await onDone({ prompt_tokens: 20, completion_tokens: 15, total_tokens: 35 });
+  };
+
+  try {
+    const planMsgId = 'msg-plan-edit-test';
+    await historyStore.appendMessage({
+      id: planMsgId,
+      role: 'assistant',
+      content: 'Plan ready',
+      planDocument: '## Architecture Plan',
+      timestamp: Date.now(),
+    });
+
+    await (provider as any)._handleStartReview('plan', planMsgId);
+    let { activeSession } = await historyStore.loadReviewerSessions();
+    const firstUserMsg = activeSession.messages[0];
+    assert.ok(firstUserMsg.attachedFile, 'Initial user message must have attachedFile plan reference');
+    assert.strictEqual(firstUserMsg.attachedFile?.name, 'Plan docs');
+
+    // Edit user prompt text
+    const editedPrompt = 'Review this plan with a focus on database scalability';
+    await (provider as any)._handleEditReviewerMessage(firstUserMsg.id, editedPrompt);
+
+    const reloaded = await historyStore.loadReviewerSessions();
+    activeSession = reloaded.activeSession;
+
+    assert.strictEqual(activeSession.messages.length, 2, 'Session must have 2 messages (edited prompt + new response)');
+    assert.strictEqual(activeSession.messages[0].content, editedPrompt, 'User message content must be updated');
+    assert.ok(activeSession.messages[0].attachedFile, 'Attached file reference must be strictly preserved after edit');
+    assert.strictEqual(activeSession.messages[0].attachedFile?.name, 'Plan docs');
+    assert.strictEqual(activeSession.messages[1].content, 'Critique response 2', 'Assistant response must be regenerated');
+  } finally {
+    OpenRouterClient.sendChatCompletionStream = originalSend;
+  }
+});
+
+test('Reviewer Generation Lock: edit and retry are rejected while active stream is running', async () => {
+  const { OpenRouterPanelProvider } = require('../src/webview/panelProvider');
+  const historyStore = new HistoryStore();
+  const secretStore = { getApiKey: async () => 'test-api-key' } as any;
+  const permissionManager = {} as any;
+  const usageStore = new UsageStore();
+  const storageUri = vscode.Uri.file('C:/mock/storage');
+
+  (vscode.workspace as any)._currentWorkspaceKey = 'reviewer-lock-test';
+  await Configuration.setReviewerEnabled(true);
+  await Configuration.setReviewerModel('google/gemini-2.5-flash');
+
+  const provider = new OpenRouterPanelProvider(
+    vscode.Uri.file('c:/mock/extension') as any,
+    secretStore,
+    historyStore,
+    permissionManager,
+    usageStore,
+    storageUri
+  );
+
+  let streamTriggered = false;
+  const originalSend = OpenRouterClient.sendChatCompletionStream;
+  OpenRouterClient.sendChatCompletionStream = async () => {
+    streamTriggered = true;
+  };
+
+  try {
+    // Simulate active generation stream
+    (provider as any)._activeReviewerAbortController = new AbortController();
+
+    // Attempt retry and edit while busy
+    await (provider as any)._handleRetryReviewerMessage('test-id');
+    assert.strictEqual(streamTriggered, false, 'Retry must be rejected while generation is active');
+
+    await (provider as any)._handleEditReviewerMessage('test-id', 'New prompt');
+    assert.strictEqual(streamTriggered, false, 'Edit must be rejected while generation is active');
+  } finally {
+    (provider as any)._activeReviewerAbortController = undefined;
+    OpenRouterClient.sendChatCompletionStream = originalSend;
   }
 });
 
