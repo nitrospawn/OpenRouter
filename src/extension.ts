@@ -8,11 +8,15 @@ import { OpenRouterPanelProvider } from './webview/panelProvider';
 import { DiagnosticManager } from './diagnostics/diagnosticManager';
 import { logger } from './logger';
 import { UsageStore } from './usage/usageStore';
+import { MemoryManifest } from './memory/memoryManifest';
 
 export function activate(context: vscode.ExtensionContext) {
   // Initialize diagnostic logger first so all subsequent code can use it
   logger.initialize(context.storageUri, context.globalStorageUri);
   logger.info('EXT', 'Extension activating');
+
+  // Initialize MemoryManifest with workspace storageUri (stores activity_log.md in AppData, outside project files)
+  MemoryManifest.initialize(context.storageUri);
 
   const secretStore = new SecretStore(context);
   const historyStore = new HistoryStore(context.storageUri);
@@ -307,6 +311,29 @@ export function activate(context: vscode.ExtensionContext) {
       const uri = vscode.Uri.file(logPath);
       await vscode.window.showTextDocument(uri, { preview: false });
       logger.info('CMD', 'Diagnostic log file opened in editor');
+    })
+  );
+
+  // Command to open the workspace activity log / memory in editor
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openrouter.openActivityLog', async () => {
+      const manifestUri = MemoryManifest.getManifestUri();
+      if (!manifestUri) {
+        vscode.window.showWarningMessage('OpenRouter: No workspace memory found.');
+        return;
+      }
+      try {
+        await vscode.workspace.fs.stat(manifestUri);
+      } catch {
+        // If file doesn't exist yet, create empty file
+        try {
+          const parentDir = vscode.Uri.joinPath(manifestUri, '..');
+          await vscode.workspace.fs.createDirectory(parentDir);
+          await vscode.workspace.fs.writeFile(manifestUri, new TextEncoder().encode('# OpenRouter Workspace Activity Log & Model Memory\n\nNo activities recorded yet.\n'));
+        } catch {}
+      }
+      await vscode.window.showTextDocument(manifestUri, { preview: false });
+      logger.info('CMD', 'Activity log / memory opened in editor');
     })
   );
 

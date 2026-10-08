@@ -39,3 +39,49 @@ test('MemoryManifest: handles plain markdown lines without meta comment graceful
   assert.strictEqual(entries[1].status, 'reverted');
   assert.strictEqual(entries[1].taskTitle, 'Old test');
 });
+
+test('Configuration: Workspace Memory in Context defaults to true and updates per-workspace', async () => {
+  const { Configuration } = await import('../src/settings/configuration');
+
+  // Default is true
+  assert.strictEqual(Configuration.getWorkspaceMemoryInContext(), true);
+
+  // Toggle off
+  await Configuration.setWorkspaceMemoryInContext(false);
+  assert.strictEqual(Configuration.getWorkspaceMemoryInContext(), false);
+
+  // Toggle back on immediately without reload
+  await Configuration.setWorkspaceMemoryInContext(true);
+  assert.strictEqual(Configuration.getWorkspaceMemoryInContext(), true);
+});
+
+test('GitignoreRespect: protects .openrouter directory from shadow git restore / commits', async () => {
+  const { GitignoreRespect } = await import('../src/shadowGit/gitignoreRespect');
+
+  assert.strictEqual(GitignoreRespect.isIgnored('C:/mock/workspace', '.openrouter/activity_log.md'), true);
+  assert.strictEqual(GitignoreRespect.isIgnored('C:/mock/workspace', '.openrouter\\activity_log.md'), true);
+  assert.strictEqual(GitignoreRespect.isIgnored('C:/mock/workspace', 'src/app.ts'), false);
+});
+
+test('MemoryManifest: storageUri initialization directs manifest Uri to storageUri/memory/activity_log.md', async () => {
+  const vscode = await import('vscode');
+  const mockStorageUri = vscode.Uri.file('C:/Users/test/AppData/Roaming/Code/User/workspaceStorage/test-hash');
+
+  MemoryManifest.initialize(mockStorageUri);
+  const manifestUri = MemoryManifest.getManifestUri();
+
+  assert.ok(manifestUri !== null);
+  const normalizedPath = manifestUri.fsPath.replace(/\\/g, '/');
+  assert.ok(
+    normalizedPath.endsWith('/memory/activity_log.md'),
+    `Expected path to end with /memory/activity_log.md, got ${normalizedPath}`
+  );
+  assert.ok(
+    normalizedPath.includes('workspaceStorage/test-hash'),
+    `Expected path to include storage directory, got ${normalizedPath}`
+  );
+
+  // Clean up
+  MemoryManifest.initialize(undefined);
+});
+

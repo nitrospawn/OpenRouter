@@ -195,26 +195,43 @@ export class OpenRouterClient {
     model: string,
     messages: ChatMessage[]
   ): Promise<ChatCompletionResponse> {
-    const res = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey.trim()}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://github.com/openrouter',
-        'X-Title': 'OpenRouter VSCode Extension',
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-      }),
-    });
+    const maxRetries = 2;
+    let attempt = 0;
 
-    const json = (await res.json()) as ChatCompletionResponse;
-    if (!res.ok) {
-      throw new Error(json.error?.message || `Request failed with HTTP ${res.status}`);
+    while (attempt <= maxRetries) {
+      const res = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey.trim()}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://github.com/openrouter',
+          'X-Title': 'OpenRouter VSCode Extension',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+        }),
+      });
+
+      if (!res.ok) {
+        if ((res.status >= 500 || res.status === 429) && attempt < maxRetries) {
+          attempt++;
+          logger.warn('API', `sendChatCompletion HTTP ${res.status} — retry ${attempt}/${maxRetries} in ${attempt * 800}ms`);
+          await new Promise((r) => setTimeout(r, attempt * 800));
+          continue;
+        }
+        let errMsg = `Request failed with HTTP ${res.status}`;
+        try {
+          const errJson = (await res.json()) as ChatCompletionResponse;
+          if (errJson?.error?.message) { errMsg = errJson.error.message; }
+        } catch { /* ignore */ }
+        throw new Error(errMsg);
+      }
+
+      return (await res.json()) as ChatCompletionResponse;
     }
 
-    return json;
+    throw new Error('sendChatCompletion: max retries exceeded');
   }
 
   /**

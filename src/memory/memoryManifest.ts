@@ -14,20 +14,43 @@ export interface MemoryManifestEntry {
 }
 
 export class MemoryManifest {
-  private static readonly MANIFEST_DIR = '.openrouter';
   private static readonly MANIFEST_FILE = 'activity_log.md';
   private static readonly MAX_ENTRIES_ON_DISK = 100;
   private static readonly MAX_ENTRIES_IN_PROMPT = 15;
+  private static storageUri: vscode.Uri | undefined;
 
   /**
-   * Retrieves the absolute Uri for .openrouter/activity_log.md in the current workspace.
+   * Initializes the MemoryManifest with extension storageUri.
+   */
+  public static initialize(storageUri?: vscode.Uri): void {
+    this.storageUri = storageUri;
+  }
+
+  /**
+   * Retrieves the absolute Uri for activity_log.md.
+   * Prioritizes workspace storageUri/memory/activity_log.md (completely outside workspace files),
+   * with fallback to legacy workspace .openrouter/activity_log.md.
    */
   public static getManifestUri(): vscode.Uri | null {
+    if (this.storageUri) {
+      return vscode.Uri.joinPath(this.storageUri, 'memory', this.MANIFEST_FILE);
+    }
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders || workspaceFolders.length === 0) {
       return null;
     }
-    return vscode.Uri.joinPath(workspaceFolders[0].uri, this.MANIFEST_DIR, this.MANIFEST_FILE);
+    return vscode.Uri.joinPath(workspaceFolders[0].uri, '.openrouter', this.MANIFEST_FILE);
+  }
+
+  /**
+   * Retrieves legacy workspace .openrouter/activity_log.md Uri if it exists.
+   */
+  private static getLegacyWorkspaceUri(): vscode.Uri | null {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+      return null;
+    }
+    return vscode.Uri.joinPath(workspaceFolders[0].uri, '.openrouter', this.MANIFEST_FILE);
   }
 
   /**
@@ -130,7 +153,9 @@ export class MemoryManifest {
   }
 
   /**
-   * Reads and parses all entries from .openrouter/activity_log.md.
+   * Reads and parses all entries from activity_log.md.
+   * If storageUri is used and no log exists yet, seamlessly migrates existing entries
+   * from legacy workspace .openrouter/activity_log.md so no past history is lost.
    */
   public static async readAllEntries(): Promise<MemoryManifestEntry[]> {
     const uri = this.getManifestUri();
@@ -141,6 +166,23 @@ export class MemoryManifest {
       const content = new TextDecoder('utf-8').decode(rawBytes);
       return this.parseMarkdown(content);
     } catch {
+      // If primary storage file doesn't exist yet, check legacy workspace location
+      const legacyUri = this.getLegacyWorkspaceUri();
+      if (legacyUri && uri.toString() !== legacyUri.toString()) {
+        try {
+          const legacyBytes = await vscode.workspace.fs.readFile(legacyUri);
+          const legacyContent = new TextDecoder('utf-8').decode(legacyBytes);
+          const parsed = this.parseMarkdown(legacyContent);
+          if (parsed.length > 0) {
+            // Migrate to storageUri location
+            await this.saveEntries(parsed);
+            logger.info('MEMORY', `Migrated ${parsed.length} entries from legacy workspace .openrouter to storageUri`);
+          }
+          return parsed;
+        } catch {
+          // ignore
+        }
+      }
       return [];
     }
   }

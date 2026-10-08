@@ -2,7 +2,7 @@
   "name": "openrouter",
   "displayName": "OpenRouter",
   "description": "VS Code extension connecting to OpenRouter for flexible model choice, in-editor assistance, and transparent cost tracking.",
-  "version": "0.4.7",
+  "version": "0.4.9",
   "publisher": "qubators",
   "engines": {
     "vscode": "^1.85.0"
@@ -87,6 +87,10 @@
       {
         "command": "openrouter.openDiagnosticLog",
         "title": "OpenRouter: Open Diagnostic Log File"
+      },
+      {
+        "command": "openrouter.openActivityLog",
+        "title": "OpenRouter: Open Activity Log / Workspace Memory"
       }
     ],
     "menus": {
@@ -156,6 +160,12 @@
           "default": true,
           "description": "Show warnings when selecting models whose providers may collect or train on prompt data."
         },
+        "openrouter.context.workspaceMemoryInContext": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Include recent workspace activity from memory/activity_log.md in the AI context prompt."
+        },
         "openrouter.diagnostics.includeWarnings": {
           "type": "boolean",
           "default": false,
@@ -195,6 +205,30 @@
           "default": "",
           "scope": "resource",
           "description": "Workspace-relative file path automatically attached into the Reviewer Model context on every review (per-workspace)."
+        },
+        "openrouter.notificationSound": {
+          "type": "boolean",
+          "default": true,
+          "description": "Play a notification chime when the agent finishes responding or completes a task."
+        },
+        "openrouter.notificationTone": {
+          "type": "string",
+          "enum": [
+            "bell",
+            "chime",
+            "pop",
+            "ding"
+          ],
+          "default": "bell",
+          "description": "Notification sound tone preset for task and message completion."
+        },
+        "openrouter.models.agenticOverrides": {
+          "type": "object",
+          "default": {},
+          "description": "Per-model agentic mode overrides. Set a model ID to true to force agentic plan/walkthrough mode, or false to disable it. Example: { \"qwen/qwen2.5-coder-7b-instruct\": true }",
+          "additionalProperties": {
+            "type": "boolean"
+          }
         }
       }
     }

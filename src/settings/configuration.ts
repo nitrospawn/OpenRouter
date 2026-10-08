@@ -43,6 +43,16 @@ export class Configuration {
     await config.update('fullHistoryResend', val, vscode.ConfigurationTarget.Global);
   }
 
+  public static getWorkspaceMemoryInContext(): boolean {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    return config.get<boolean>('context.workspaceMemoryInContext', true);
+  }
+
+  public static async setWorkspaceMemoryInContext(val: boolean): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('context.workspaceMemoryInContext', val, vscode.ConfigurationTarget.Workspace);
+  }
+
   public static getRedactionMode(): 'mask' | 'block_and_warn' {
     const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
     return config.get<'mask' | 'block_and_warn'>('privacy.redactionMode', 'mask');
@@ -153,6 +163,43 @@ Provide a constructive, prioritized critique with clear, actionable recommendati
   public static async setReviewerPinnedContextFile(filePath: string): Promise<void> {
     const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
     await config.update('reviewer.pinnedContextFile', filePath ? filePath.trim() : undefined, vscode.ConfigurationTarget.Workspace);
+  }
+
+  public static getNotificationSound(): boolean {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    return config.get<boolean>('notificationSound', true);
+  }
+
+  public static async setNotificationSound(enabled: boolean): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('notificationSound', enabled, vscode.ConfigurationTarget.Global);
+  }
+
+  public static getNotificationTone(): 'bell' | 'chime' | 'pop' | 'ding' {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    return config.get<'bell' | 'chime' | 'pop' | 'ding'>('notificationTone', 'bell');
+  }
+
+  public static async setNotificationTone(tone: 'bell' | 'chime' | 'pop' | 'ding'): Promise<void> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    await config.update('notificationTone', tone, vscode.ConfigurationTarget.Global);
+  }
+
+  /**
+   * Returns a map of modelId → boolean for user-defined agentic overrides.
+   * Example setting value: { "qwen/qwen2.5-coder-7b-instruct": true, "some/tiny-model": false }
+   */
+  public static getAgenticOverrides(): Record<string, boolean> {
+    const config = vscode.workspace.getConfiguration(this.CONFIG_SECTION);
+    const raw = config.get<Record<string, boolean>>('models.agenticOverrides', {});
+    // Validate: ensure values are booleans, silently drop invalid entries
+    const result: Record<string, boolean> = {};
+    for (const [key, val] of Object.entries(raw)) {
+      if (typeof val === 'boolean') {
+        result[key] = val;
+      }
+    }
+    return result;
   }
 }
 

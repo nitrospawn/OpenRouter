@@ -112,6 +112,10 @@ export class TerminalOutputTracker {
     return `${head}\n\n...[output truncated due to size]...\n\n${tail}`;
   }
 
+  public static getRecentOutputs(): readonly CapturedOutput[] {
+    return [...this.recentOutputs];
+  }
+
   /**
    * Returns formatted recent terminal outputs to be included in context.
    * This includes both completed commands and still-running commands.

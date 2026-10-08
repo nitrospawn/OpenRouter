@@ -7,6 +7,7 @@ import { detectModelCapabilities } from '../api/modelCapabilities';
 import { HistoryStore } from '../conversation/historyStore';
 import { Configuration } from '../settings/configuration';
 import { PermissionManager } from '../permissions/permissionManager';
+import { ConfirmationDialogs } from '../permissions/confirmationDialogs';
 import { DiffPreviewManager } from '../editor/diffPreview';
 import { ContextReader } from '../editor/contextReader';
 import { TerminalOutputTracker } from '../terminal/terminalOutputTracker';
@@ -29,6 +30,76 @@ import { extractArtifacts } from '../prompt/responseParser';
 import { ArtifactDocumentManager } from '../editor/artifactDocumentManager';
 import { ReviewerCommentController } from '../comments/reviewerCommentController';
 import { EXTENSION_VERSION } from '../version';
+
+/**
+ * Extract candidate file references mentioned in a user message.
+ * Scans for explicit @mentions, quoted filenames, bare filenames with recognized extensions,
+ * and common file operation intent patterns (e.g. "copy PRD.md into prdv2.md").
+ */
+export function extractFileMentions(message: string): string[] {
+  if (!message || typeof message !== 'string') return [];
+
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const addCandidate = (raw: string, matchIndex?: number) => {
+    if (!raw) return;
+    // Discard matches that appear inside URL schemes
+    if (typeof matchIndex === 'number' && matchIndex >= 0) {
+      const prefix = message.slice(Math.max(0, matchIndex - 12), matchIndex);
+      if (/:\/\/[^\s]*$/i.test(prefix) || /https?:\/\/[^\s]*$/i.test(prefix)) {
+        return;
+      }
+    }
+
+    let cleaned = raw.trim();
+    // Strip leading @ or file:
+    cleaned = cleaned.replace(/^@(?:file:)?/, '');
+    // Strip surrounding quotes
+    cleaned = cleaned.replace(/^["'`\u2018\u2019\u201c\u201d]+|["'`\u2018\u2019\u201c\u201d]+$/g, '');
+    // Strip leading ./ or .\
+    cleaned = cleaned.replace(/^\.[\/\\]/, '');
+    // Strip trailing punctuation
+    cleaned = cleaned.replace(/[.,;:]+$/, '');
+    cleaned = cleaned.trim();
+
+    if (!cleaned || cleaned.length < 3) return;
+    if (/^https?:\/\//i.test(cleaned) || cleaned.includes('://')) return;
+
+    const lower = cleaned.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      candidates.push(cleaned);
+    }
+  };
+
+  // 1. Explicit @ mentions: @(?:file:)?([\w\-./\\]+\.[\w]+)
+  const atMentionRegex = /@(?:file:)?([\w\-./\\]+\.[\w]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = atMentionRegex.exec(message)) !== null) {
+    addCandidate(m[1], m.index);
+  }
+
+  // 2. Quoted filenames: ["'`\u2018\u2019\u201c\u201d]([\w\-./\\]+\.[\w]{1,10})["'`\u2018\u2019\u201c\u201d]
+  const quotedRegex = /["'`\u2018\u2019\u201c\u201d]([\w\-./\\]+\.[\w]{1,10})["'`\u2018\u2019\u201c\u201d]/g;
+  while ((m = quotedRegex.exec(message)) !== null) {
+    addCandidate(m[1], m.index);
+  }
+
+  // 3. Bare filenames with recognized extensions
+  const bareRegex = /\b([\w\-./\\]+\.(?:md|ts|js|tsx|jsx|json|yaml|yml|txt|dart|py|cs|java|swift|kt|go|rs|html|css|env|prisma|sql|sh|bat|ps1))\b/gi;
+  while ((m = bareRegex.exec(message)) !== null) {
+    addCandidate(m[1], m.index);
+  }
+
+  // 4. Intent patterns (e.g. "copy PRD.md", "read foo.dart", "into bar.ts", "based on spec.md")
+  const intentRegex = /\b(?:copy|read|open|check|inspect|look at|view|into|from|to|update|edit|based on)\s+["'`\u2018\u2019\u201c\u201d]?([\w\-./\\]+\.[\w]{1,10})["'`\u2018\u2019\u201c\u201d]?(?=[^\w\-./\\]|$)/gi;
+  while ((m = intentRegex.exec(message)) !== null) {
+    addCandidate(m[1], m.index);
+  }
+
+  return candidates.slice(0, 5);
+}
 
 export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'openrouter.chatView';
@@ -302,6 +373,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       this._checkpointManager = new CheckpointManager(this._shadowRepo);
       this._scopedRestore = new ScopedRestore(this._shadowRepo);
     }
+    ConfirmationDialogs.onPermissionPrompt = () => {
+      this._postMessage({ type: 'PLAY_NOTIFICATION_SOUND' });
+    };
   }
 
   public resolveWebviewView(
@@ -348,7 +422,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           logger.info('USER', `User selected model: ${data.modelId}`);
           await Configuration.setLastModel(data.modelId);
           const model = this._cachedModels.find((m) => m.id === data.modelId);
-          const capabilities = detectModelCapabilities(model);
+          const capabilities = detectModelCapabilities(model, Configuration.getAgenticOverrides());
           this._postMessage({
             type: 'SET_SELECTED_MODEL',
             modelId: data.modelId,
@@ -396,14 +470,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
           }
 
-          const initialRetryContext = isExecutionIntent
+          const isResumeIntent = Boolean((data as any).isResume);
+          const initialRetryContext = (isExecutionIntent || isResumeIntent)
             ? { retryCount: 0, failedCommands: new Set<string>(), autoTurnCount: 0, isAutoFollowUp: true }
             : undefined;
           await this._handleSendMessage(
             data.content,
             data.modelId,
             data.images,
-            data.messageId,
+            isResumeIntent ? undefined : data.messageId,
             data.reasoningEffort || this._activeReasoningEffort,
             initialRetryContext,
             data.isRetry,
@@ -1107,7 +1182,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
           // 4. Windows path missing drive letter (e.g. Users\HP\...)
           if (!fileUri && process.platform === 'win32' && /^[\\/]?[uU]sers[\\/]/.test(targetPath)) {
-            const withDrive = 'C:\\' + targetPath.replace(/^[\\/]/, '');
+            const sysDrive = (process.env.SystemDrive || 'C:').replace(/[\\/]+$/, '');
+            const withDrive = sysDrive + '\\' + targetPath.replace(/^[\\/]/, '');
             if (fs.existsSync(withDrive)) {
               fileUri = vscode.Uri.file(withDrive);
             }
@@ -1506,8 +1582,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         case 'SET_CONTEXT_SETTING':
           if (data.key === 'autoSummarize') {
             await Configuration.setAutoSummarize(data.value);
-          } else {
+          } else if (data.key === 'fullHistoryResend') {
             await Configuration.setFullHistoryResend(data.value);
+          } else if (data.key === 'workspaceMemoryInContext') {
+            await Configuration.setWorkspaceMemoryInContext(data.value);
+            logger.info('MEMORY', `Workspace memory in context setting changed to: ${data.value}`);
           }
           await this._sendSettingsData();
           break;
@@ -1556,6 +1635,18 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               activeSessionId: activeSession.id,
             });
           }
+          await this._sendSettingsData();
+          break;
+
+        case 'SET_NOTIFICATION_SOUND':
+          await Configuration.setNotificationSound(data.enabled);
+          logger.info('SETTINGS', `Notification sound setting changed to: ${data.enabled}`);
+          await this._sendSettingsData();
+          break;
+
+        case 'SET_NOTIFICATION_TONE':
+          await Configuration.setNotificationTone(data.tone);
+          logger.info('SETTINGS', `Notification tone preset changed to: ${data.tone}`);
           await this._sendSettingsData();
           break;
 
@@ -1696,6 +1787,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const permissions = this._permissionManager.getAllStates();
     const autoSummarize = Configuration.getAutoSummarize();
     const fullHistoryResend = Configuration.getFullHistoryResend();
+    const workspaceMemoryInContext = Configuration.getWorkspaceMemoryInContext();
     const redactionMode = Configuration.getRedactionMode();
     const dataCollectionPolicy = Configuration.getDataCollectionPolicy();
     const warnOnDataTraining = Configuration.getWarnOnDataTraining();
@@ -1704,6 +1796,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const reviewerReasoningEffort = Configuration.getReviewerReasoningEffort();
     const reviewerSystemPrompt = Configuration.getReviewerSystemPrompt();
     const reviewerPinnedContextFile = Configuration.getReviewerPinnedContextFile();
+    const notificationSound = Configuration.getNotificationSound();
+    const notificationTone = Configuration.getNotificationTone();
 
     const formatted = this._cachedModels.map((m) => {
       // Model supports ZDR if top_provider does not allow data collection or explicit support flag
@@ -1729,6 +1823,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       permissions,
       autoSummarize,
       fullHistoryResend,
+      workspaceMemoryInContext,
       redactionMode,
       dataCollectionPolicy,
       warnOnDataTraining,
@@ -1738,6 +1833,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       reviewerReasoningEffort,
       reviewerSystemPrompt,
       reviewerPinnedContextFile,
+      notificationSound,
+      notificationTone,
     });
   }
 
@@ -1843,7 +1940,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         if (!supportsZdr && enforceZdr) {
           hiddenZdrCount++;
         }
-        const caps = detectModelCapabilities(m);
+        const caps = detectModelCapabilities(m, Configuration.getAgenticOverrides());
         return {
           id: m.id,
           name: m.name,
@@ -1865,7 +1962,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       const lastModel = Configuration.getLastModel() || (formatted[0]?.id ?? '');
       if (lastModel) {
         const found = this._cachedModels.find((m) => m.id === lastModel);
-        const capabilities = detectModelCapabilities(found);
+        const capabilities = detectModelCapabilities(found, Configuration.getAgenticOverrides());
         const supportsZdr = found?.top_provider?.allow_data_collection === false || found?.supports_zdr === true;
         this._postMessage({
           type: 'SET_SELECTED_MODEL',
@@ -1889,7 +1986,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     images?: Array<{ name: string; dataUrl: string }>,
     clientMessageId?: string,
     reasoningEffort?: string,
-    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number },
+    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number; hasDelegatedFailure?: boolean },
     isRetry?: boolean,
     userTypedText?: string,
     attachments?: any[]
@@ -2095,8 +2192,107 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       };
     }
 
+    const MAX_REFERENCED_CONTENT_CHARS = 120_000;
+    let totalReferencedChars = 0;
+    let remainingRefTokens = Math.min(availableFileTokens, 30000);
+
     const referencedFileResults: Array<{ relativePath: string; content: string; batch?: FileBatchMetadata }> = [];
     let missingReferencedFile: string | undefined;
+
+    const normalizePathForCompare = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+    const activeRelativeNorm = editorCtx.relativePath ? normalizePathForCompare(editorCtx.relativePath) : '';
+
+    // Proactively scan user message for file references and resolve before building prompt
+    const candidateMentions = extractFileMentions(processedContent);
+    if (content && content !== processedContent) {
+      for (const m of extractFileMentions(content)) {
+        if (!candidateMentions.includes(m)) {
+          candidateMentions.push(m);
+        }
+      }
+    }
+
+    for (const candidate of candidateMentions) {
+      if (remainingRefTokens <= 1000 || totalReferencedChars >= MAX_REFERENCED_CONTENT_CHARS) {
+        break;
+      }
+      const candNorm = normalizePathForCompare(candidate);
+      const isCandidateActive = activeRelativeNorm && (
+        candNorm === activeRelativeNorm ||
+        activeRelativeNorm.endsWith('/' + candNorm) ||
+        candNorm.endsWith('/' + activeRelativeNorm)
+      );
+      if (isCandidateActive) continue;
+
+      const isAlreadyReferenced = referencedFileResults.some(r => {
+        const rNorm = normalizePathForCompare(r.relativePath);
+        return rNorm === candNorm || rNorm.endsWith('/' + candNorm) || candNorm.endsWith('/' + rNorm);
+      });
+      if (isAlreadyReferenced) continue;
+
+      try {
+        const baseName = path.basename(candidate);
+        this._postMessage({
+          type: 'AGENT_PROGRESS',
+          phase: 'reading',
+          label: 'Reading referenced file',
+          detail: baseName,
+        });
+        this._postMessage({
+          type: 'SET_BUSY',
+          busy: true,
+          statusText: `Reading file: ${baseName}...`,
+        });
+
+        const matched = await ContextReader.findAndReadWorkspaceFile(candidate, this._permissionManager);
+        if (matched) {
+          const matchedNorm = normalizePathForCompare(matched.relativePath);
+          if (activeRelativeNorm && (matchedNorm === activeRelativeNorm || matchedNorm.endsWith('/' + activeRelativeNorm))) {
+            continue;
+          }
+          if (referencedFileResults.some(r => normalizePathForCompare(r.relativePath) === matchedNorm)) {
+            continue;
+          }
+
+          let refContent = matched.content;
+          let refBatch: FileBatchMetadata | undefined;
+          if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
+            const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
+            const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
+            refContent = chosenBatch.content;
+            refBatch = {
+              batchIndex: chosenBatch.batchIndex,
+              totalBatches: chosenBatch.totalBatches,
+              startLine: chosenBatch.startLine,
+              endLine: chosenBatch.endLine,
+              totalLines: chosenBatch.totalLines,
+            };
+          }
+
+          if (totalReferencedChars + refContent.length > MAX_REFERENCED_CONTENT_CHARS) {
+            const allowed = MAX_REFERENCED_CONTENT_CHARS - totalReferencedChars;
+            if (allowed <= 0) break;
+            refContent = refContent.slice(0, allowed);
+          }
+
+          const tokensUsed = ChunkManager.estimateTokens(refContent);
+          remainingRefTokens -= tokensUsed;
+          totalReferencedChars += refContent.length;
+
+          referencedFileResults.push({
+            relativePath: matched.relativePath,
+            content: refContent,
+            batch: refBatch,
+          });
+        } else {
+          if (!missingReferencedFile) {
+            missingReferencedFile = candidate;
+          }
+        }
+      } catch {
+        // Fail silently
+      }
+    }
 
     // Discover all workspace files mentioned in the prompt, reviewer feedback, or attachments
     const mentionedFiles: string[] = [];
@@ -2147,7 +2343,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       if (matchedWf && matchedWf !== editorCtx.relativePath && !mentionedFiles.includes(matchedWf)) {
         mentionedFiles.push(matchedWf);
       } else if (!matchedWf && /\b(?:file|to|in|edit|update)\s+([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)\b/i.test(fm[0])) {
-        missingReferencedFile = raw;
+        if (!missingReferencedFile) {
+          missingReferencedFile = raw;
+        }
       }
     }
 
@@ -2172,9 +2370,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     }
 
     // Allocate token budget across mentioned files (up to availableFileTokens or 30,000 tokens)
-    let remainingRefTokens = Math.min(availableFileTokens, 30000);
     for (const wf of mentionedFiles.slice(0, 8)) {
-      if (remainingRefTokens <= 1000) break;
+      if (remainingRefTokens <= 1000 || totalReferencedChars >= MAX_REFERENCED_CONTENT_CHARS) break;
+      const wfNorm = normalizePathForCompare(wf);
+      if (referencedFileResults.some(r => {
+        const rNorm = normalizePathForCompare(r.relativePath);
+        return rNorm === wfNorm || rNorm.endsWith('/' + wfNorm) || wfNorm.endsWith('/' + rNorm);
+      })) {
+        continue;
+      }
       const baseName = path.basename(wf);
       this._postMessage({
         type: 'AGENT_PROGRESS',
@@ -2187,29 +2391,50 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         busy: true,
         statusText: `Reading file: ${baseName}...`,
       });
-      const matched = await ContextReader.findAndReadWorkspaceFile(wf, this._permissionManager);
-      if (matched) {
-        let refContent = matched.content;
-        let refBatch: FileBatchMetadata | undefined;
-        if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
-          const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
-          const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
-          refContent = chosenBatch.content;
-          refBatch = {
-            batchIndex: chosenBatch.batchIndex,
-            totalBatches: chosenBatch.totalBatches,
-            startLine: chosenBatch.startLine,
-            endLine: chosenBatch.endLine,
-            totalLines: chosenBatch.totalLines,
-          };
+      try {
+        const matched = await ContextReader.findAndReadWorkspaceFile(wf, this._permissionManager);
+        if (matched) {
+          const matchedNorm = normalizePathForCompare(matched.relativePath);
+          if (activeRelativeNorm && (matchedNorm === activeRelativeNorm || matchedNorm.endsWith('/' + activeRelativeNorm))) {
+            continue;
+          }
+          if (referencedFileResults.some(r => normalizePathForCompare(r.relativePath) === matchedNorm)) {
+            continue;
+          }
+
+          let refContent = matched.content;
+          let refBatch: FileBatchMetadata | undefined;
+          if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
+            const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
+            const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
+            refContent = chosenBatch.content;
+            refBatch = {
+              batchIndex: chosenBatch.batchIndex,
+              totalBatches: chosenBatch.totalBatches,
+              startLine: chosenBatch.startLine,
+              endLine: chosenBatch.endLine,
+              totalLines: chosenBatch.totalLines,
+            };
+          }
+
+          if (totalReferencedChars + refContent.length > MAX_REFERENCED_CONTENT_CHARS) {
+            const allowed = MAX_REFERENCED_CONTENT_CHARS - totalReferencedChars;
+            if (allowed <= 0) break;
+            refContent = refContent.slice(0, allowed);
+          }
+
+          const tokensUsed = ChunkManager.estimateTokens(refContent);
+          remainingRefTokens -= tokensUsed;
+          totalReferencedChars += refContent.length;
+
+          referencedFileResults.push({
+            relativePath: matched.relativePath,
+            content: refContent,
+            batch: refBatch,
+          });
         }
-        const tokensUsed = ChunkManager.estimateTokens(refContent);
-        remainingRefTokens -= tokensUsed;
-        referencedFileResults.push({
-          relativePath: matched.relativePath,
-          content: refContent,
-          batch: refBatch,
-        });
+      } catch {
+        // Fail silently
       }
     }
 
@@ -2221,7 +2446,31 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       ? (process.env.ComSpec ? path.basename(process.env.ComSpec) : 'cmd.exe')
       : (process.env.SHELL ? path.basename(process.env.SHELL) : 'bash');
 
-    const recentActivities = await MemoryManifest.formatForPrompt();
+    const isMemoryEnabled = Configuration.getWorkspaceMemoryInContext();
+    const recentActivities = isMemoryEnabled ? await MemoryManifest.formatForPrompt() : '';
+
+    // Extract compact plan task anchor if a multi-step plan is currently in progress
+    let activePlanAnchor = '';
+    if (this._historyStore) {
+      try {
+        const hist = await this._historyStore.loadHistory();
+        const lastPlanMsg = [...hist].reverse().find(
+          (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+        );
+        const planText = lastPlanMsg?.planDocument || lastPlanMsg?.content;
+        if (planText) {
+          // Check if any unchecked items remain
+          const checklistMatches = planText.match(/^\s*-\s*\[[ xX]\].*$/gm);
+          if (checklistMatches && checklistMatches.some((item) => /-\s*\[ \]/i.test(item))) {
+            // Keep it ultra-compact: only checklist items, max 10 items
+            const compactItems = checklistMatches.slice(0, 10).map((l) => l.trim()).join('\n');
+            activePlanAnchor = compactItems;
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }
 
     const systemPrompt = buildSystemPrompt({
       activeFile: editorCtx.hasContext && (editorCtx.relativePath || editorCtx.isArtifactDocument) ? {
@@ -2246,7 +2495,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         platform,
         shell,
       },
+      reasoningEffort: (reasoningEffort || this._activeReasoningEffort) as 'low' | 'medium' | 'high' | undefined,
       recentActivities: recentActivities || undefined,
+      activePlanAnchor: activePlanAnchor || undefined,
     });
 
     // Phase 7: Secret Scanning & Redaction Pipeline
@@ -2442,13 +2693,66 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         // If the model returned an empty completion (often due to upstream timeout or token limits)
         let finalContent = accumulatedContent;
         const isEmptyResponse = finalContent.trim() === '' && !this._activeAbortController?.signal.aborted;
+
+        // Upstream provider quota/balance error text detection:
+        // Some upstream proxies (e.g. Z.ai / GLM proxies) stream quota exhaustion text with HTTP 200
+        // (e.g. "Your quota is exhausted. API key status: exceeded ... USDT balance: -9.110032 USDT")
+        const isProviderQuotaError =
+          /\b(quota is exhausted|api key status:\s*exceeded|insufficient balance|balance:\s*-\d+(\.\d+)?\s*usdt|account has run out of credits)\b/i.test(finalContent);
+
         if (isEmptyResponse) {
           logger.warn('AGENT', `Empty response from ${selectedModel} — possible upstream timeout, context limit, or provider issue`);
           finalContent = '⚠️ The model returned an empty response. This usually occurs when the upstream provider times out or encounters a context limit. You can click "↻ Retry" or send a follow-up prompt to continue.';
+        } else if (isProviderQuotaError) {
+          logger.error('AGENT', `[PROVIDER_QUOTA_ERROR] ${selectedModel} streamed upstream quota failure: ${finalContent.slice(0, 150)}`);
         }
 
         // Extract two-tier artifacts (plan / walkthrough) from the raw model response
-        const { planDocument, walkthroughDocument, chatSummary } = extractArtifacts(finalContent);
+        const { planDocument, walkthroughDocument: rawWalkthroughDocument, chatSummary } = extractArtifacts(finalContent);
+
+        // Premature walkthrough guard:
+        // A walkthrough is invalid and premature if an active implementation plan exists but has
+        // uncompleted checklist items, or if no non-read-only verification command has succeeded with exit code 0.
+        let walkthroughDocument = rawWalkthroughDocument;
+        let prematureWalkthroughReason: string | undefined;
+
+        if (walkthroughDocument) {
+          // Check for active plan and uncompleted items
+          let activePlanContent = planDocument;
+          if (!activePlanContent && this._historyStore) {
+            try {
+              const hist = await this._historyStore.loadHistory();
+              const lastPlanMsg = [...hist].reverse().find(
+                (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+              );
+              activePlanContent = lastPlanMsg?.planDocument || lastPlanMsg?.content;
+            } catch {
+              // non-fatal
+            }
+          }
+
+          if (activePlanContent) {
+            const hasUncheckedItems = /^\s*-\s*\[ \]/m.test(activePlanContent);
+            if (hasUncheckedItems) {
+              prematureWalkthroughReason = 'There are uncompleted checklist items (- [ ]) remaining in the active implementation plan.';
+            }
+          }
+
+          if (!prematureWalkthroughReason) {
+            const recentOutputs = TerminalOutputTracker.getRecentOutputs();
+            const hasVerifiedExitZero = recentOutputs.some(
+              (out) => out.exitCode === 0 && out.status === 'success' && !CommandRunner.isReadOnly(out.command)
+            );
+            if (!hasVerifiedExitZero) {
+              prematureWalkthroughReason = 'No non-read-only verification command (test runner, build, lint, or compiler) has physically executed and returned exit code 0 in Recent Terminal Outputs.';
+            }
+          }
+
+          if (prematureWalkthroughReason) {
+            logger.warn('AGENT', `Discarding premature walkthrough: ${prematureWalkthroughReason}`);
+            walkthroughDocument = undefined;
+          }
+        }
 
         // Check if this turn is an intermediate step:
         // An automated follow-up turn (isAutoFollowUp or autoTurnCount > 0 or retryCount > 0)
@@ -2458,127 +2762,188 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           !walkthroughDocument
         );
 
-        await this._historyStore.appendMessage({
-          id: assistantMessageId,
-          role: 'assistant',
-          content: chatSummary,
-          planDocument,
-          walkthroughDocument,
-          model: selectedModel,
-          timestamp: Date.now(),
-          executionDurationMs,
-          totalTokens: usage?.total_tokens,
-          isIntermediateStep,
-          isAutoFollowUp: Boolean(retryContext?.isAutoFollowUp && !walkthroughDocument && !planDocument),
-        });
+        const isAutoFlow = Boolean(retryContext?.isAutoFollowUp || (retryContext?.autoTurnCount ?? 0) > 0 || (retryContext?.retryCount ?? 0) > 0);
+        const emptyRetryCount = retryContext?.emptyRetryCount ?? 0;
+        const MAX_EMPTY_RETRIES = 2;
+        const willRetryEmptySilently = isEmptyResponse && isAutoFlow && emptyRetryCount < MAX_EMPTY_RETRIES;
 
-        // Proactively persist artifact .md files to disk immediately upon generation
-        if (planDocument) {
-          try {
-            await ArtifactDocumentManager.prepareArtifactFile(
-              this._historyStore,
-              'plan',
-              assistantMessageId,
-              planDocument,
-              this._storageUri
-            );
-            // Record planned task in MemoryManifest
-            const taskId = `task-${assistantMessageId}`;
-            await MemoryManifest.recordTask({
-              id: taskId,
-              taskTitle: chatSummary ? chatSummary.slice(0, 80) : 'Implementation Plan',
-              status: 'in_progress',
-              summary: 'Created implementation plan',
-            });
-          } catch {
-            // non-fatal
-          }
-        }
-        if (walkthroughDocument) {
-          try {
-            await ArtifactDocumentManager.prepareArtifactFile(
-              this._historyStore,
-              'walkthrough',
-              assistantMessageId,
-              walkthroughDocument,
-              this._storageUri
-            );
-            // Complete task in MemoryManifest
-            const taskId = `task-${assistantMessageId}`;
-            await MemoryManifest.recordTask({
-              id: taskId,
-              taskTitle: chatSummary ? chatSummary.slice(0, 80) : 'Completed implementation task',
-              status: 'completed',
-              summary: chatSummary ? chatSummary.slice(0, 150) : undefined,
-            });
-          } catch {
-            // non-fatal
-          }
-        }
-
-        // Compute cost and log to UsageStore
-        if (usage) {
-          const modelObj = this._cachedModels.find((m) => m.id === selectedModel);
-          const cost = PricingCalculator.calculateCost(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            modelObj?.pricing
-          );
-
-          // If reasoning effort was used, log Model (Effort)
-          let loggedModelName = selectedModel;
-          const effortForLogging = effectiveReasoningEffort || this._activeReasoningEffort;
-          if (effortForLogging) {
-            const formattedEffort =
-              effortForLogging.charAt(0).toUpperCase() + effortForLogging.slice(1).toLowerCase();
-            loggedModelName = `${selectedModel} (${formattedEffort})`;
-          }
-
-          await this._usageStore.appendRecord({
-            type: 'chat_completion',
-            project: ProjectResolver.getActiveProjectName(),
-            model: loggedModelName,
-            reasoningEffort: effortForLogging,
-            promptTokens: usage.prompt_tokens,
-            completionTokens: usage.completion_tokens,
-            totalTokens: usage.total_tokens,
-            cost,
+        if (isEmptyResponse) {
+          // Tell webview to remove the empty streaming bubble without flashing or rendering an empty card
+          this._postMessage({
+            type: 'MESSAGE_STREAM_DISCARD',
+            messageId: assistantMessageId,
           });
-          logger.info('COST', `Request cost — model: ${loggedModelName}, cost: $${cost?.toFixed(6) ?? '?'} (in: ${usage.prompt_tokens ?? '?'} out: ${usage.completion_tokens ?? '?'} tokens)`);
-        }
+        } else {
+          await this._historyStore.appendMessage({
+            id: assistantMessageId,
+            role: 'assistant',
+            content: chatSummary,
+            planDocument,
+            walkthroughDocument,
+            model: selectedModel,
+            timestamp: Date.now(),
+            executionDurationMs,
+            totalTokens: usage?.total_tokens,
+            isIntermediateStep,
+            isAutoFollowUp: Boolean(retryContext?.isAutoFollowUp && !walkthroughDocument && !planDocument),
+          });
 
-        this._postMessage({
-          type: 'MESSAGE_STREAM_DONE',
-          messageId: assistantMessageId,
-          model: selectedModel,
-          usage,
-          chatSummary,
-          planDocument,
-          walkthroughDocument,
-          executionDurationMs,
-          isIntermediateStep,
-        });
+          // Proactively persist artifact .md files to disk immediately upon generation
+          if (planDocument) {
+            try {
+              await ArtifactDocumentManager.prepareArtifactFile(
+                this._historyStore,
+                'plan',
+                assistantMessageId,
+                planDocument,
+                this._storageUri
+              );
+              // Record planned task in MemoryManifest
+              const taskId = `task-${assistantMessageId}`;
+              await MemoryManifest.recordTask({
+                id: taskId,
+                taskTitle: chatSummary ? chatSummary.slice(0, 80) : 'Implementation Plan',
+                status: 'in_progress',
+                summary: 'Created implementation plan',
+              });
+            } catch {
+              // non-fatal
+            }
+          }
+          if (walkthroughDocument) {
+            try {
+              await ArtifactDocumentManager.prepareArtifactFile(
+                this._historyStore,
+                'walkthrough',
+                assistantMessageId,
+                walkthroughDocument,
+                this._storageUri
+              );
+              // Complete task in MemoryManifest
+              const taskId = `task-${assistantMessageId}`;
+              await MemoryManifest.recordTask({
+                id: taskId,
+                taskTitle: chatSummary ? chatSummary.slice(0, 80) : 'Completed implementation task',
+                status: 'completed',
+                summary: chatSummary ? chatSummary.slice(0, 150) : undefined,
+              });
+            } catch {
+              // non-fatal
+            }
+          }
+
+          // Compute cost and log to UsageStore
+          if (usage) {
+            const modelObj = this._cachedModels.find((m) => m.id === selectedModel);
+            const cost = PricingCalculator.calculateCost(
+              usage.prompt_tokens,
+              usage.completion_tokens,
+              modelObj?.pricing
+            );
+
+            // If reasoning effort was used, log Model (Effort)
+            let loggedModelName = selectedModel;
+            const effortForLogging = effectiveReasoningEffort || this._activeReasoningEffort;
+            if (effortForLogging) {
+              const formattedEffort =
+                effortForLogging.charAt(0).toUpperCase() + effortForLogging.slice(1).toLowerCase();
+              loggedModelName = `${selectedModel} (${formattedEffort})`;
+            }
+
+            await this._usageStore.appendRecord({
+              type: 'chat_completion',
+              project: ProjectResolver.getActiveProjectName(),
+              model: loggedModelName,
+              reasoningEffort: effortForLogging,
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+              totalTokens: usage.total_tokens,
+              cost,
+            });
+            logger.info('COST', `Request cost — model: ${loggedModelName}, cost: $${cost?.toFixed(6) ?? '?'} (in: ${usage.prompt_tokens ?? '?'} out: ${usage.completion_tokens ?? '?'} tokens)`);
+          }
+
+          this._postMessage({
+            type: 'MESSAGE_STREAM_DONE',
+            messageId: assistantMessageId,
+            model: selectedModel,
+            usage,
+            chatSummary,
+            planDocument,
+            walkthroughDocument,
+            executionDurationMs,
+            isIntermediateStep,
+          });
+        }
 
         // Auto-execution under Allow = Zero Manual Interaction
         let triggeredFollowUp = false;
         try {
-          if (isEmptyResponse && (retryContext?.isAutoFollowUp || (retryContext?.retryCount ?? 0) > 0) && (retryContext?.emptyRetryCount ?? 0) < 1) {
-            const targetModel = selectedModel || Configuration.getLastModel() || 'openai/gpt-4o-mini';
-            triggeredFollowUp = true;
-            await this._handleSendMessage(
-              'The previous request returned an empty completion. Please continue executing the plan and verify results.',
-              targetModel,
-              undefined,
-              undefined,
-              this._activeReasoningEffort,
-              {
-                retryCount: retryContext?.retryCount ?? 0,
-                failedCommands: retryContext?.failedCommands ?? new Set<string>(),
-                autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
-                isAutoFollowUp: true,
-                emptyRetryCount: (retryContext?.emptyRetryCount ?? 0) + 1,
+          if (isEmptyResponse) {
+            const isAutoFlow = Boolean(retryContext?.isAutoFollowUp || (retryContext?.autoTurnCount ?? 0) > 0 || (retryContext?.retryCount ?? 0) > 0);
+            const emptyRetryCount = retryContext?.emptyRetryCount ?? 0;
+            const MAX_EMPTY_RETRIES = 2;
+
+            if (isAutoFlow && emptyRetryCount < MAX_EMPTY_RETRIES) {
+              const attempt = emptyRetryCount + 1;
+              logger.warn('AGENT', `[EMPTY_RESPONSE: AUTO_RETRY] Model ${selectedModel} returned empty completion (attempt ${attempt}/${MAX_EMPTY_RETRIES}). Retrying internally...`);
+              this._postMessage({
+                type: 'SET_BUSY',
+                busy: true,
+                statusText: `Empty completion from ${selectedModel}. Retrying (${attempt}/${MAX_EMPTY_RETRIES})...`,
+              });
+              const targetModel = selectedModel || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+              triggeredFollowUp = true;
+              await this._handleSendMessage(
+                'The previous request returned an empty completion. Please continue executing the plan and verify results.',
+                targetModel,
+                undefined,
+                undefined,
+                this._activeReasoningEffort,
+                {
+                  retryCount: retryContext?.retryCount ?? 0,
+                  failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+                  autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
+                  isAutoFollowUp: true,
+                  emptyRetryCount: attempt,
+                }
+              );
+            } else {
+              logger.error('AGENT', `[EMPTY_RESPONSE: FAILED] Model ${selectedModel} returned empty completion. Emitting error card.`);
+              let canResume = false;
+              if (this._historyStore) {
+                try {
+                  const hist = await this._historyStore.loadHistory();
+                  canResume = hist.some((m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content)));
+                } catch {
+                  // non-fatal
+                }
               }
-            );
+              this._postMessage({
+                type: 'ERROR',
+                errorTitle: '⚠️ AI Model Returned Empty Response',
+                message: `${selectedModel} completed without returning output text. The upstream provider may be experiencing heavy load or a timeout. Click "Retry Now" or select another model to continue.`,
+                canRetry: true,
+                canResume,
+              });
+            }
+          } else if (isProviderQuotaError) {
+            let canResume = false;
+            if (this._historyStore) {
+              try {
+                const hist = await this._historyStore.loadHistory();
+                canResume = hist.some((m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content)));
+              } catch {
+                // non-fatal
+              }
+            }
+            this._postMessage({
+              type: 'ERROR',
+              errorTitle: '⚠️ Upstream Provider Quota Exhausted',
+              message: `The upstream provider for ${selectedModel} returned an account quota error:\n"${finalContent.trim()}". Switch to an alternative model in the top dropdown and click "Retry Now" or "Resume Task".`,
+              canRetry: true,
+              canResume,
+            });
           } else {
             triggeredFollowUp = await this._handleAutoExecution(
               accumulatedContent,
@@ -2588,6 +2953,31 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               planDocument,
               assistantMessageId
             );
+
+            // Premature Walkthrough Auto-Correction:
+            // If the model produced a premature walkthrough that was discarded, and auto-execution
+            // did not trigger another action (like running a command or handling errors), prompt the model to verify.
+            if (!triggeredFollowUp && prematureWalkthroughReason && !this._isUserCancelled && !this._activeAbortController?.signal.aborted) {
+              const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
+              const MAX_AUTO_FOLLOWUPS = (planDocument || retryContext?.isAutoFollowUp) ? 30 : 10;
+              if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
+                const targetModel = selectedModel || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+                triggeredFollowUp = true;
+                await this._handleSendMessage(
+                  `You emitted a walkthrough block before the task was fully verified. ${prematureWalkthroughReason} Run the appropriate build or test command now. Only emit the \`\`\`\`walkthrough block after exit code 0 is confirmed.`,
+                  targetModel,
+                  undefined,
+                  undefined,
+                  this._activeReasoningEffort,
+                  {
+                    retryCount: retryContext?.retryCount ?? 0,
+                    failedCommands: retryContext?.failedCommands ?? new Set<string>(),
+                    autoTurnCount: currentAutoTurns + 1,
+                    isAutoFollowUp: true,
+                  }
+                );
+              }
+            }
 
             // If the model was cut off mid-response due to token limits (finish_reason === 'length')
             // and auto-execution hasn't already scheduled a follow-up, resume generation automatically
@@ -2628,20 +3018,67 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           if (!triggeredFollowUp) {
             this._activeAbortController = undefined;
             this._postMessage({ type: 'SET_BUSY', busy: false });
+            this._postMessage({ type: 'PLAY_NOTIFICATION_SOUND' });
           }
         }
       },
-      (err) => {
+      async (err) => {
         this._activeAbortController = undefined;
-        const isNetwork = err.message.includes('fetch failed') || err.message.includes('network') || err.message.includes('ECONNRESET');
-        const friendlyMsg = isNetwork
-          ? 'Connection to OpenRouter lost after 2 retry attempts. Please check your internet connection or try again.'
-          : `Request failed: ${err.message}`;
+        const errMsg = err.message || '';
+        const errMsgLower = errMsg.toLowerCase();
+        const isNetwork = errMsgLower.includes('fetch failed') || errMsgLower.includes('network') || errMsgLower.includes('econnreset') || errMsgLower.includes('connection lost');
+        const isTimeout = errMsgLower.includes('timed out after') || errMsgLower.includes('unresponsive');
+        const isStalled = errMsgLower.includes('stalled');
+        const isServerOutage = errMsgLower.includes('500') || errMsgLower.includes('502') || errMsgLower.includes('503') || errMsgLower.includes('504') || errMsgLower.includes('bad gateway') || errMsgLower.includes('service unavailable') || errMsgLower.includes('gateway timeout') || errMsgLower.includes('server error');
+
+        let errorTitle: string;
+        let friendlyMsg: string;
+
+        if (isTimeout) {
+          errorTitle = '⚠️ AI Model Is Not Responding';
+          friendlyMsg = `${selectedModel} is taking longer than usual or is experiencing heavy traffic. Try again or select another model.`;
+          logger.warn('API', `[STREAM_ERROR: TIMEOUT] Model: ${selectedModel} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else if (isStalled) {
+          errorTitle = '⚠️ Response Interrupted';
+          friendlyMsg = `The connection to ${selectedModel} dropped mid-response. Click Resume Task to pick up where it left off.`;
+          logger.warn('API', `[STREAM_ERROR: STALLED] Model: ${selectedModel} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else if (isNetwork) {
+          errorTitle = '⚠️ Internet Connection Issue';
+          friendlyMsg = `Could not reach the server. Please check your network connection and click Retry Now.`;
+          logger.warn('API', `[STREAM_ERROR: NETWORK] Model: ${selectedModel} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else if (isServerOutage) {
+          errorTitle = '⚠️ AI Service Temporarily Unavailable';
+          friendlyMsg = `The provider hosting ${selectedModel} is having server issues. Try switching to an alternative model.`;
+          logger.error('API', `[STREAM_ERROR: PROVIDER_OUTAGE] Model: ${selectedModel} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else {
+          errorTitle = '⚠️ Request Failed';
+          friendlyMsg = errMsg.startsWith('Request failed:') ? errMsg : `Request failed: ${errMsg}`;
+          logger.error('API', `[STREAM_ERROR: GENERAL] Model: ${selectedModel} — ${friendlyMsg}`);
+        }
+
+        let canResume = false;
+        if (this._historyStore) {
+          try {
+            const hist = await this._historyStore.loadHistory();
+            const hasActivePlan = hist.some(
+              (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+            );
+            const lastAssistantMsg = [...hist].reverse().find((m) => m.role === 'assistant');
+            const hasWalkthrough = Boolean(
+              lastAssistantMsg?.walkthroughDocument || (lastAssistantMsg?.content && /```walkthrough/i.test(lastAssistantMsg.content))
+            );
+            canResume = Boolean(hasActivePlan && !hasWalkthrough);
+          } catch {
+            // non-fatal
+          }
+        }
 
         this._postMessage({
           type: 'ERROR',
+          errorTitle,
           message: friendlyMsg,
           canRetry: true,
+          canResume,
         });
         this._postMessage({ type: 'SET_BUSY', busy: false });
       },
@@ -2699,7 +3136,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
   private async _handleAutoExecution(
     content: string,
     modelId?: string,
-    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number },
+    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number; hasDelegatedFailure?: boolean },
     walkthroughDocument?: string,
     planDocument?: string,
     assistantMessageId?: string
@@ -3157,17 +3594,23 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     };
 
     if (runTerminalPerm !== 'deny') {
-      // Check if the user's latest message explicitly asked not to run commands or said they'll run it manually
-      let userRequestedManual = false;
-      if (this._currentTurnUserMessageId && historyForPlanCheck.length > 0) {
-        const lastUserMsg = [...historyForPlanCheck].reverse().find(m => m.role === 'user');
-        if (lastUserMsg?.content) {
-          const userText = lastUserMsg.content.toLowerCase();
-          const forbidsRun = /\b(i will run|i'll run|run (it )?by myself|don'?t run|no need to (re)?try|do not run|stop running|just tell me|only explain)\b/i.test(userText);
-          const explicitlyCommandsExecution = /\b(execute|run (it|this|now|the command))\b/i.test(userText);
-          userRequestedManual = forbidsRun && !explicitlyCommandsExecution;
+      // If file edits failed in this turn, SKIP running any terminal commands.
+      // Running tests or builds against a codebase with failed edits guarantees test failure
+      // and wastes retry budget. Instead, let file edit self-healing take full precedence.
+      if (failedEdits.length > 0) {
+        logger.warn('AGENT', `Skipping terminal commands in current turn because ${failedEdits.length} file edit(s) failed to apply.`);
+      } else {
+        // Check if the user's latest message explicitly asked not to run commands or said they'll run it manually
+        let userRequestedManual = false;
+        if (this._currentTurnUserMessageId && historyForPlanCheck.length > 0) {
+          const lastUserMsg = [...historyForPlanCheck].reverse().find(m => m.role === 'user');
+          if (lastUserMsg?.content) {
+            const userText = lastUserMsg.content.toLowerCase();
+            const forbidsRun = /\b(i will run|i'll run|run (it )?by myself|don'?t run|no need to (re)?try|do not run|stop running|just tell me|only explain)\b/i.test(userText);
+            const explicitlyCommandsExecution = /\b(execute|run (it|this|now|the command))\b/i.test(userText);
+            userRequestedManual = forbidsRun && !explicitlyCommandsExecution;
+          }
         }
-      }
 
       const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
       let match;
@@ -3195,6 +3638,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               type: 'PENDING_TERMINAL_COMMAND',
               command,
             });
+            this._postMessage({ type: 'PLAY_NOTIFICATION_SOUND' });
             continue;
           }
 
@@ -3389,46 +3833,113 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             const cmdSig = normalizeCmdSignature(command);
             const hasSimilarFailure = Array.from(failedCommands).some(fc => fc === command || normalizeCmdSignature(fc) === cmdSig);
 
-            // If no files were edited and the identical or equivalent command failed again, halt
+            // Extract failure diagnostics for reporting
+            const outputParts: string[] = [];
+            if (result.stdout?.trim()) {
+              outputParts.push(result.stdout.trim());
+            }
+            if (result.stderr?.trim()) {
+              outputParts.push(result.stderr.trim());
+            }
+            if (outputParts.length === 0 && result.error?.trim()) {
+              outputParts.push(result.error.trim());
+            }
+            const fullOutput = outputParts.join('\n') || (result.timedOut ? 'Command timed out after 120s' : 'Command exited with non-zero status');
+            const truncatedError = fullOutput.length > 3000
+              ? fullOutput.substring(0, 3000) + '\n... [output truncated]'
+              : fullOutput;
+            const failureHistory = `Command: ${command}\nOutcome: ${outcome} (Exit code: ${result.exitCode ?? 'unknown'})\nOutput:\n${truncatedError}`;
+
+            // Safeguard 2: Duplicate failing command detection (infinite loop breaker)
+            // If identical or equivalent command failed again and no files were edited,
+            // hand off back to the model once to force a strategic pivot rather than halting abruptly.
             if ((failedCommands.has(command) || hasSimilarFailure) && successfullyEditedFiles.length === 0) {
               await flushExecutedTerminalSummary();
-              if (!isReadOnlyCmd) {
-                const loopMsg = {
-                  id: `${Date.now()}-term-loop-${cmdCount}`,
-                  role: 'assistant' as const,
-                  content: `⚠️ Model proposed repeating failing command \`${command}\` without file modifications. Halting self-healing retry to prevent infinite execution.`,
-                  timestamp: Date.now(),
-                };
-                if (this._historyStore?.appendMessage) {
-                  await this._historyStore.appendMessage(loopMsg);
+
+              if (!retryContext?.hasDelegatedFailure) {
+                const loopPivotSummary = `The model proposed repeating the failing command \`${command}\` without any workspace file modifications, which failed again:\n\n${failureHistory}\n\nCRITICAL: Do NOT propose this command again. Classify the error using the categories in your instructions (MISSING_SCHEMA, COMPILE_ERROR, ENV_ISSUE, etc.) and apply a completely different strategy, or clearly explain what is blocking progress and offer 2–3 concrete options to the user.`;
+
+                const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+
+                await this._handleSendMessage(
+                  loopPivotSummary,
+                  targetModel,
+                  undefined,
+                  undefined,
+                  this._activeReasoningEffort,
+                  {
+                    retryCount: currentRetryCount + 1,
+                    failedCommands,
+                    autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
+                    isAutoFollowUp: true,
+                    hasDelegatedFailure: true,
+                  }
+                );
+                return true;
+              } else {
+                // Already asked the model to pivot and it still repeated a failing command; halt cleanly.
+                if (!isReadOnlyCmd) {
+                  const loopMsg = {
+                    id: `${Date.now()}-term-loop-${cmdCount}`,
+                    role: 'assistant' as const,
+                    content: `⚠️ Model repeated failing command \`${command}\` without workspace modifications after a strategic pivot request. Halting self-healing loop.`,
+                    timestamp: Date.now(),
+                  };
+                  if (this._historyStore?.appendMessage) {
+                    await this._historyStore.appendMessage(loopMsg);
+                  }
+                  this._postMessage({
+                    type: 'MESSAGE_RECEIVED',
+                    message: loopMsg,
+                  });
                 }
-                this._postMessage({
-                  type: 'MESSAGE_RECEIVED',
-                  message: loopMsg,
-                });
+                break;
               }
-              break;
             }
 
-            // Safeguard 3: Hard limit on attempts (MAX_TERMINAL_RETRIES = 5)
+            // Safeguard 3: Hard limit on attempts reached — delegate failure context back to model once
             if (currentRetryCount >= MAX_TERMINAL_RETRIES) {
               await flushExecutedTerminalSummary();
-              if (!isReadOnlyCmd) {
-                const maxMsg = {
-                  id: `${Date.now()}-term-max-${cmdCount}`,
-                  role: 'assistant' as const,
-                  content: `⚠️ Terminal auto-retry limit reached (${MAX_TERMINAL_RETRIES}/${MAX_TERMINAL_RETRIES} attempts). Halting self-healing loop.`,
-                  timestamp: Date.now(),
-                };
-                if (this._historyStore?.appendMessage) {
-                  await this._historyStore.appendMessage(maxMsg);
+
+              if (!retryContext?.hasDelegatedFailure) {
+                const failureSummary = `The terminal self-healing loop has attempted ${currentRetryCount} times without success. Here is what happened:\n\n${failureHistory}\n\nDo NOT retry the same command. Classify the error using the categories in your instructions (MISSING_SCHEMA, COMPILE_ERROR, ENV_ISSUE, etc.) and apply a completely different strategy, or tell the user clearly what is blocking progress and offer 2–3 concrete options.`;
+
+                const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+
+                await this._handleSendMessage(
+                  failureSummary,
+                  targetModel,
+                  undefined,
+                  undefined,
+                  this._activeReasoningEffort,
+                  {
+                    retryCount: currentRetryCount + 1,
+                    failedCommands,
+                    autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
+                    isAutoFollowUp: true,
+                    hasDelegatedFailure: true,
+                  }
+                );
+                return true;
+              } else {
+                // Post-delegation retry exhausted; halt cleanly
+                if (!isReadOnlyCmd) {
+                  const maxMsg = {
+                    id: `${Date.now()}-term-max-${cmdCount}`,
+                    role: 'assistant' as const,
+                    content: `⚠️ Terminal auto-retry limit reached (${MAX_TERMINAL_RETRIES}/${MAX_TERMINAL_RETRIES} attempts). Halting self-healing loop.`,
+                    timestamp: Date.now(),
+                  };
+                  if (this._historyStore?.appendMessage) {
+                    await this._historyStore.appendMessage(maxMsg);
+                  }
+                  this._postMessage({
+                    type: 'MESSAGE_RECEIVED',
+                    message: maxMsg,
+                  });
                 }
-                this._postMessage({
-                  type: 'MESSAGE_RECEIVED',
-                  message: maxMsg,
-                });
+                break;
               }
-              break;
             }
 
             // For read-only inspection commands (like dir, type, cat):
@@ -3467,21 +3978,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               message: retryNotice,
             });
 
-            // Combine stdout, stderr, and error without short-circuiting so compiler/linter diagnostics are not lost
-            const outputParts: string[] = [];
-            if (result.stdout?.trim()) {
-              outputParts.push(result.stdout.trim());
-            }
-            if (result.stderr?.trim()) {
-              outputParts.push(result.stderr.trim());
-            }
-            if (outputParts.length === 0 && result.error?.trim()) {
-              outputParts.push(result.error.trim());
-            }
-            const fullOutput = outputParts.join('\n') || (result.timedOut ? 'Command timed out after 120s' : 'Command exited with non-zero status');
-            const truncatedError = fullOutput.length > 3000
-              ? fullOutput.substring(0, 3000) + '\n... [output truncated]'
-              : fullOutput;
+            // Trigger regular self-healing retry turn using extracted failure diagnostics
 
             const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
             const retryPrompt = result.timedOut
@@ -3501,10 +3998,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             return true;
           }
         }
-      }
+        }
 
-      // Flush any completed commands from the loop into a single consolidated 1-line dropdown
-      await flushExecutedTerminalSummary();
+        // Flush any completed commands from the loop into a single consolidated 1-line dropdown
+        await flushExecutedTerminalSummary();
+      }
     } else if (runTerminalPerm === 'deny') {
       const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
       let match;
@@ -3530,7 +4028,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    const MAX_AUTO_FOLLOWUPS = 10;
+    // Active Task Heartbeat & Loop Guard:
+    // If a multi-step plan is active and has pending checklist items, permit continuous execution
+    // (up to 30 continuous automated steps) as long as forward progress is occurring.
+    // If no plan is active, retain the standard conversational follow-up cap of 10.
+    const hasPendingPlanItems = activePlanExists && historyForPlanCheck.some(m => {
+      if (m.role !== 'assistant') return false;
+      const text = m.planDocument || m.content;
+      return /^\s*-\s*\[ \]/m.test(text);
+    });
+    const MAX_AUTO_FOLLOWUPS = hasPendingPlanItems ? 30 : 10;
 
     // 3. Auto-continue conversation with terminal outputs so the model can complete its response
     const hasCommandsToReport = successfulCommands.length > 0 || executedInspectionCommands.length > 0;
@@ -3580,7 +4087,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         if (!hasExistingPlan) {
           continuationPrompt += `Based on the terminal command results above, answer the user's question directly or continue your analysis of the workspace. If implementation or file modifications are required, formulate the implementation plan inside a \`\`\`plan block. If this was a status check or informational query, conclude with your direct answer without requesting further tasks.`;
         } else {
-          continuationPrompt += `Based on the terminal command results and applied changes above, please continue executing the plan autonomously until all tasks are complete and verified. Conclude with the two-tier walkthrough document when done.`;
+          const hasFailedProbe = executedInspectionCommands.some(c => /Test-NetConnection|curl\s|Invoke-WebRequest|nc\s/i.test(c.command) && (/TcpTestSucceeded\s*:\s*False/i.test(c.output) || c.exitCode !== 0));
+          if (hasFailedProbe) {
+            continuationPrompt += "CRITICAL NOTE: A network/port probe failed above. Do NOT sleep or repeat the same probe. Immediately inspect the background process output or crash log (e.g. Get-Content <log>) or verify environment prerequisites (e.g. java -version). If prerequisites are missing or the service crashed, classify as [ENV_ISSUE] and clearly explain the blocking prerequisite with 2–3 options.";
+          } else {
+            continuationPrompt += "Based on the terminal command results and applied changes above, please continue executing the plan autonomously until all tasks are complete and verified. Conclude with the two-tier walkthrough document when done.";
+          }
         }
 
         await this._handleSendMessage(
@@ -4257,7 +4769,37 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         this._activeReviewerAbortController = undefined;
         this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });
 
-        logger.error('REVIEW', `Reviewer stream error: ${err?.message || err}`);
+        const errMsg = err?.message || '';
+        const errMsgLower = errMsg.toLowerCase();
+        const isNetwork = errMsgLower.includes('fetch failed') || errMsgLower.includes('network') || errMsgLower.includes('econnreset') || errMsgLower.includes('connection lost');
+        const isTimeout = errMsgLower.includes('timed out after') || errMsgLower.includes('unresponsive');
+        const isStalled = errMsgLower.includes('stalled');
+        const isServerOutage = errMsgLower.includes('500') || errMsgLower.includes('502') || errMsgLower.includes('503') || errMsgLower.includes('504') || errMsgLower.includes('bad gateway') || errMsgLower.includes('service unavailable') || errMsgLower.includes('gateway timeout') || errMsgLower.includes('server error');
+
+        let errorTitle: string;
+        let friendlyMsg: string;
+
+        if (isTimeout) {
+          errorTitle = '⚠️ AI Model Is Not Responding';
+          friendlyMsg = `${model} is taking longer than usual or is experiencing heavy traffic. Try again or select another model.`;
+          logger.warn('REVIEW', `[REVIEWER_ERROR: TIMEOUT] Model: ${model} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else if (isStalled) {
+          errorTitle = '⚠️ Response Interrupted';
+          friendlyMsg = `The connection to ${model} dropped mid-response. Click Retry to continue.`;
+          logger.warn('REVIEW', `[REVIEWER_ERROR: STALLED] Model: ${model} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else if (isNetwork) {
+          errorTitle = '⚠️ Internet Connection Issue';
+          friendlyMsg = `Could not reach the server. Please check your network connection and click Retry.`;
+          logger.warn('REVIEW', `[REVIEWER_ERROR: NETWORK] Model: ${model} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else if (isServerOutage) {
+          errorTitle = '⚠️ AI Service Temporarily Unavailable';
+          friendlyMsg = `The provider hosting ${model} is having server issues. Try switching to an alternative model.`;
+          logger.error('REVIEW', `[REVIEWER_ERROR: PROVIDER_OUTAGE] Model: ${model} — ${friendlyMsg} (raw: ${errMsg})`);
+        } else {
+          errorTitle = '⚠️ Reviewer Request Issue';
+          friendlyMsg = errMsg.startsWith('Request failed:') ? errMsg : `Request failed: ${errMsg}`;
+          logger.error('REVIEW', `[REVIEWER_ERROR: GENERAL] Model: ${model} — ${friendlyMsg}`);
+        }
 
         const isPartial = accumulatedChunk.trim().length > 0;
         if (isPartial) {
@@ -4270,7 +4812,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
         this._postMessage({
           type: 'REVIEWER_STREAM_ERROR',
-          message: err.message || 'Reviewer request failed',
+          errorTitle,
+          message: friendlyMsg,
           partial: isPartial,
           canRetry: true,
         });
@@ -4592,6 +5135,27 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         <button id="reset-permissions-btn" class="btn secondary" style="margin-top:8px;">Reset all permissions</button>
       </div>
 
+      <!-- Notifications & Sound Section -->
+      <div class="settings-group">
+        <div class="settings-group-title">Notifications &amp; Sound</div>
+        <label class="checkbox-row">
+          <span>Play notification sound on completion</span>
+          <input type="checkbox" id="chk-notification-sound" checked />
+        </label>
+        <div id="notification-sound-controls" class="settings-row" style="margin-top: 6px; display: flex; align-items: center; justify-content: space-between;">
+          <span style="font-size: 11px; opacity: 0.9;">Sound Tone</span>
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <select id="settings-notification-tone" class="settings-select" style="max-width: 130px; font-size: 11.5px; padding: 2px 6px;">
+              <option value="bell">Soft Bell (2x)</option>
+              <option value="chime">Chime</option>
+              <option value="pop">Pop</option>
+              <option value="ding">Modern Ding</option>
+            </select>
+            <button id="test-notification-sound-btn" class="btn secondary" style="font-size: 11px; padding: 2px 8px; height: 26px; white-space: nowrap;" title="Play sound preview">▶ Test</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Context management Section -->
       <div class="settings-group">
         <div class="settings-group-title">Context management</div>
@@ -4602,6 +5166,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         <label class="checkbox-row">
           <span>Full history resend on model switch</span>
           <input type="checkbox" id="chk-full-history" />
+        </label>
+        <label class="checkbox-row">
+          <span>Workspace Memory in Context</span>
+          <input type="checkbox" id="chk-workspace-memory" checked />
         </label>
       </div>
 

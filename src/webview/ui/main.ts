@@ -593,6 +593,7 @@ const settingsUpdateKeyBtn = document.getElementById('settings-update-key-btn') 
 const resetPermissionsBtn = document.getElementById('reset-permissions-btn') as HTMLButtonElement;
 const chkAutoSummarize = document.getElementById('chk-auto-summarize') as HTMLInputElement;
 const chkFullHistory = document.getElementById('chk-full-history') as HTMLInputElement;
+const chkWorkspaceMemory = document.getElementById('chk-workspace-memory') as HTMLInputElement;
 const settingsViewUsageBtn = document.getElementById('settings-view-usage-btn') as HTMLButtonElement;
 const settingsViewLogsBtn = document.getElementById('settings-view-logs-btn') as HTMLButtonElement;
 const settingsClearHistoryBtn = document.getElementById('settings-clear-history-btn') as HTMLButtonElement;
@@ -658,6 +659,119 @@ let currentReviewerModelId = '';
 let currentReviewerReasoningEffort = 'medium';
 let currentReviewerPinnedFile = '';
 let isReviewerEnabled = false;
+
+// Notification Sound DOM References & State
+const chkNotificationSound = document.getElementById('chk-notification-sound') as HTMLInputElement;
+const settingsNotificationTone = document.getElementById('settings-notification-tone') as HTMLSelectElement;
+const testNotificationSoundBtn = document.getElementById('test-notification-sound-btn') as HTMLButtonElement;
+let isNotificationSoundEnabled = true;
+let currentNotificationTone: 'bell' | 'chime' | 'pop' | 'ding' = 'bell';
+let notificationAudioContext: AudioContext | null = null;
+
+function getNotificationAudioContext(): AudioContext | null {
+  try {
+    if (!notificationAudioContext) {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        notificationAudioContext = new AudioCtx();
+      }
+    }
+    if (notificationAudioContext && notificationAudioContext.state === 'suspended') {
+      notificationAudioContext.resume().catch(() => {});
+    }
+    return notificationAudioContext;
+  } catch (err) {
+    console.warn('Failed to initialize AudioContext:', err);
+    return null;
+  }
+}
+
+function playNotificationSound(overrideTone?: 'bell' | 'chime' | 'pop' | 'ding') {
+  if (!isNotificationSoundEnabled && !overrideTone) return;
+  const tone = overrideTone || currentNotificationTone || 'bell';
+  const ctx = getNotificationAudioContext();
+  if (!ctx) return;
+
+  try {
+    const baseNow = ctx.currentTime;
+
+    if (tone === 'bell') {
+      // Soft Bell: 2 identical rings spaced 200ms apart with smooth harmonic decay
+      const ringStrike = (startTime: number, volumeMultiplier: number) => {
+        const freqs = [659.25, 1318.5, 1975.5];
+        const baseGains = [0.22, 0.09, 0.04];
+        freqs.forEach((freq, i) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, startTime);
+          const peakGain = baseGains[i] * volumeMultiplier;
+          gain.gain.setValueAtTime(0.0001, startTime);
+          gain.gain.exponentialRampToValueAtTime(peakGain, startTime + 0.015);
+          gain.gain.exponentialRampToValueAtTime(0.0001, startTime + 0.65);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(startTime);
+          osc.stop(startTime + 0.65);
+        });
+      };
+      ringStrike(baseNow, 1.0);
+      ringStrike(baseNow + 0.20, 0.9);
+    } else if (tone === 'chime') {
+      // D5 -> A5 rising chime
+      const osc1 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(587.33, baseNow);
+      gain1.gain.setValueAtTime(0.001, baseNow);
+      gain1.gain.exponentialRampToValueAtTime(0.2, baseNow + 0.03);
+      gain1.gain.exponentialRampToValueAtTime(0.001, baseNow + 0.35);
+      osc1.connect(gain1);
+      gain1.connect(ctx.destination);
+      osc1.start(baseNow);
+      osc1.stop(baseNow + 0.35);
+
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(880, baseNow + 0.1);
+      gain2.gain.setValueAtTime(0.001, baseNow + 0.1);
+      gain2.gain.exponentialRampToValueAtTime(0.25, baseNow + 0.13);
+      gain2.gain.exponentialRampToValueAtTime(0.0001, baseNow + 0.6);
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
+      osc2.start(baseNow + 0.1);
+      osc2.stop(baseNow + 0.6);
+    } else if (tone === 'pop') {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(800, baseNow);
+      osc.frequency.exponentialRampToValueAtTime(200, baseNow + 0.08);
+      gain.gain.setValueAtTime(0.001, baseNow);
+      gain.gain.exponentialRampToValueAtTime(0.35, baseNow + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, baseNow + 0.12);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(baseNow);
+      osc.stop(baseNow + 0.12);
+    } else if (tone === 'ding') {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(1046.5, baseNow);
+      gain.gain.setValueAtTime(0.001, baseNow);
+      gain.gain.exponentialRampToValueAtTime(0.25, baseNow + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, baseNow + 0.9);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(baseNow);
+      osc.stop(baseNow + 0.9);
+    }
+  } catch (err) {
+    console.warn('Failed to play notification tone:', err);
+  }
+}
 
 function updateReviewerPinnedHeader(filePath?: string) {
   const file = (filePath !== undefined ? filePath : currentReviewerPinnedFile || '').trim();
@@ -1550,6 +1664,23 @@ window.addEventListener('message', (event) => {
       }
       break;
 
+    case 'MESSAGE_STREAM_DISCARD':
+      if (mainProgressManager) {
+        mainProgressManager.cleanupImmediate();
+        mainProgressManager = null;
+      }
+      if (activeAssistantMessageEl?.parentNode) {
+        activeAssistantMessageEl.remove();
+      } else if (msg.messageId) {
+        const el = document.getElementById(`msg-${msg.messageId}`);
+        if (el?.parentNode) {
+          el.remove();
+        }
+      }
+      activeAssistantMessageEl = null;
+      activeAssistantContentEl = null;
+      break;
+
     case 'MESSAGE_STREAM_DONE':
       if (mainProgressManager) {
         mainProgressManager.cleanupImmediate();
@@ -1632,6 +1763,7 @@ window.addEventListener('message', (event) => {
         updateTokenMeter(msg.usage.total_tokens || 0);
       }
       updateAllUndoButtonsAvailability();
+
       break;
 
     case 'PROPOSE_EDIT':
@@ -1898,7 +2030,7 @@ window.addEventListener('message', (event) => {
       break;
 
     case 'REVIEWER_STREAM_ERROR':
-      handleReviewerStreamError(msg.message, msg.partial, msg.canRetry);
+      handleReviewerStreamError(msg.message, msg.partial, msg.canRetry, msg.errorTitle);
       break;
 
     case 'REVIEWER_SESSIONS_LOADED':
@@ -1945,6 +2077,10 @@ window.addEventListener('message', (event) => {
       });
       break;
     }
+
+    case 'PLAY_NOTIFICATION_SOUND':
+      playNotificationSound(msg.tone);
+      break;
 
     case 'PENDING_TERMINAL_COMMAND':
       setPendingTerminalCommand(msg.command);
@@ -2099,10 +2235,11 @@ window.addEventListener('message', (event) => {
         cleanErrorMsg.toLowerCase().includes('timed out') ||
         cleanErrorMsg.toLowerCase().includes('network') ||
         cleanErrorMsg.toLowerCase().includes('econnreset') ||
-        cleanErrorMsg.toLowerCase().includes('connection lost');
+        cleanErrorMsg.toLowerCase().includes('connection lost') ||
+        cleanErrorMsg.toLowerCase().includes('empty response') ||
+        cleanErrorMsg.toLowerCase().includes('empty completion');
 
       const triggerRetry = () => {
-        if (isDisarmed) return;
         clearCountdown();
         if (!lastSentMessage) return;
         errorCard.remove();
@@ -2116,35 +2253,66 @@ window.addEventListener('message', (event) => {
         });
       };
 
+      const triggerResume = () => {
+        clearCountdown();
+        errorCard.remove();
+        vscode.postMessage({
+          type: 'SEND_MESSAGE',
+          content: 'The connection was interrupted. Please continue executing the active plan and verify results.',
+          modelId: lastSentMessage?.modelId || currentModelId,
+          reasoningEffort: lastSentMessage?.reasoningEffort,
+          isRetry: false,
+          isResume: true,
+        });
+      };
+
       const dismissError = () => {
         clearCountdown();
         errorCard.remove();
       };
 
-      if (msg.canRetry && lastSentMessage) {
+      const errorTitleText = (msg as any).errorTitle || '⚠️ Request Failed';
+      const detailText = msg.message || 'Stream failed';
+
+      if (msg.canRetry && (lastSentMessage || msg.canResume)) {
+        const resumeBtnHtml = msg.canResume
+          ? `<button class="btn-resume-inline" title="Resume execution from where it left off">
+               <span>▶</span>
+               <span>Resume Task</span>
+             </button>`
+          : '';
+
         errorCard.innerHTML = `
           <div class="stream-error-content-row">
-            <span class="stream-error-icon">⚠️</span>
-            <span class="stream-error-inline-msg" title="${escapeHtml(msg.message)}">${escapeHtml(cleanErrorMsg)}</span>
-            <span class="stream-error-divider">|</span>
+            <div class="stream-error-title-row">
+              <span class="stream-error-title">${escapeHtml(errorTitleText)}</span>
+              ${isStalledOrTimeout ? `<span class="stream-error-countdown-pill">• Auto-retrying in ${remainingSeconds}s...</span>` : ''}
+            </div>
             <div class="stream-error-actions-inline">
+              ${lastSentMessage ? `
               <button class="btn-retry-inline" title="Retry immediately">
                 <span>🔁</span>
-                <span class="retry-btn-label">Retry Now (${remainingSeconds}s)</span>
-              </button>
+                <span class="retry-btn-label">${isStalledOrTimeout ? `Retry Now (${remainingSeconds}s)` : 'Retry Now'}</span>
+              </button>` : ''}
+              ${resumeBtnHtml}
               <button class="btn-dismiss-inline" title="Cancel retry and dismiss">✕ Dismiss</button>
             </div>
-            <span class="stream-error-countdown-pill">• Auto-retrying in ${remainingSeconds}s...</span>
           </div>
+          <div class="stream-error-detail">${escapeHtml(detailText)}</div>
         `;
 
-        const retryBtn = errorCard.querySelector('.btn-retry-inline') as HTMLButtonElement;
+        const retryBtn = errorCard.querySelector('.btn-retry-inline') as HTMLButtonElement | null;
+        const resumeBtn = errorCard.querySelector('.btn-resume-inline') as HTMLButtonElement | null;
         const dismissBtn = errorCard.querySelector('.btn-dismiss-inline') as HTMLButtonElement;
-        const retryLabel = errorCard.querySelector('.retry-btn-label') as HTMLSpanElement;
-        const countdownPill = errorCard.querySelector('.stream-error-countdown-pill') as HTMLSpanElement;
+        const retryLabel = errorCard.querySelector('.retry-btn-label') as HTMLSpanElement | null;
+        const countdownPill = errorCard.querySelector('.stream-error-countdown-pill') as HTMLSpanElement | null;
 
         retryBtn?.addEventListener('click', () => {
           triggerRetry();
+        });
+
+        resumeBtn?.addEventListener('click', () => {
+          triggerResume();
         });
 
         dismissBtn?.addEventListener('click', () => {
@@ -2152,7 +2320,7 @@ window.addEventListener('message', (event) => {
         });
 
         // Only start the countdown automatically for stalled/timeout or network issues
-        if (isStalledOrTimeout) {
+        if (isStalledOrTimeout && lastSentMessage) {
           const startTime = Date.now();
           const targetDurationMs = 30000;
 
@@ -2197,10 +2365,12 @@ window.addEventListener('message', (event) => {
       } else {
         errorCard.innerHTML = `
           <div class="stream-error-content-row">
-            <span class="stream-error-icon">⚠️</span>
-            <span class="stream-error-inline-msg" title="${escapeHtml(msg.message)}">${escapeHtml(cleanErrorMsg)}</span>
+            <div class="stream-error-title-row">
+              <span class="stream-error-title">${escapeHtml(errorTitleText)}</span>
+            </div>
             <button class="btn-dismiss-inline" title="Dismiss">✕ Dismiss</button>
           </div>
+          <div class="stream-error-detail">${escapeHtml(detailText)}</div>
         `;
         const dismissBtn = errorCard.querySelector('.btn-dismiss-inline') as HTMLButtonElement;
         dismissBtn?.addEventListener('click', () => {
@@ -4931,6 +5101,34 @@ if (resetPermissionsBtn) {
   });
 }
 
+// Notification Sound Event Listeners
+if (chkNotificationSound) {
+  chkNotificationSound.addEventListener('change', () => {
+    isNotificationSoundEnabled = chkNotificationSound.checked;
+    vscode.postMessage({
+      type: 'SET_NOTIFICATION_SOUND',
+      enabled: isNotificationSoundEnabled,
+    });
+  });
+}
+
+if (settingsNotificationTone) {
+  settingsNotificationTone.addEventListener('change', () => {
+    currentNotificationTone = (settingsNotificationTone.value as 'bell' | 'chime' | 'pop' | 'ding') || 'bell';
+    vscode.postMessage({
+      type: 'SET_NOTIFICATION_TONE',
+      tone: currentNotificationTone,
+    });
+  });
+}
+
+if (testNotificationSoundBtn) {
+  testNotificationSoundBtn.addEventListener('click', () => {
+    const selected = (settingsNotificationTone?.value as 'bell' | 'chime' | 'pop' | 'ding') || currentNotificationTone || 'bell';
+    playNotificationSound(selected);
+  });
+}
+
 if (chkAutoSummarize) {
   chkAutoSummarize.addEventListener('change', () => {
     vscode.postMessage({
@@ -4947,6 +5145,16 @@ if (chkFullHistory) {
       type: 'SET_CONTEXT_SETTING',
       key: 'fullHistoryResend',
       value: chkFullHistory.checked,
+    });
+  });
+}
+
+if (chkWorkspaceMemory) {
+  chkWorkspaceMemory.addEventListener('change', () => {
+    vscode.postMessage({
+      type: 'SET_CONTEXT_SETTING',
+      key: 'workspaceMemoryInContext',
+      value: chkWorkspaceMemory.checked,
     });
   });
 }
@@ -5014,12 +5222,27 @@ function renderSettings(data: any) {
     });
   }
 
+  // Notifications & Sound
+  isNotificationSoundEnabled = data.notificationSound !== false;
+  if (chkNotificationSound) {
+    chkNotificationSound.checked = isNotificationSoundEnabled;
+  }
+  if (data.notificationTone) {
+    currentNotificationTone = data.notificationTone;
+  }
+  if (settingsNotificationTone) {
+    settingsNotificationTone.value = currentNotificationTone;
+  }
+
   // Checkboxes
   if (chkAutoSummarize) {
     chkAutoSummarize.checked = !!data.autoSummarize;
   }
   if (chkFullHistory) {
     chkFullHistory.checked = !!data.fullHistoryResend;
+  }
+  if (chkWorkspaceMemory) {
+    chkWorkspaceMemory.checked = data.workspaceMemoryInContext !== false;
   }
 
   // Phase 7: Privacy checkboxes and selection
@@ -5936,10 +6159,12 @@ function handleReviewerStreamDone(executionDurationMs?: number) {
   if (reviewerStatusText) reviewerStatusText.textContent = 'Ready';
   setReviewerActivityIndicator(false);
   updateReviewerTokenMeter();
+  playNotificationSound();
 }
 
 // Case 1 & Case 3: Reviewer Stream Error Handling
-function handleReviewerStreamError(errMsg: string, isPartial: boolean, canRetry = true) {
+function handleReviewerStreamError(errMsg: string, isPartial: boolean, canRetry = true, errorTitle?: string) {
+  const displayTitle = errorTitle || (isPartial ? '⚠️ Response Interrupted' : '⚠️ Reviewer Request Issue');
   if (reviewerStatusText) reviewerStatusText.textContent = `Reviewer Error: ${errMsg}`;
 
   if (isPartial && activeReviewerAssistantEl) {
@@ -5954,8 +6179,7 @@ function handleReviewerStreamError(errMsg: string, isPartial: boolean, canRetry 
     interruptedBadge.style.marginTop = '8px';
     interruptedBadge.innerHTML = `
       <div class="stream-error-header" style="color:#e3b341;">
-        <span>⚠️</span>
-        <span>Response interrupted — incomplete</span>
+        <span>${escapeHtml(displayTitle)}</span>
       </div>
       <div class="stream-error-msg">${escapeHtml(errMsg)}</div>
     `;
@@ -6022,8 +6246,7 @@ function handleReviewerStreamError(errMsg: string, isPartial: boolean, canRetry 
     errorCard.className = 'stream-error-card';
     errorCard.innerHTML = `
       <div class="stream-error-header">
-        <span>⚠️</span>
-        <span>Reviewer Request Issue</span>
+        <span>${escapeHtml(displayTitle)}</span>
       </div>
       <div class="stream-error-msg">${escapeHtml(errMsg)}</div>
     `;

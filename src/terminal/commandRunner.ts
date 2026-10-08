@@ -243,6 +243,21 @@ export class CommandRunner {
               // ignore
             }
           }
+
+          // Failsafe: if child process does not emit 'close' within 2000ms after kill signal, force resolve
+          setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            outputChannel?.appendLine(`[Timeout]: Forced resolve after process termination.`);
+            logger.warn('TERM', `Forced resolve on timeout for command: ${command.substring(0, 60)}`);
+            resolve({
+              exitCode: null,
+              stdout,
+              stderr: (stderr ? stderr + '\n' : '') + `Command timed out after ${timeoutMs}ms`,
+              timedOut: true,
+            });
+          }, 2000);
         }, timeoutMs);
       }
 

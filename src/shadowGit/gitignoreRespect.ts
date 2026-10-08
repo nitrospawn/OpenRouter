@@ -11,6 +11,7 @@ export class GitignoreRespect {
     // Always ignore common sensitive/large patterns
     if (
       normalized.startsWith('.git/') ||
+      normalized.startsWith('.openrouter/') ||
       normalized.startsWith('node_modules/') ||
       normalized.endsWith('.env') ||
       normalized.includes('/.env')

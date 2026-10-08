@@ -83,6 +83,7 @@ export type HostToWebviewMessage =
     }
   | { type: 'MESSAGE_STREAM_START'; messageId: string; model?: string }
   | { type: 'MESSAGE_STREAM_CHUNK'; messageId: string; chunk: string }
+  | { type: 'MESSAGE_STREAM_DISCARD'; messageId: string }
   | {
       type: 'MESSAGE_STREAM_DONE';
       messageId: string;
@@ -123,6 +124,7 @@ export type HostToWebviewMessage =
       permissions: Record<string, string>;
       autoSummarize: boolean;
       fullHistoryResend: boolean;
+      workspaceMemoryInContext?: boolean;
       redactionMode: string;
       dataCollectionPolicy: string;
       warnOnDataTraining: boolean;
@@ -132,6 +134,8 @@ export type HostToWebviewMessage =
       reviewerReasoningEffort?: string;
       reviewerSystemPrompt?: string;
       reviewerPinnedContextFile?: string;
+      notificationSound?: boolean;
+      notificationTone?: 'bell' | 'chime' | 'pop' | 'ding';
     }
   | {
       type: 'REVIEWER_VIEW_DATA';
@@ -163,6 +167,7 @@ export type HostToWebviewMessage =
   | {
       type: 'REVIEWER_STREAM_ERROR';
       message: string;
+      errorTitle?: string;
       partial: boolean;
       canRetry?: boolean;
     }
@@ -181,7 +186,7 @@ export type HostToWebviewMessage =
       detail?: string;
     }
   | { type: 'INSERT_INPUT_TEXT'; text: string; append?: boolean }
-  | { type: 'ERROR'; message: string; canRetry?: boolean }
+  | { type: 'ERROR'; message: string; errorTitle?: string; canRetry?: boolean; canResume?: boolean }
   | { type: 'TERMINAL_RUNNING'; command: string }
   | {
       type: 'TERMINAL_RESULT';
@@ -194,7 +199,8 @@ export type HostToWebviewMessage =
       timedOut?: boolean;
       error?: string;
     }
-  | { type: 'PENDING_TERMINAL_COMMAND'; command: string };
+  | { type: 'PENDING_TERMINAL_COMMAND'; command: string }
+  | { type: 'PLAY_NOTIFICATION_SOUND'; tone?: 'bell' | 'chime' | 'pop' | 'ding' };
 
 // Webview -> Host messages
 export type WebviewToHostMessage =
@@ -202,7 +208,7 @@ export type WebviewToHostMessage =
   | { type: 'SUBMIT_API_KEY'; apiKey: string }
   | { type: 'SELECT_MODEL'; modelId: string }
   | { type: 'REFRESH_MODELS' }
-  | { type: 'SEND_MESSAGE'; content: string; modelId: string; images?: Array<{ name: string; dataUrl: string }>; messageId?: string; reasoningEffort?: string; isRetry?: boolean; userTypedText?: string; attachments?: any[] }
+  | { type: 'SEND_MESSAGE'; content: string; modelId: string; images?: Array<{ name: string; dataUrl: string }>; messageId?: string; reasoningEffort?: string; isRetry?: boolean; isResume?: boolean; userTypedText?: string; attachments?: any[] }
   | { type: 'STOP_STREAM' }
   | { type: 'PREVIEW_DIFF'; filePath: string; newContent: string }
   | { type: 'ACCEPT_EDIT'; editId: string; filePath: string; newContent: string }
@@ -220,9 +226,11 @@ export type WebviewToHostMessage =
   | { type: 'SET_DEFAULT_MODEL'; modelId: string }
   | { type: 'TOGGLE_PERMISSION'; category: string }
   | { type: 'RESET_PERMISSIONS' }
-  | { type: 'SET_CONTEXT_SETTING'; key: 'autoSummarize' | 'fullHistoryResend'; value: boolean }
+  | { type: 'SET_CONTEXT_SETTING'; key: 'autoSummarize' | 'fullHistoryResend' | 'workspaceMemoryInContext'; value: boolean }
   | { type: 'SET_PRIVACY_SETTING'; key: 'redactionMode' | 'dataCollectionPolicy' | 'warnOnDataTraining'; value: any }
   | { type: 'SET_REVIEWER_SETTING'; key: 'enabled' | 'model' | 'reasoningEffort' | 'systemPrompt' | 'pinnedContextFile'; value: any }
+  | { type: 'SET_NOTIFICATION_SOUND'; enabled: boolean }
+  | { type: 'SET_NOTIFICATION_TONE'; tone: 'bell' | 'chime' | 'pop' | 'ding' }
   | { type: 'BROWSE_PINNED_CONTEXT_FILE' }
   | { type: 'RESET_REVIEWER_PROMPT' }
   | { type: 'PROMPT_UPDATE_KEY' }

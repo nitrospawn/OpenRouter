@@ -47,10 +47,14 @@ export class ContextReader {
       ? (document.fileName.includes('implementation_plan') ? 'plan' : 'walkthrough')
       : undefined;
 
-    // Guard: Ignore internal extension files and files outside workspace
-    const isInternalLog = document.fileName.includes('globalStorage') ||
-      document.fileName.includes('log-today.txt') ||
-      document.fileName.includes('usage_audit_log.json');
+    // Guard: Ignore internal extension files, memory logs, and files outside workspace
+    const normFileName = document.fileName.replace(/\\/g, '/');
+    const isInternalLog = normFileName.includes('globalStorage') ||
+      normFileName.includes('log-today.txt') ||
+      normFileName.includes('usage_audit_log.json') ||
+      normFileName.includes('/.openrouter/') ||
+      normFileName.endsWith('/activity_log.md') ||
+      normFileName.endsWith('activity_log.md');
     if (isInternalLog) {
       return { hasContext: false };
     }
@@ -101,6 +105,16 @@ export class ContextReader {
     const lowerQuery = cleanQuery.toLowerCase();
     const queryBasename = path.basename(cleanQuery).toLowerCase();
 
+    // Guard: Prevent reading internal memory logs or files in .openrouter as workspace code files
+    const normalizedQuery = cleanQuery.replace(/\\/g, '/').toLowerCase();
+    if (
+      normalizedQuery.includes('.openrouter') ||
+      normalizedQuery === 'activity_log.md' ||
+      normalizedQuery.endsWith('/activity_log.md')
+    ) {
+      return null;
+    }
+
     // 1. Check open in-memory document buffers first (live unsaved edits & case-insensitive match)
     if (vscode.workspace.textDocuments && vscode.workspace.textDocuments.length > 0) {
       // Prioritize exact match first
@@ -141,7 +155,7 @@ export class ContextReader {
     let targetUri: vscode.Uri | undefined;
     const hasExtension = cleanQuery.includes('.');
     const globPattern = hasExtension ? `**/${cleanQuery}` : `**/${cleanQuery}.*`;
-    const files = await vscode.workspace.findFiles(globPattern, '**/node_modules/**', 5);
+    const files = await vscode.workspace.findFiles(globPattern, '{**/node_modules/**,**/.openrouter/**}', 5);
     if (files && files.length > 0) {
       targetUri = files.sort((a, b) => a.fsPath.length - b.fsPath.length)[0];
     } else {
@@ -215,7 +229,7 @@ export class ContextReader {
     try {
       const uris = await vscode.workspace.findFiles(
         '**/*',
-        '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.vscode/**}',
+        '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/.vscode/**,**/.openrouter/**}',
         100
       );
       if (uris.length > 0) {
@@ -228,7 +242,7 @@ export class ContextReader {
         const rootPath = folders[0].uri.fsPath;
         const entries = fs.readdirSync(rootPath, { withFileTypes: true });
         return entries
-          .filter((e) => !e.name.startsWith('.') && e.name !== 'node_modules')
+          .filter((e) => !e.name.startsWith('.') && e.name !== 'node_modules' && e.name !== '.openrouter')
           .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
       }
       return [];

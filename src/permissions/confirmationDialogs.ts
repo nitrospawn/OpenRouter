@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 
 export class ConfirmationDialogs {
+  public static onPermissionPrompt?: () => void;
   public static async confirmFileEdit(filePath: string, isNewFile: boolean = false): Promise<'allow' | 'allow_session' | 'deny'> {
+    this.onPermissionPrompt?.();
     const actionLabel = isNewFile ? 'create file' : 'modify file';
     const choice = await vscode.window.showWarningMessage(
       `OpenRouter wants to ${actionLabel}: ${filePath}`,
@@ -17,6 +19,7 @@ export class ConfirmationDialogs {
   }
 
   public static async confirmFileDelete(filePath: string): Promise<boolean> {
+    this.onPermissionPrompt?.();
     const choice = await vscode.window.showWarningMessage(
       `Warning: OpenRouter wants to DELETE file: ${filePath}. This cannot be undone automatically!`,
       { modal: true },
@@ -32,6 +35,7 @@ export class ConfirmationDialogs {
     isDestructive: boolean,
     suggestedReverse?: string
   ): Promise<'allow' | 'allow_always' | 'deny'> {
+    this.onPermissionPrompt?.();
     let warningText = `Execute terminal command?\n\nCommand: ${command}\nDirectory: ${cwd}`;
     if (isDestructive) {
       warningText = `⚠️ CAUTION: Potentially destructive command detected!\n\nCommand: ${command}\nDirectory: ${cwd}`;

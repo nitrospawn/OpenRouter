@@ -46,6 +46,8 @@ async function run() {
       'test/commandClassifier.test.ts',
       'test/fileMutationGuardAndTerminalDropdown.test.ts',
       'test/memoryManifest.test.ts',
+      'test/filePreInjection.test.ts',
+      'test/notificationSound.test.ts',
     ],
     bundle: true,
     outdir: 'dist/test',
@@ -101,6 +103,9 @@ async function run() {
       'dist/test/executionSelfHealingAndContinuation.test.js',
       'dist/test/commandClassifier.test.js',
       'dist/test/fileMutationGuardAndTerminalDropdown.test.js',
+      'dist/test/memoryManifest.test.js',
+      'dist/test/filePreInjection.test.js',
+      'dist/test/notificationSound.test.js',
     ],
     {
       stdio: 'inherit',

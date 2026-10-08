@@ -4,6 +4,168 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9] - 2026-10-08
+
+### Added
+- **Terminal Self-Healing Failure Diagnostics & Strategic Pivot Delegation:**
+  - Added full diagnostic context handoff when terminal auto-retries reach `MAX_TERMINAL_RETRIES` (`currentRetryCount >= 5`), instead of halting silently.
+  - Automatically compiles complete execution history including the failing command, execution outcome, exit code, and truncated stderr/stdout diagnostics.
+  - Enhanced Safeguard 2 (repeated failing command detection): instead of abruptly breaking execution on the first repeat without edits, hands failure context back to the model once with explicit instructions to pivot away from repeating failing commands.
+  - Added single-fire failure delegation guard (`hasDelegatedFailure: true` in `retryContext`) to prevent infinite recursive self-healing loops if commands proposed during the pivot turn also fail.
+  - Feeds failure context back as an automated follow-up turn (`isAutoFollowUp: true`) directing the model to classify the error (e.g. `MISSING_SCHEMA`, `COMPILE_ERROR`, `ENV_ISSUE`), apply a completely different strategy, or offer 2–3 concrete actionable options to the user.
+- **Failed-Edit Precedence Over Terminal Commands:**
+  - When proposed file edits in a turn fail to apply, terminal commands (e.g. tests/compilers) are skipped immediately.
+  - Prevents testing stale/unmodified code that would burn retry budget, giving file self-healing full precedence to fix search blocks before verification commands run.
+- **Anti-Sleep & Port Probe Failure Safeguards:**
+  - Updated system prompt instructions to forbid blind sleep loops greater than 5 seconds (Start-Sleep 60/120, sleep 60) when waiting on background services/emulators.
+  - Added anti-stall directive in continuation prompts when port probes (e.g. Test-NetConnection returning False) or health checks fail, directing the model to inspect crash logs (Get-Content <log>) and verify runtime prerequisites (java -version) rather than repeating sleep loops.
+  - If prerequisites are missing or unconfigured, mandates classifying immediately as [ENV_ISSUE] and explaining the blocking prerequisite to the user.
+- **Upstream Provider Quota & Balance Error Detection:**
+  - Added pattern matching for upstream proxy credit exhaustion streamed as regular HTTP 200 text (e.g. `Your quota is exhausted`, `balance: -... USDT`, `API key status: exceeded`).
+  - Surfaces a structured error card with `⚠️ Upstream Provider Quota Exhausted` and actionable `Retry Now` and `Resume Task` buttons instead of silently treating it as conversational text and stopping.
+- **Active Implementation Plan Task Anchor & Continuous Execution Heartbeat:**
+  - Injected an ultra-compact (~50 tokens) `activePlanAnchor` into the system prompt containing only the current plan's checklist items (`- [ ]`, `- [x]`) whenever a multi-step plan is underway.
+  - Keeps the model anchored to the plan so it never edits random files out of scope or loses track of its pending tasks.
+  - Dynamic Auto-Followup Limit: Expanded `MAX_AUTO_FOLLOWUPS` dynamically from 10 to 30 whenever an active plan has pending checklist items, ensuring multi-step workflows do not halt prematurely.
+- **Universal Verification Principles (All Stacks & Languages):**
+  - Codified cross-stack verification guidelines in the system prompt: mandates fast, non-destructive diagnostic tools (`tsc --noEmit`, `npm test`, `pytest`, `cargo test`, `flutter analyze/test`, `go test`) for task completion verification.
+  - Forbids heavy release packaging (e.g. `flutter build apk`, `docker build`, `assembleRelease`, `electron-builder`) as verification steps unless explicitly requested by the user.
+  - Enforces synchronous execution: forbids detaching verification commands into background processes (`Start-Process`, `nohup`) so exit codes are always reliably tracked.
+
+### Fixed
+- **Silent Halting on Duplicate Commands and Exhausted Auto-Retries:**
+  - Resolved premature halting in Safeguard 2 where repeating a command without file changes terminated the session before reaching the retry limit.
+  - Replaced the dead-end behavior where reaching `MAX_TERMINAL_RETRIES` simply posted an assistant warning message and broke the loop, leaving the task incomplete and the user without guidance.
+
+## [0.4.9] - 2026-10-07
+
+### Added
+- **Human-Friendly Stream Error Classification & Structured UI Presentation:**
+  - Added structured `errorTitle` and `detail` representation to stream failure handling, replacing ambiguous, technical error strings with clear, actionable messages.
+  - Classified 4 distinct failure scenarios:
+    1. **Provider Busy / Timeout:**
+       - **Title:** `⚠️ AI Model Is Not Responding`
+       - **Detail:** `<model> is taking longer than usual or is experiencing heavy traffic. Try again or select another model.`
+    2. **Mid-Stream Interrupted / Stalled:**
+       - **Title:** `⚠️ Response Interrupted`
+       - **Detail:** `The connection to <model> dropped mid-response. Click Resume Task to pick up where it left off.`
+    3. **User Network Connectivity / Dropped Connection:**
+       - **Title:** `⚠️ Internet Connection Issue`
+       - **Detail:** `Could not reach the server. Please check your network connection and click Retry Now.`
+    4. **Provider Server Failure / Outage (HTTP 5xx / Bad Gateway / Service Unavailable):**
+       - **Title:** `⚠️ AI Service Temporarily Unavailable`
+       - **Detail:** `The provider hosting <model> is having server issues. Try switching to an alternative model.`
+  - Redesigned in-chat error card UI to present a bold headline row, an action-oriented detail explanation, and immediate action buttons (`🔁 Retry Now`, `▶ Resume Task`, `✕ Dismiss`).
+  - Retained automatic 30s countdown retry for network and timeout errors, disarming automatically upon prompt input focus.
+- **Accurate Notification Sound Timing & Permission Prompt Alerting:**
+  - Decoupled notification chime playback from the webview stream end heuristic (`!msg.isIntermediateStep` on `MESSAGE_STREAM_DONE`) which was mistakenly chiming after the initial terminal command was proposed and staying silent after the final completion summary.
+  - Introduced dedicated backend-driven `PLAY_NOTIFICATION_SOUND` message dispatched when:
+    1. The agent finishes all processing turns and becomes idle (`!triggeredFollowUp`).
+    2. The agent requests user permissions via modal dialogs (`ConfirmationDialogs.onPermissionPrompt`).
+    3. The agent pauses to ask user permission before running a side-effecting terminal command in `ask` mode (`PENDING_TERMINAL_COMMAND`).
+- **Internal Silent Retry for Empty Completions During Auto-Execution:**
+  - When an AI model emits an empty completion during automated follow-up turns or multi-step execution plans, retries are handled internally and silently up to `MAX_EMPTY_RETRIES = 2`.
+  - Dispatches `MESSAGE_STREAM_DISCARD` to clean up intermediate empty bubbles without cluttering the chat with repetitive empty response cards.
+  - If retries are exhausted, halts auto-execution cleanly and surfaces a single structured error card with `⚠️ AI Model Returned Empty Response` and `Resume Task` / `Retry Now` actions.
+
+### Fixed
+- **Premature & Missing Notification Sound Fix:**
+  - Resolved bug where the agent notification sound chimed immediately after the first terminal command was proposed, but remained completely silent when the entire task and final summary concluded.
+  - Eliminated the faulty webview stream end heuristic (`!msg.isIntermediateStep` on `MESSAGE_STREAM_DONE`) which misclassified intermediate automated follow-up turns.
+  - Added notification alert support for user permission requests: the notification chime now sounds when user permission is requested (VS Code modal confirmation dialogs for terminal commands, file edits, file deletions) and when terminal execution pauses in `ask` mode (`PENDING_TERMINAL_COMMAND`).
+- **10-Turn Empty Response Auto-Execution Loop & Duplicate Error Card Fix:**
+  - Fixed bug where an empty response failure emitted duplicate error indicators (both a top yellow assistant chat bubble and a bottom red structured error card).
+  - Empty response completions now emit `MESSAGE_STREAM_DISCARD` to remove the streaming placeholder without appending a duplicate text bubble to history or triggering `MESSAGE_STREAM_DONE`.
+  - Consolidated empty response failure rendering into a single, clean structured error card (`type: 'ERROR'`) with `Retry Now` and `Resume Task` buttons.
+- **Transient Error Card Cleanup Across Chat Actions:**
+  - Error cards now vanish immediately (`errorCard.remove()`) when the user or auto-execution clicks **"Retry Now"**, **"Resume Task"**, or **"Dismiss"**, keeping the chat stream clean and uncluttered.
+  - Retained full diagnostic logging in logger for all errors and internal retry attempts.
+
+### Changed
+- **Host-Webview Error & Sound Messaging Protocol:**
+  - Updated `HostToWebviewMessage` in `src/webview/messages.ts` with `PLAY_NOTIFICATION_SOUND` event, putting sound playback timing under authoritative host lifecycle control (`!triggeredFollowUp` on completion, modal dialog prompt, or `ask` mode pending action).
+  - Updated `HostToWebviewMessage` with `MESSAGE_STREAM_DISCARD` event, allowing the backend to silently remove intermediate streaming placeholders during silent retries.
+  - Updated `HostToWebviewMessage` `ERROR` type in `src/webview/messages.ts` to include optional `errorTitle?: string`.
+  - Updated webview renderer in `src/webview/ui/main.ts` and styling in `src/webview/ui/style.css` to support multi-line title + detail layouts with clean button alignment.
+
+### Observability & Logging
+- **Structured Diagnostic Error Logging:**
+  - Added dedicated diagnostic logger tags in `panelProvider.ts` for each failure classification (`[STREAM_ERROR: TIMEOUT]`, `[STREAM_ERROR: STALLED]`, `[STREAM_ERROR: NETWORK]`, and `[STREAM_ERROR: PROVIDER_OUTAGE]`), preserving raw error metadata while surfacing clean explanations to users.
+  - Achieved full parity in the Reviewer sub-system: applied identical human-friendly error titles/details and structured logging tags (`[REVIEWER_ERROR: TIMEOUT]`, `[REVIEWER_ERROR: STALLED]`, `[REVIEWER_ERROR: NETWORK]`, and `[REVIEWER_ERROR: PROVIDER_OUTAGE]`) across `REVIEWER_STREAM_ERROR`.
+  - **Comprehensive Silent Retry Logging:** Even though intermediate empty retries are completely silent on the UI, every attempt is recorded in the diagnostic log:
+    - Logged on each attempt: `[EMPTY_RESPONSE: AUTO_RETRY] Model <model> returned empty completion (attempt <x>/2). Retrying internally...`
+    - Logged on exhaustion: `[EMPTY_RESPONSE: FAILED] Model <model> returned empty completion after 2 attempts. Halting auto-execution.`
+
+## [0.4.8] - 2026-10-02
+
+### Added
+- **Candidate Mention Extraction (`extractFileMentions`):**
+  - Proactively scans user chat prompts to detect file references across 4 distinct pattern sets:
+    1. Explicit `@` mentions (e.g. `@src/index.ts`, `@file:README.md`).
+    2. Quoted filenames (e.g. `"PRD.md"`, `'database.sql'`, `` `config.json` ``).
+    3. Bare filenames with recognized extensions (`.md`, `.ts`, `.js`, `.dart`, `.py`, `.sql`, `.prisma`, `.json`, etc.).
+    4. Common intent phrases (e.g. `copy PRD.md into prdv2.md`, `read foo.dart`, `based on spec.md`, `open auth.ts`).
+  - Added URL immunity: ignores file-like extensions inside HTTP/HTTPS web links.
+  - Normalization: trims whitespace, strips leading `@`, `file:`, or `./` relative path prefixes, strips trailing punctuation, deduplicates case-insensitively, and limits extraction to top 5 candidates.
+- **Proactive File Pre-Injection Loop:**
+  - In `_handleSendMessage()`, resolves extracted file candidates via `ContextReader.findAndReadWorkspaceFile()` before prompt generation.
+  - Injects target file buffers directly into prompt `<file_content>` tags, eliminating wasteful chunked terminal reads (`Get-Content`) by models.
+  - Automatically skips the active editor file (already injected) and prevents duplicate file entries.
+  - Budget guardrail: caps total injected referenced content across files at `MAX_REFERENCED_CONTENT_CHARS = 120_000` (~40,000 tokens).
+  - Missing file intelligence: flags non-existent referenced files under `missingReferencedFile` so the model knows to create them instead of searching fruitlessly.
+  - Robust fault tolerance: wraps all candidate file lookups in silent `try/catch` handlers to never disrupt message sending.
+- **Workspace Memory in Context Switch (`openrouter.context.workspaceMemoryInContext`):**
+  - Added dedicated toggle in the Context Management settings view: *"Workspace Memory in Context"*.
+  - Strictly controls prompt injection: when toggled OFF, `<recent_workspace_activities>` is omitted from outgoing AI prompts to conserve tokens or run clean turns.
+  - Logging continuity: activity logging to `.openrouter/activity_log.md` continues uninterrupted even when context injection is toggled OFF, preserving complete session auditability.
+  - Immediate turn-by-turn effect: toggling immediately impacts the very next turn with zero window reload required.
+  - Checkpoint undo consistency: rolling back or undoing turns appends an explicit reverted status (`~~[Task Summary]~~ [REVERTED by user]`), preserving truth across turns.
+- **Memory Leakage Prevention & Workspace Isolation:**
+  - Added strict exclusions in `ContextReader` for `.openrouter/` and `activity_log.md`:
+    - Active editor tabs viewing `activity_log.md` are ignored (`hasContext: false`), preventing unintentional context ingestion when browsing logs.
+    - Excluded from `listWorkspaceFiles` directory discovery glob, so `.openrouter` never appears in workspace file trees.
+    - Excluded from `findAndReadWorkspaceFile`, preventing proactive pre-injection or model file reads from querying internal activity logs as source code files.
+- **Shadow Git Protection for Memory Logs:**
+  - Added `.openrouter/` to hardcoded ignore lists in `GitignoreRespect`.
+  - Guarantees `.openrouter/activity_log.md` is never reverted, corrupted, or deleted during checkpoint restore operations.
+- **Relocation of Workspace Memory Storage to Extension Storage:**
+  - Relocated `activity_log.md` from the project workspace folder (`.openrouter/activity_log.md`) to VS Code's internal workspace storage: `context.storageUri/memory/activity_log.md`.
+  - **Zero Workspace Clutter:** Prevents `.openrouter` folder from cluttering project root directory or VS Code file explorer.
+  - **Git & Shadow Git Immunity:** Stored securely in extension storage (`AppData/Roaming/Code/User/workspaceStorage/...`), completely outside user git tracking, shadow git commits, file undos, and workspace cleanups.
+  - **Diagnostic Logger Coexistence:** Diagnostic logging uses `context.storageUri/logs/` while memory logs use `context.storageUri/memory/`, providing separate lifecycles, clear directory isolation, and zero collision.
+  - **Automatic Seamless Migration:** On first access of an existing workspace, if `.openrouter/activity_log.md` is detected, its contents are automatically migrated to `context.storageUri/memory/activity_log.md`, preserving all existing memory history.
+- **Agent Response & Task Completion Notification Sound (`openrouter.notificationSound`):**
+  - Added notification audio alert that plays whenever the agent finishes responding or completes a task.
+  - Intermediate step immunity: notification sounds trigger exclusively on final turn completions (`MESSAGE_STREAM_DONE` when `!msg.isIntermediateStep` and `REVIEWER_STREAM_DONE`), avoiding disruptive chatter during multi-step tool calls.
+  - Zero external dependency synthesizer: built entirely using standard HTML5 Web Audio API (`AudioContext`) oscillators with smooth acoustic envelopes, fully immune to Content Security Policy (CSP) media blocks and requiring 0 npm packages.
+  - **Tone Presets (`openrouter.notificationTone`):**
+    - Configurable preset selection in Settings:
+      1. `bell` (Default): Soft Bell featuring two consecutive identical harmonic strikes (spaced 200ms apart with smooth acoustic decay).
+      2. `chime`: Subtle two-tone rising chime ($D_5 \rightarrow A_5$).
+      3. `pop`: Snappy, minimal wooden bubble pop.
+      4. `ding`: High crystal sine ding with harmonic tail.
+  - **Settings UI Controls & Real-Time Test Button:**
+    - Dedicated "Notifications & Sound" section in Settings view with a master toggle checkbox (`Play notification sound on completion`).
+    - Sound Tone dropdown selector dynamically synced with extension state.
+    - Inline "▶ Test" preview button to instantly audition the selected preset before saving.
+
+### Fixed
+- **Network Timeout Retry Fix & Seamless Task Continuation:**
+  - Resolved an issue in `src/webview/ui/main.ts` where the inline `Retry Now` button became completely unresponsive after the 30-second auto-retry countdown expired (caused by `isDisarmed = true` in `clearCountdown()` short-circuiting subsequent manual clicks in `triggerRetry()`).
+  - Decoupled countdown disarming from user-initiated retries, ensuring manual `Retry Now` clicks reliably execute regardless of countdown status or expiration.
+  - Added an intuitive **"▶ Resume Task"** action button to the stream error card whenever an active implementation plan is underway in history (`canResume: true`). Allows seamlessly continuing multi-step execution from the exact point of connection interruption without starting over or re-running completed modifications.
+- **Premature Walkthrough Prevention & Hard Physical Execution Gate:**
+  - Hardened system prompt `WALKTHROUGH RULES` with an explicit physical execution gate: ````walkthrough blocks must be the very last artifact produced in a task and require all checklist items (- [x]) to be completed, modified files inspected/compiled, and at least one non-read-only verification command (test runner, build, lint, or compiler) to have physically executed with exit code 0 in `Recent Terminal Outputs`.
+  - Added a mandatory `PRE-WALKTHROUGH SELF-CHECK` 3-point checklist directive in Section 10 (Step 4: Verify Before Declaring Done) directly preceding the walkthrough block format definition.
+  - Added a runtime walkthrough guard in `OpenRouterPanelProvider` (`panelProvider.ts`): inspects active plan documents for unchecked items (`- [ ]`) and verifies that `TerminalOutputTracker.getRecentOutputs()` contains a successful non-read-only command execution with exit code 0.
+  - Automatically discards premature walkthrough artifacts and schedules an autonomous correction turn directing the model to execute verification commands before emitting the final walkthrough.
+- **Physical Test Execution Gate & Anti-Hallucination Guardrail:**
+  - Enforced a strict execution gate preventing models from fabricating test outcomes (e.g. "All green", "All tests passed") without physically executing the test suite (`flutter test`, `npm test`, `pytest`) in the terminal with exit code 0 during the active turn.
+  - Implemented dependency and environment verification prerequisites before any test commands run, preventing runaway self-healing loops when dependencies fail to resolve.
+  - Enforced that implementation walkthrough plans and completion summaries are strictly the **final artifact** generated only after all code edits and terminal test verifications have completed cleanly.
+
+---
+
 ## [0.4.7] - 2026-09-25
 
 ### Added

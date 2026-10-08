@@ -6,8 +6,10 @@ import { PermissionManager } from '../src/permissions/permissionManager';
 
 class MockMemento {
   private data: Map<string, any> = new Map();
-  public get<T>(key: string, defaultValue?: T): T {
-    return this.data.has(key) ? this.data.get(key) : defaultValue;
+  public get<T>(key: string): T | undefined;
+  public get<T>(key: string, defaultValue: T): T;
+  public get<T>(key: string, defaultValue?: T): T | undefined {
+    return this.data.has(key) ? (this.data.get(key) as T) : defaultValue;
   }
   public async update(key: string, value: any): Promise<void> {
     if (value === undefined) {
@@ -143,28 +145,33 @@ test('ContextReader.findAndReadWorkspaceFile: matches open documents case-insens
   assert.strictEqual(result?.content, prdContent);
 });
 
-test('ContextReader.getActiveEditorContext: preserves full file content without arbitrary 25k truncation', () => {
+test('ContextReader: excludes .openrouter and activity_log.md from active editor context and file search', async () => {
   const permManager = createPermissionManager();
-  // Create a 40,000 character string (exceeds old 25k limit)
-  const largeContent = 'A'.repeat(40000);
-  const largeDoc: any = {
-    uri: vscode.Uri.file('C:/mock/workspace/large.md'),
-    fileName: 'C:/mock/workspace/large.md',
+  const logDoc: any = {
+    uri: vscode.Uri.file('C:/mock/workspace/.openrouter/activity_log.md'),
+    fileName: 'C:/mock/workspace/.openrouter/activity_log.md',
     languageId: 'markdown',
-    getText: () => largeContent,
+    getText: () => '# Activity Log\n- Secret past activity',
   };
   const mockEditor: any = {
-    document: largeDoc,
+    document: logDoc,
     selection: { isEmpty: true },
   };
 
   (vscode.window as any).activeTextEditor = mockEditor;
   (vscode.window as any).visibleTextEditors = [mockEditor];
-  (vscode.workspace as any).textDocuments = [largeDoc];
+  (vscode.workspace as any).textDocuments = [logDoc];
 
+  // Should ignore active editor context when user has activity_log.md open
   const ctx = ContextReader.getActiveEditorContext(permManager);
-  assert.strictEqual(ctx.hasContext, true);
-  assert.strictEqual(ctx.fileContent?.length, 40000);
-  assert.strictEqual(ctx.fileContent?.includes('...[truncated]'), false);
+  assert.strictEqual(ctx.hasContext, false, 'Should not ingest .openrouter/activity_log.md as active editor code file');
+
+  // Should reject reading activity_log.md via findAndReadWorkspaceFile
+  const readDirect = await ContextReader.findAndReadWorkspaceFile('activity_log.md', permManager);
+  assert.strictEqual(readDirect, null, 'Should block direct query for activity_log.md');
+
+  const readRel = await ContextReader.findAndReadWorkspaceFile('.openrouter/activity_log.md', permManager);
+  assert.strictEqual(readRel, null, 'Should block query for .openrouter/activity_log.md');
 });
+
 
