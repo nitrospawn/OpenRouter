@@ -632,6 +632,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           break;
         }
 
+        case 'SEND_FILE_TO_REVIEWER': {
+          await this._handleSendFileToReviewer(data.filePath, data.customPrompt);
+          break;
+        }
+
+        case 'SEND_CONTENT_TO_REVIEWER': {
+          await this._handleSendContentToReviewer(data.content, data.sourceLabel);
+          break;
+        }
+
         case 'ACCEPT_EDIT': {
           logger.info('USER', `User accepted change to: ${data.filePath} (editId: ${data.editId})`);
           const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -952,7 +962,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
                 if (hasActivePlan && !hasWalkthrough && !this._activeAbortController?.signal.aborted) {
                   const targetModel = Configuration.getLastModel() || 'openai/gpt-4o-mini';
                   const fileNames = affectedFiles.map((f) => path.basename(f)).join(', ');
-                  const continuationPrompt = `Applied edits to ${fileNames} successfully. Please proceed directly with the next step in the implementation plan without pausing for confirmation, or provide the final walkthrough if all steps are complete.`;
+                  const continuationPrompt = `Applied edits to ${fileNames} successfully. Please proceed directly with the next step in the implementation plan without pausing for confirmation. Do NOT emit a walkthrough block during intermediate steps; only emit the final \`\`\`\`walkthrough block once all implementation steps are finished AND all verification checks have passed.`;
                   await this._handleSendMessage(
                     continuationPrompt,
                     targetModel,
@@ -1459,7 +1469,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               });
 
               if (result.exitCode === 0 && !result.timedOut) {
-                followUpPrompt = `The terminal command \`${data.command}\` was executed with output:\n\`\`\`\n${truncatedSnippet}\n\`\`\`\nPlease proceed with the next step in the implementation plan, or provide the final walkthrough if all steps are complete.`;
+                followUpPrompt = `The terminal command \`${data.command}\` was executed with output:\n\`\`\`\n${truncatedSnippet}\n\`\`\`\nPlease proceed with the next step in the implementation plan. Do NOT emit a walkthrough block during intermediate steps; only emit the final \`\`\`\`walkthrough block once all implementation steps are finished AND all verification checks have passed.`;
               } else {
                 followUpPrompt = `The terminal command \`${data.command}\` failed (${outcome}).\nOutput:\n\`\`\`\n${truncatedSnippet}\n\`\`\`\nPlease diagnose this error, generate necessary file edits to fix it, or provide a corrected command.`;
               }
@@ -2708,18 +2718,29 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         // Extract two-tier artifacts (plan / walkthrough) from the raw model response
-        const { planDocument, walkthroughDocument: rawWalkthroughDocument, chatSummary } = extractArtifacts(finalContent);
+        const { planDocument, walkthroughDocument: rawWalkthroughDocument, chatSummary: rawChatSummary } = extractArtifacts(finalContent);
+        let chatSummary = rawChatSummary;
 
-        // Premature walkthrough guard:
-        // A walkthrough is invalid and premature if an active implementation plan exists but has
-        // uncompleted checklist items, or if no non-read-only verification command has succeeded with exit code 0.
+        // Premature & Multiple Walkthrough Guard:
+        // A walkthrough is invalid and premature if:
+        // 1. The turn contains pending file edits or terminal commands that have not yet executed or completed.
+        // 2. An active implementation plan exists and still has uncompleted checklist items (- [ ]).
+        // 3. No non-read-only verification command has succeeded with exit code 0 for this task in Recent Terminal Outputs.
+        // 4. A walkthrough document already exists for this active task session (strictly ONE walkthrough per task).
         let walkthroughDocument = rawWalkthroughDocument;
         let prematureWalkthroughReason: string | undefined;
 
         if (walkthroughDocument) {
-          // Check for active plan and uncompleted items
+          // Check 1: Pending edits or terminal commands in the same response
+          const hasPendingEdits = /(?:```|````)(?:create_file|edit_file|file|create|edit|patch|(?!plan|walkthrough)[a-zA-Z0-9_-]+):/i.test(finalContent);
+          const hasPendingCommands = /(?:```|````)(?:bash|sh|shell|cmd|powershell|pwsh)\b/i.test(finalContent);
+          if (hasPendingEdits || hasPendingCommands) {
+            prematureWalkthroughReason = 'The response contains pending file edits or terminal commands that have not yet executed or completed.';
+          }
+
+          // Check 2: Active plan with unchecked items
           let activePlanContent = planDocument;
-          if (!activePlanContent && this._historyStore) {
+          if (!prematureWalkthroughReason && !activePlanContent && this._historyStore) {
             try {
               const hist = await this._historyStore.loadHistory();
               const lastPlanMsg = [...hist].reverse().find(
@@ -2731,35 +2752,76 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
           }
 
-          if (activePlanContent) {
+          if (!prematureWalkthroughReason && activePlanContent) {
             const hasUncheckedItems = /^\s*-\s*\[ \]/m.test(activePlanContent);
             if (hasUncheckedItems) {
               prematureWalkthroughReason = 'There are uncompleted checklist items (- [ ]) remaining in the active implementation plan.';
             }
           }
 
+          // Check 3: Physical verification command with exit code 0 for this task
           if (!prematureWalkthroughReason) {
+            let taskStartTimestamp = 0;
+            if (this._historyStore) {
+              try {
+                const hist = await this._historyStore.loadHistory();
+                const lastUserMsg = [...hist].reverse().find((m) => m.role === 'user');
+                taskStartTimestamp = lastUserMsg?.timestamp || 0;
+              } catch {
+                // non-fatal
+              }
+            }
+
             const recentOutputs = TerminalOutputTracker.getRecentOutputs();
             const hasVerifiedExitZero = recentOutputs.some(
-              (out) => out.exitCode === 0 && out.status === 'success' && !CommandRunner.isReadOnly(out.command)
+              (out) =>
+                out.exitCode === 0 &&
+                out.status === 'success' &&
+                !CommandRunner.isReadOnly(out.command) &&
+                (taskStartTimestamp === 0 || out.timestamp >= taskStartTimestamp - 5000)
             );
             if (!hasVerifiedExitZero) {
-              prematureWalkthroughReason = 'No non-read-only verification command (test runner, build, lint, or compiler) has physically executed and returned exit code 0 in Recent Terminal Outputs.';
+              prematureWalkthroughReason = 'No non-read-only verification command (test runner, build, lint, or compiler) has physically executed and returned exit code 0 for this task in Recent Terminal Outputs.';
+            }
+          }
+
+          // Check 4: Exactly ONE walkthrough per task session (prevent generating multiple walkthroughs)
+          if (!prematureWalkthroughReason && this._historyStore) {
+            try {
+              const hist = await this._historyStore.loadHistory();
+              let lastUserIdx = -1;
+              for (let i = hist.length - 1; i >= 0; i--) {
+                if (hist[i].role === 'user') {
+                  lastUserIdx = i;
+                  break;
+                }
+              }
+              const subsequentMessages = lastUserIdx >= 0 ? hist.slice(lastUserIdx) : hist;
+              const existingWalkthroughMsg = subsequentMessages.find((m) => m.walkthroughDocument);
+              if (existingWalkthroughMsg) {
+                prematureWalkthroughReason = `A walkthrough document already exists for this task (${existingWalkthroughMsg.id}). Only one walkthrough document is allowed per task.`;
+              }
+            } catch {
+              // non-fatal
             }
           }
 
           if (prematureWalkthroughReason) {
             logger.warn('AGENT', `Discarding premature walkthrough: ${prematureWalkthroughReason}`);
             walkthroughDocument = undefined;
+            // Clean up chatSummary so it NEVER has "📄 Results docs ready — [view]" when discarded
+            chatSummary = chatSummary
+              .replace(/📄\s*(?:Results docs ready|Results docs|Walkthrough result|Walkthrough ready|Result walkthrough)\s*(?:[—–-]\s*\[view\])?/gi, '')
+              .trim();
           }
         }
 
         // Check if this turn is an intermediate step:
-        // An automated follow-up turn (isAutoFollowUp or autoTurnCount > 0 or retryCount > 0)
-        // that does NOT contain a walkthrough document is an intermediate execution step.
+        // A turn is tentatively intermediate if auto follow-up is active AND the message contains actions/commands to execute.
+        // We will finalize whether it is intermediate in the finally block after auto-execution resolves.
         const isIntermediateStep = Boolean(
-          (retryContext?.isAutoFollowUp || (retryContext?.autoTurnCount ?? 0) > 0 || (retryContext?.retryCount ?? 0) > 0) &&
-          !walkthroughDocument
+          !walkthroughDocument &&
+          (/(?:```|````)(?:bash|sh|shell|cmd|powershell|create_file|edit_file|file|create|edit|patch)/i.test(finalContent))
         );
 
         const isAutoFlow = Boolean(retryContext?.isAutoFollowUp || (retryContext?.autoTurnCount ?? 0) > 0 || (retryContext?.retryCount ?? 0) > 0);
@@ -3015,6 +3077,17 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
           }
         } finally {
+          if (assistantMessageId && !isEmptyResponse) {
+            const confirmedIntermediate = Boolean(triggeredFollowUp || isIntermediateStep);
+            if (this._historyStore) {
+              await this._historyStore.setMessageIntermediate(assistantMessageId, confirmedIntermediate);
+            }
+            this._postMessage({
+              type: 'SET_MESSAGE_INTERMEDIATE',
+              messageId: assistantMessageId,
+              isIntermediate: confirmedIntermediate,
+            });
+          }
           if (!triggeredFollowUp) {
             this._activeAbortController = undefined;
             this._postMessage({ type: 'SET_BUSY', busy: false });
@@ -3564,6 +3637,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         role: 'system' as const,
         content: summaryContent,
         timestamp: Date.now(),
+        isIntermediateStep: true,
       };
       
       // Proactively record significant terminal actions in MemoryManifest
@@ -3781,18 +3855,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             ? rawSnippet.substring(0, 1500) + '\n... [output truncated]'
             : rawSnippet;
 
-          // Tier 1 (Read-Only / Inspection): Run silently without chat card or message pollution
-          // Tier 2 (Side-Effecting): Collect into executedCommandsSummary for a single consolidated 1-line dropdown
-          if (!isReadOnlyCmd) {
-            executedCommandsSummary.push({
-              command,
-              outcome,
-              exitCode: result.exitCode ?? null,
-              output: truncatedSnippet,
-              timedOut: result.timedOut,
-              cancelled: result.cancelled,
-            });
-          }
+          // Collect all executed commands into executedCommandsSummary for the consolidated 1-line execution drawer
+          executedCommandsSummary.push({
+            command,
+            outcome,
+            exitCode: result.exitCode ?? null,
+            output: truncatedSnippet,
+            timedOut: result.timedOut,
+            cancelled: result.cancelled,
+          });
 
           // Track successful commands for automatic continuation response
           if (result.executed && result.exitCode === 0 && !result.cancelled && !result.timedOut) {
@@ -4091,7 +4162,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           if (hasFailedProbe) {
             continuationPrompt += "CRITICAL NOTE: A network/port probe failed above. Do NOT sleep or repeat the same probe. Immediately inspect the background process output or crash log (e.g. Get-Content <log>) or verify environment prerequisites (e.g. java -version). If prerequisites are missing or the service crashed, classify as [ENV_ISSUE] and clearly explain the blocking prerequisite with 2–3 options.";
           } else {
-            continuationPrompt += "Based on the terminal command results and applied changes above, please continue executing the plan autonomously until all tasks are complete and verified. Conclude with the two-tier walkthrough document when done.";
+            continuationPrompt += "Based on the terminal command results and applied changes above, please continue executing the plan autonomously until all tasks are complete and verified. Do NOT emit a walkthrough block during intermediate steps; conclude with the final walkthrough block only when all tasks and verifications are complete.";
           }
         }
 
@@ -4130,7 +4201,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
       if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
         const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
-        const continuationPrompt = `Applied the following edit(s) successfully:\n${successfullyEditedFiles.map((f) => `- \`${f}\``).join('\n')}\n\nPlease proceed directly with the next step in the implementation plan without pausing for confirmation. Reconcile your planned task checklist, implement the next pending modification, or provide the final walkthrough if all implementation and verification steps are complete.`;
+        const continuationPrompt = `Applied the following edit(s) successfully:\n${successfullyEditedFiles.map((f) => `- \`${f}\``).join('\n')}\n\nPlease proceed directly with the next step in the implementation plan without pausing for confirmation. Reconcile your planned task checklist and implement the next pending modification. Do NOT emit a walkthrough block during intermediate steps; only emit the final \`\`\`\`walkthrough block once all implementation and verification steps are complete.`;
 
         await this._handleSendMessage(
           continuationPrompt,
@@ -4172,7 +4243,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
       if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
         const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
-        const continuationPrompt = `Please proceed directly with the implementation without pausing for confirmation. Reconcile your planned task checklist and emit the required file edits (\`\`\`edit_file:<path>) or terminal commands for the next step, or provide the final \`\`\`walkthrough block if all implementation and verification steps are complete.`;
+        const continuationPrompt = `Please proceed directly with the implementation without pausing for confirmation. Reconcile your planned task checklist and emit the required file edits (\`\`\`edit_file:<path>) or terminal commands for the next step. Do NOT emit a walkthrough block during intermediate steps; only emit the final \`\`\`\`walkthrough block once all implementation and verification steps are complete.`;
 
         await this._handleSendMessage(
           continuationPrompt,
@@ -4269,6 +4340,155 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       sessions: allSessions,
       activeSessionId: activeSession.id,
     });
+  }
+
+  private async _handleSendFileToReviewer(filePath: string, customPrompt?: string): Promise<void> {
+    if (!Configuration.getReviewerEnabled()) {
+      vscode.window.showWarningMessage('Reviewer mode is currently disabled in extension settings.');
+      return;
+    }
+
+    let targetPath = (filePath || '').trim().replace(/^["']|["']$/g, '');
+    if (!targetPath) {
+      vscode.window.showWarningMessage('No file path provided to send to Reviewer.');
+      return;
+    }
+
+    // Strip line or anchor suffix (e.g. file.ts:42, file.ts#L42-L50)
+    targetPath = targetPath.replace(/(?::\d+(?::\d+)?|#L\d+(?:-L?\d+)?)$/i, '').trim();
+
+    let fileUri: vscode.Uri | undefined;
+
+    if (targetPath.startsWith('file://')) {
+      try {
+        fileUri = vscode.Uri.parse(targetPath);
+      } catch {
+        fileUri = undefined;
+      }
+    } else if (path.isAbsolute(targetPath)) {
+      const normalized = path.normalize(targetPath);
+      if (fs.existsSync(normalized)) {
+        fileUri = vscode.Uri.file(normalized);
+      }
+    }
+
+    const workspaceFolders = vscode.workspace.workspaceFolders || [];
+
+    if (!fileUri && workspaceFolders.length > 0) {
+      for (const folder of workspaceFolders) {
+        const candidate = path.resolve(folder.uri.fsPath, targetPath);
+        if (fs.existsSync(candidate)) {
+          fileUri = vscode.Uri.file(candidate);
+          break;
+        }
+      }
+    }
+
+    if (!fileUri && process.platform === 'win32' && /^[\\/]?[uU]sers[\\/]/.test(targetPath)) {
+      const sysDrive = (process.env.SystemDrive || 'C:').replace(/[\\/]+$/, '');
+      const withDrive = sysDrive + '\\' + targetPath.replace(/^[\\/]/, '');
+      if (fs.existsSync(withDrive)) {
+        fileUri = vscode.Uri.file(withDrive);
+      }
+    }
+
+    if (!fileUri && workspaceFolders.length > 0) {
+      const baseName = path.basename(targetPath);
+      if (baseName && baseName.length > 1) {
+        try {
+          const matches = await vscode.workspace.findFiles(`**/${baseName}`, '**/node_modules/**', 20);
+          if (matches.length === 1) {
+            fileUri = matches[0];
+          } else if (matches.length > 1) {
+            const normalizedTarget = targetPath.replace(/\\/g, '/').toLowerCase();
+            const exactSuffixMatch = matches.filter((u) =>
+              u.fsPath.replace(/\\/g, '/').toLowerCase().endsWith(normalizedTarget)
+            );
+            if (exactSuffixMatch.length === 1) {
+              fileUri = exactSuffixMatch[0];
+            } else if (exactSuffixMatch.length > 1) {
+              fileUri = exactSuffixMatch[0];
+            } else {
+              fileUri = matches[0];
+            }
+          }
+        } catch (findErr) {
+          logger.warn('REVIEW', `Error finding files for ${baseName}: ${findErr}`);
+        }
+      }
+    }
+
+    if (!fileUri || !fs.existsSync(fileUri.fsPath)) {
+      vscode.window.showWarningMessage(`Cannot review file: "${filePath}" was not found in the workspace.`);
+      return;
+    }
+
+    try {
+      const stat = await vscode.workspace.fs.stat(fileUri);
+      if (stat.type & vscode.FileType.Directory) {
+        vscode.window.showWarningMessage(`Cannot review folder "${filePath}". Please select a file.`);
+        return;
+      }
+
+      const rawBytes = await vscode.workspace.fs.readFile(fileUri);
+      const content = Buffer.from(rawBytes).toString('utf8');
+      const fileName = path.basename(fileUri.fsPath);
+      const relPath = vscode.workspace.asRelativePath(fileUri);
+      const sizeBytes = stat.size;
+
+      // Ensure Reviewer panel state and session are loaded on webview
+      await this._handleOpenDirectReviewer();
+
+      const promptText =
+        customPrompt ||
+        `Please review ${relPath} for correctness, potential regressions, and alignment with project requirements.`;
+
+      this._postMessage({
+        type: 'REVIEWER_CONTEXT_POPULATED',
+        attachment: {
+          filePath: relPath,
+          fileName,
+          content,
+          sizeBytes,
+        },
+        promptText,
+      });
+
+      logger.info('REVIEW', `Sent file "${relPath}" (${sizeBytes} bytes) to Reviewer.`);
+    } catch (readErr: any) {
+      logger.error('REVIEW', `Failed reading file for review: ${readErr?.message || readErr}`);
+      vscode.window.showErrorMessage(`Failed reading file "${filePath}": ${readErr?.message || readErr}`);
+    }
+  }
+
+  private async _handleSendContentToReviewer(content: string, sourceLabel?: string): Promise<void> {
+    if (!Configuration.getReviewerEnabled()) {
+      vscode.window.showWarningMessage('Reviewer mode is currently disabled in extension settings.');
+      return;
+    }
+
+    const cleanContent = (content || '').trim();
+    if (!cleanContent) {
+      vscode.window.showWarningMessage('No content selected to review.');
+      return;
+    }
+
+    // Ensure Reviewer panel state and session are loaded on webview
+    await this._handleOpenDirectReviewer();
+
+    const label = sourceLabel || 'Chat Message';
+    const promptText = `Please review this content from ${label} for correctness and potential issues.`;
+
+    this._postMessage({
+      type: 'REVIEWER_CONTEXT_POPULATED',
+      contentSnippet: {
+        text: cleanContent,
+        sourceLabel: label,
+      },
+      promptText,
+    });
+
+    logger.info('REVIEW', `Sent content snippet (${cleanContent.length} chars) to Reviewer.`);
   }
 
   private async _handleStartReview(
@@ -4846,7 +5066,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
   <link rel="stylesheet" href="${styleUri}">
   <title>OpenRouter</title>
 </head>
-<body>
+<body class="${reviewerEnabled ? 'reviewer-enabled' : 'reviewer-disabled'}">
   <!-- Auth / Onboarding Section -->
   <div id="auth-section" class="welcome-box hidden">
     <h3>Welcome to OpenRouter</h3>

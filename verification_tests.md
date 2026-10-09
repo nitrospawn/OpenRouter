@@ -81,6 +81,18 @@ This document provides an end-to-end, rigorous manual and automated test matrix 
   - Entire error status and action controls stay on 1 single line without vertical header clutter.
   - When countdown reaches 0s, cleanly retries without duplicate text or scrambled tokens.
 
+### TC-CHAT-05: Intermediate Execution Steps Drawer (Scrolling & Unconstrained View)
+* **Goal:** Verify that the intermediate execution drawer expands properly without clipping or vertical compression and allows full vertical scrolling through all step details and diagnostics.
+* **Test Steps:**
+  1. Trigger an agentic task involving multi-step file operations or terminal command executions.
+  2. During execution or upon completion, click to expand the intermediate steps dropdown drawer (`.intermediate-steps-drawer`).
+  3. Inspect step descriptions, outputs, and diagnostic logs within the expanded list.
+  4. Scroll vertically across the drawer content when multiple steps or multi-line outputs exist.
+* **Expected Result:**
+  - Full details for each intermediate step remain legible without artificial single-line truncation or summary clamping.
+  - Drawer maintains `flex-shrink: 0` structure and does not collapse under flex parent layout constraints.
+  - User can smoothly scroll vertically through the complete set of execution steps and review all actions taken.
+
 ---
 
 ## 3. File Operations, Diffs & Checkpoint System

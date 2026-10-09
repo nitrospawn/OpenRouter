@@ -45,9 +45,17 @@ const MUTATING_PATTERNS: RegExp[] = [
  * Checks if an individual command segment is read-only.
  */
 function isSingleCommandReadOnly(cmd: string): boolean {
-  const trimmed = cmd.trim();
+  let trimmed = cmd.trim();
   if (!trimmed) {
     return true;
+  }
+
+  // Unwrap powershell / pwsh / cmd wrapper invocations
+  const wrapperMatch =
+    trimmed.match(/^(?:powershell|pwsh)(?:\.exe)?\s+(?:-Command|-c)\s+["']?([\s\S]+?)["']?$/i) ||
+    trimmed.match(/^cmd(?:\.exe)?\s+\/c\s+["']?([\s\S]+?)["']?$/i);
+  if (wrapperMatch) {
+    trimmed = wrapperMatch[1].trim();
   }
 
   // Any mutating keyword or redirection disqualifies it immediately
@@ -99,7 +107,13 @@ export function isReadOnly(command: string): boolean {
  * (e.g. "Reading file: src/index.ts", "Inspecting directory")
  */
 export function getInspectionDescription(command: string): string {
-  const trimmed = command.trim();
+  let trimmed = command.trim();
+  const wrapperMatch =
+    trimmed.match(/^(?:powershell|pwsh)(?:\.exe)?\s+(?:-Command|-c)\s+["']?([\s\S]+?)["']?$/i) ||
+    trimmed.match(/^cmd(?:\.exe)?\s+\/c\s+["']?([\s\S]+?)["']?$/i);
+  if (wrapperMatch) {
+    trimmed = wrapperMatch[1].trim();
+  }
 
   const fileMatch = trimmed.match(/^(?:type|cat|Get-Content|gc)\s+(.+)$/i);
   if (fileMatch) {

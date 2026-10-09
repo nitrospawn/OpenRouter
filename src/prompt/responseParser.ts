@@ -246,7 +246,9 @@ export function extractArtifacts(rawContent: string): ExtractedArtifacts {
   }
 
   // Resilient fallback: If no fenced walkthrough was found, check if rawContent contains an unfenced Walkthrough document
-  if (!walkthroughFence && !walkthroughDocument) {
+  // Only attempt this fallback if the message does NOT contain pending file edits or terminal commands
+  const hasEditsOrCommands = /(?:```|````)(?:create_file|edit_file|file|create|edit|patch|bash|sh|shell|cmd|powershell|pwsh)\b/i.test(rawContent);
+  if (!walkthroughFence && !walkthroughDocument && !hasEditsOrCommands) {
     const unfencedWalkthroughMatch = /(?:^|\n)(#{1,3}\s+(?:(?:Final\s+)?Walkthrough|Verification\s+(?:&|and)\s+Walkthrough|Walkthrough\s+(?:Report|Result))[\s\S]*)$/i.exec(chatSummary);
     if (unfencedWalkthroughMatch && unfencedWalkthroughMatch[1].trim().length > 30) {
       const candidateWalkthrough = unfencedWalkthroughMatch[1].trim();

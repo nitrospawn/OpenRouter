@@ -48,6 +48,8 @@ async function run() {
       'test/memoryManifest.test.ts',
       'test/filePreInjection.test.ts',
       'test/notificationSound.test.ts',
+      'test/sendToReviewer.test.ts',
+      'test/walkthroughDedup.test.ts',
     ],
     bundle: true,
     outdir: 'dist/test',
@@ -106,6 +108,8 @@ async function run() {
       'dist/test/memoryManifest.test.js',
       'dist/test/filePreInjection.test.js',
       'dist/test/notificationSound.test.js',
+      'dist/test/sendToReviewer.test.js',
+      'dist/test/walkthroughDedup.test.js',
     ],
     {
       stdio: 'inherit',

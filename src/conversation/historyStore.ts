@@ -223,6 +223,27 @@ export class HistoryStore {
     return false;
   }
 
+  public async setMessageIntermediate(messageId: string, isIntermediate: boolean): Promise<boolean> {
+    if (!this.hasLoaded) {
+      await this.loadSessions();
+    }
+    const active = this.sessions.find((s) => s.id === this.activeSessionId);
+    if (!active) return false;
+
+    let msg = active.messages.find((m) => m.id === messageId);
+    if (!msg) {
+      const idx = this._findMessageIndex(active.messages, messageId);
+      if (idx !== -1) msg = active.messages[idx];
+    }
+    if (msg) {
+      msg.isIntermediateStep = isIntermediate;
+      active.updatedAt = Date.now();
+      await this._saveToDisk();
+      return true;
+    }
+    return false;
+  }
+
   public async getMessageById(messageId: string): Promise<StoredChatMessage | undefined> {
     if (!this.hasLoaded) {
       await this.loadSessions();

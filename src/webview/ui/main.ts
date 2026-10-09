@@ -658,7 +658,7 @@ const reviewerPinnedClearBtn = document.getElementById('reviewer-pinned-clear-bt
 let currentReviewerModelId = '';
 let currentReviewerReasoningEffort = 'medium';
 let currentReviewerPinnedFile = '';
-let isReviewerEnabled = false;
+export let isReviewerEnabled = false;
 
 // Notification Sound DOM References & State
 const chkNotificationSound = document.getElementById('chk-notification-sound') as HTMLInputElement;
@@ -826,7 +826,22 @@ function updateReviewerPinnedHeader(filePath?: string) {
 // Direct Reviewer Toggle Button (Main Chat Header)
 const reviewerToggleBtn = document.getElementById('reviewer-toggle-btn') as HTMLButtonElement;
 
-function updateReviewerToggleBtnVisibility(enabled: boolean) {
+export function setReviewerModeEnabled(enabled: boolean) {
+  isReviewerEnabled = enabled;
+  if (typeof document !== 'undefined' && document.body && document.body.classList) {
+    if (typeof document.body.classList.toggle === 'function') {
+      document.body.classList.toggle('reviewer-enabled', enabled);
+      document.body.classList.toggle('reviewer-disabled', !enabled);
+    } else {
+      if (enabled) {
+        document.body.classList.add('reviewer-enabled');
+        document.body.classList.remove('reviewer-disabled');
+      } else {
+        document.body.classList.remove('reviewer-enabled');
+        document.body.classList.add('reviewer-disabled');
+      }
+    }
+  }
   if (reviewerToggleBtn) {
     if (enabled) {
       if (reviewerToggleBtn.classList) {
@@ -842,13 +857,44 @@ function updateReviewerToggleBtnVisibility(enabled: boolean) {
       }
     }
   }
-  document.querySelectorAll<HTMLElement>('.chat-artifact-review-btn').forEach((btn) => {
-    if (enabled) {
-      btn.classList.remove('hidden');
+  if (chkReviewerEnabled) {
+    chkReviewerEnabled.checked = enabled;
+  }
+  if (typeof floatingReviewBtn !== 'undefined' && floatingReviewBtn && floatingReviewBtn.classList) {
+    if (typeof floatingReviewBtn.classList.toggle === 'function') {
+      floatingReviewBtn.classList.toggle('hidden', !enabled);
     } else {
-      btn.classList.add('hidden');
+      if (!enabled) {
+        floatingReviewBtn.classList.add('hidden');
+      } else {
+        floatingReviewBtn.classList.remove('hidden');
+      }
     }
-  });
+    if (!enabled) {
+      floatingReviewBtn.style.display = 'none';
+    } else {
+      floatingReviewBtn.style.display = '';
+    }
+  }
+  if (typeof document !== 'undefined' && document.querySelectorAll) {
+    const allReviewBtns = document.querySelectorAll<HTMLElement>(
+      '.file-link-review-btn, .btn-review-file, .msg-review-btn, .btn-review-msg, .chat-artifact-review-btn, .btn-review-selection'
+    );
+    allReviewBtns.forEach((btn) => {
+      const inReviewer = typeof isInsideReviewerChat === 'function' ? isInsideReviewerChat(btn) : false;
+      if (inReviewer || !enabled) {
+        btn.classList.add('hidden');
+        btn.style.display = 'none';
+      } else {
+        btn.classList.remove('hidden');
+        btn.style.display = '';
+      }
+    });
+  }
+}
+
+export function updateReviewerToggleBtnVisibility(enabled: boolean) {
+  setReviewerModeEnabled(enabled);
 }
 updateReviewerToggleBtnVisibility(isReviewerEnabled);
 
@@ -870,6 +916,8 @@ export const reviewerScrollController = new SmartScrollController(reviewerMessag
 const reviewerSelectionToolbar = document.getElementById('reviewer-selection-toolbar') as HTMLDivElement;
 const reviewerSendSelectionBtn = document.getElementById('reviewer-send-selection-btn') as HTMLButtonElement;
 const reviewerClarifySelectionBtn = document.getElementById('reviewer-clarify-selection-btn') as HTMLButtonElement;
+if (viewReviewer) viewReviewer.dataset.isReviewer = 'true';
+if (reviewerMessages) reviewerMessages.dataset.isReviewer = 'true';
 
 // In-Panel Reviewer Model Selector & Reasoning DOM References
 const reviewerPanelModelInput = document.getElementById('reviewer-panel-model-input') as HTMLInputElement;
@@ -1687,6 +1735,9 @@ window.addEventListener('message', (event) => {
         mainProgressManager = null;
       }
       if (activeAssistantContentEl) {
+        if (activeAssistantMessageEl && msg.isIntermediateStep) {
+          activeAssistantMessageEl.dataset.isIntermediate = 'true';
+        }
         const textToRender = msg.chatSummary || activeAssistantContentEl.textContent || '';
         activeAssistantContentEl.textContent = '';
         renderFormattedContent(textToRender, activeAssistantContentEl, 'assistant', false, msg.messageId);
@@ -1694,7 +1745,8 @@ window.addEventListener('message', (event) => {
           activeAssistantMessageEl.dataset.rawContent = textToRender;
           parseAndRenderActions(textToRender, activeAssistantMessageEl);
           if (msg.isIntermediateStep) {
-            collapseIntermediateStepDetails(activeAssistantMessageEl, activeAssistantContentEl);
+            // collapseIntermediateStepDetails(activeAssistantMessageEl, activeAssistantContentEl);
+            placeInIntermediateDrawer(activeAssistantMessageEl);
           }
         }
 
@@ -1752,6 +1804,24 @@ window.addEventListener('message', (event) => {
               });
             });
             headerActions.appendChild(copyBtn);
+
+            const reviewBtn = document.createElement('button');
+            reviewBtn.className = `msg-review-btn btn-review-msg${isReviewerEnabled ? '' : ' hidden'}`;
+            if (!isReviewerEnabled) {
+              reviewBtn.style.display = 'none';
+            }
+            reviewBtn.title = 'Send message or selected text to Reviewer';
+            reviewBtn.innerHTML = `
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              <span>Review</span>
+            `;
+            reviewBtn.addEventListener('click', () => {
+              handleReviewMessageAction(textToRender);
+            });
+            headerActions.appendChild(reviewBtn);
             header.appendChild(headerActions);
           }
         }
@@ -2017,6 +2087,10 @@ window.addEventListener('message', (event) => {
       handleReviewerAttachArtifact(msg);
       break;
 
+    case 'REVIEWER_CONTEXT_POPULATED':
+      handleReviewerContextPopulated(msg);
+      break;
+
     case 'REVIEWER_STREAM_START':
       handleReviewerStreamStart();
       break;
@@ -2085,6 +2159,28 @@ window.addEventListener('message', (event) => {
     case 'PENDING_TERMINAL_COMMAND':
       setPendingTerminalCommand(msg.command);
       break;
+
+    case 'SET_MESSAGE_INTERMEDIATE': {
+      const el = document.getElementById(`msg-${msg.messageId}`);
+      if (el) {
+        if (msg.isIntermediate) {
+          el.dataset.isIntermediate = 'true';
+          const bodyEl = el.querySelector<HTMLElement>('.message-body');
+          // if (bodyEl) {
+          //   collapseIntermediateStepDetails(el, bodyEl);
+          // }
+          placeInIntermediateDrawer(el);
+        } else {
+          el.dataset.isIntermediate = 'false';
+          const bodyEl = el.querySelector<HTMLElement>('.message-body');
+          // if (bodyEl) {
+          //   uncollapseIntermediateStepDetails(bodyEl);
+          // }
+          unplaceFromIntermediateDrawer(el);
+        }
+      }
+      break;
+    }
 
     case 'TERMINAL_RESULT': {
       setPendingTerminalCommand(null);
@@ -2548,21 +2644,6 @@ function parseAndRenderActions(content: string, parentEl: HTMLDivElement | null,
 export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, bodyEl: HTMLElement | null) {
   if (!bodyEl) return;
 
-  // 1. Check if this message has action cards or code blocks
-  const hasActionCards = Boolean(
-    bodyEl.querySelector('.terminal-card, .diff-card, .chat-artifact-card, .task-summary-card') ||
-    (messageEl && messageEl.querySelector('.terminal-card, .diff-card, .chat-artifact-card, .task-summary-card'))
-  );
-
-  const hasCodeBlocks = Boolean(
-    bodyEl.querySelector('.code-block-wrapper, pre')
-  );
-
-  // If there are no actions or code blocks in this step, do not collapse
-  if (!hasActionCards && !hasCodeBlocks) {
-    return;
-  }
-
   // Already collapsed guard
   if (bodyEl.querySelector('.intermediate-step-details')) {
     return;
@@ -2572,18 +2653,7 @@ export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, b
   const commentaryNodes: HTMLElement[] = [];
   const children = Array.from(bodyEl.children) as HTMLElement[];
   for (const child of children) {
-    const isAction =
-      child.classList.contains('code-block-wrapper') ||
-      child.classList.contains('terminal-card') ||
-      child.classList.contains('diff-card') ||
-      child.classList.contains('chat-artifact-card') ||
-      child.classList.contains('task-summary-card') ||
-      child.classList.contains('message-attachments-bar') ||
-      child.classList.contains('empty-response-banner');
-
-    if (!isAction) {
-      commentaryNodes.push(child);
-    }
+    commentaryNodes.push(child);
   }
 
   if (commentaryNodes.length === 0) {
@@ -2592,9 +2662,6 @@ export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, b
 
   // 3. Check for errors or warnings
   const fullText = commentaryNodes.map((n) => n.textContent || '').join(' ');
-  if (!fullText.trim()) {
-    return;
-  }
 
   const hasErrorOrWarning =
     fullText.includes('⚠️') ||
@@ -2609,7 +2676,7 @@ export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, b
 
   const summary = document.createElement('summary');
   summary.className = 'intermediate-step-summary';
-  summary.title = 'Click to expand or collapse step commentary';
+  summary.title = 'Click to expand or collapse step details';
 
   const icon = document.createElement('span');
   icon.className = 'intermediate-step-icon';
@@ -2617,7 +2684,7 @@ export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, b
 
   const label = document.createElement('span');
   label.className = 'intermediate-step-label';
-  label.textContent = hasErrorOrWarning ? 'Step Notes (Attention Needed)' : 'Step Notes';
+  label.textContent = hasErrorOrWarning ? 'Step Details (Attention Needed)' : 'Step Details';
 
   summary.appendChild(icon);
   summary.appendChild(label);
@@ -2638,6 +2705,145 @@ export function collapseIntermediateStepDetails(messageEl: HTMLElement | null, b
   details.appendChild(contentDiv);
   bodyEl.appendChild(details);
 }
+
+export function uncollapseIntermediateStepDetails(bodyEl: HTMLElement | null) {
+  if (!bodyEl) return;
+  const details = bodyEl.querySelector<HTMLDetailsElement>('.intermediate-step-details');
+  if (!details) return;
+  const contentDiv = details.querySelector<HTMLElement>('.intermediate-step-body');
+  if (contentDiv) {
+    const children = Array.from(contentDiv.children);
+    children.forEach((child) => {
+      bodyEl.insertBefore(child, details);
+    });
+  }
+  details.remove();
+}
+
+export function getOrCreateIntermediateDrawer(targetChild?: HTMLElement | null): { drawer: HTMLDetailsElement; bodyEl: HTMLElement } {
+  const existingParentDrawer = targetChild?.closest?.('.intermediate-turn-drawer') as HTMLDetailsElement | null;
+  if (existingParentDrawer) {
+    const bodyEl = existingParentDrawer.querySelector<HTMLElement>('.intermediate-turn-drawer-body') || existingParentDrawer;
+    return { drawer: existingParentDrawer, bodyEl };
+  }
+
+  const allChildren = Array.from(messagesContainer.children) as HTMLElement[];
+  let lastUserIdx = -1;
+  for (let i = allChildren.length - 1; i >= 0; i--) {
+    if (allChildren[i].classList?.contains('user')) {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  for (let i = allChildren.length - 1; i > lastUserIdx; i--) {
+    if (allChildren[i].classList?.contains('intermediate-turn-drawer')) {
+      const drawer = allChildren[i] as HTMLDetailsElement;
+      const bodyEl = drawer.querySelector<HTMLElement>('.intermediate-turn-drawer-body');
+      if (bodyEl) {
+        return { drawer, bodyEl };
+      }
+    }
+  }
+
+  const drawer = document.createElement('details');
+  drawer.className = 'intermediate-turn-drawer';
+  (drawer as any).open = false;
+
+  const summary = document.createElement('summary');
+  summary.className = 'intermediate-turn-drawer-summary';
+  summary.title = 'Click to expand or collapse execution steps and terminal outputs';
+
+  const icon = document.createElement('span');
+  icon.className = 'intermediate-turn-drawer-icon';
+  icon.textContent = '▸';
+
+  const emoji = document.createElement('span');
+  emoji.className = 'intermediate-turn-drawer-emoji';
+  emoji.textContent = '⚙️';
+
+  const title = document.createElement('span');
+  title.className = 'intermediate-turn-drawer-title';
+  title.textContent = 'Execution in progress...';
+
+  const hint = document.createElement('span');
+  hint.className = 'intermediate-turn-drawer-hint';
+  hint.textContent = 'View details';
+
+  summary.appendChild(icon);
+  summary.appendChild(emoji);
+  summary.appendChild(title);
+  summary.appendChild(hint);
+  drawer.appendChild(summary);
+
+  const bodyEl = document.createElement('div');
+  bodyEl.className = 'intermediate-turn-drawer-body';
+  drawer.appendChild(bodyEl);
+
+  if (targetChild && targetChild.parentElement === messagesContainer) {
+    messagesContainer.insertBefore(drawer, targetChild);
+  } else {
+    messagesContainer.appendChild(drawer);
+  }
+
+  return { drawer, bodyEl };
+}
+
+export function updateIntermediateDrawerSummary(drawer: HTMLDetailsElement) {
+  const bodyEl = drawer.querySelector<HTMLElement>('.intermediate-turn-drawer-body');
+  if (!bodyEl) return;
+  const title = drawer.querySelector<HTMLElement>('.intermediate-turn-drawer-title');
+  if (!title) return;
+
+  const childMessages = Array.from(bodyEl.querySelectorAll<HTMLElement>('.message'));
+  const assistantSteps = childMessages.filter((m) => m.classList.contains('assistant')).length;
+  const terminalItems = Array.from(bodyEl.querySelectorAll('.terminal-run-summary, .terminal-run-item, .terminal-card')).length;
+
+  let text = '';
+  if (assistantSteps > 0 && terminalItems > 0) {
+    const stepWord = assistantSteps === 1 ? 'step' : 'steps';
+    const cmdWord = terminalItems === 1 ? 'terminal command' : 'terminal commands';
+    text = `${assistantSteps} execution ${stepWord} (${terminalItems} ${cmdWord})`;
+  } else if (assistantSteps > 0) {
+    const stepWord = assistantSteps === 1 ? 'step' : 'steps';
+    text = `${assistantSteps} execution ${stepWord} completed`;
+  } else if (terminalItems > 0) {
+    const cmdWord = terminalItems === 1 ? 'command' : 'commands';
+    text = `${terminalItems} terminal ${cmdWord} executed`;
+  } else {
+    text = `${childMessages.length} intermediate execution items`;
+  }
+  title.textContent = text;
+}
+
+export function placeInIntermediateDrawer(msgEl: HTMLElement) {
+  if (!msgEl) return;
+  const { drawer, bodyEl } = getOrCreateIntermediateDrawer(msgEl);
+  if (msgEl.parentElement !== bodyEl) {
+    bodyEl.appendChild(msgEl);
+  }
+  updateIntermediateDrawerSummary(drawer);
+}
+
+export function unplaceFromIntermediateDrawer(msgEl: HTMLElement) {
+  if (!msgEl) return;
+  const parentDrawer = msgEl.closest('.intermediate-turn-drawer') as HTMLDetailsElement | null;
+  if (!parentDrawer) return;
+
+  if (parentDrawer.parentElement) {
+    parentDrawer.parentElement.insertBefore(msgEl, parentDrawer.nextSibling);
+  } else {
+    messagesContainer.appendChild(msgEl);
+  }
+
+  const bodyEl = parentDrawer.querySelector<HTMLElement>('.intermediate-turn-drawer-body');
+  if (bodyEl && bodyEl.children.length === 0) {
+    parentDrawer.remove();
+  } else {
+    updateIntermediateDrawerSummary(parentDrawer);
+  }
+}
+
 
 function renderTaskSummaryCard(content: string, parentEl: HTMLElement) {
   // Check if content contains a distinct Summary section header
@@ -2795,6 +3001,19 @@ function updatePendingEditsBar() {
     });
 
     actions.appendChild(prevBtn);
+
+    const reviewBtn = document.createElement('button');
+    reviewBtn.className = 'btn secondary btn-sm';
+    reviewBtn.textContent = 'Review';
+    reviewBtn.title = 'Send file to Reviewer';
+    reviewBtn.addEventListener('click', () => {
+      vscode.postMessage({
+        type: 'SEND_FILE_TO_REVIEWER',
+        filePath: item.filePath,
+      });
+    });
+    actions.appendChild(reviewBtn);
+
     actions.appendChild(applyBtn);
     actions.appendChild(rejectBtn);
 
@@ -2926,6 +3145,19 @@ if (rejectAllEditsBtn) {
     pendingEditsMap.clear();
     updatePendingEditsBar();
   });
+}
+
+export function isInsideReviewerChat(el?: HTMLElement | null): boolean {
+  if (!el) return false;
+  if (el.dataset && el.dataset.isReviewer === 'true') return true;
+  if (el.closest && el.closest('#view-reviewer, #reviewer-messages, [data-is-reviewer="true"]')) return true;
+  try {
+    if (typeof reviewerMessages !== 'undefined' && reviewerMessages && (reviewerMessages === el || reviewerMessages.contains(el))) return true;
+    if (typeof viewReviewer !== 'undefined' && viewReviewer && (viewReviewer === el || viewReviewer.contains(el))) return true;
+  } catch {
+    // Safe ignore in isolated/test environments
+  }
+  return false;
 }
 
 function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: HTMLElement, isHistory = false) {
@@ -3068,6 +3300,23 @@ function renderEditProposal(editId: string, edit: ProposedEditData, parentEl?: H
     }
   }
   rightContainer.appendChild(badge);
+
+  if (isReviewerEnabled && !isInsideReviewerChat(parentEl)) {
+    const reviewFileBtn = document.createElement('button');
+    reviewFileBtn.className = 'btn-review-file';
+    reviewFileBtn.type = 'button';
+    reviewFileBtn.dataset.filepath = edit.filePath;
+    reviewFileBtn.title = `Send ${edit.filePath} to Reviewer`;
+    reviewFileBtn.innerHTML = `🔍 Review File`;
+    reviewFileBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({
+        type: 'SEND_FILE_TO_REVIEWER',
+        filePath: edit.filePath,
+      });
+    });
+    rightContainer.appendChild(reviewFileBtn);
+  }
 
   const toggleBtn = document.createElement('button');
   toggleBtn.className = 'diff-toggle-btn';
@@ -3267,7 +3516,7 @@ function updateTokenMeter(tokens: number) {
   }
 }
 
-const FILE_LINK_EXTENSIONS = 'py|js|ts|jsx|tsx|md|markdown|json|html|htm|css|scss|less|yaml|yml|toml|xml|csv|tsv|rs|go|c|cpp|h|hpp|cs|java|sql|sh|bash|bat|cmd|ps1|txt|log|svg|png|jpg|jpeg|gif|webp|pdf';
+const FILE_LINK_EXTENSIONS = 'dart|kt|kts|swift|m|mm|py|js|ts|jsx|tsx|md|markdown|json|html|htm|css|scss|less|yaml|yml|toml|xml|csv|tsv|rs|go|c|cpp|h|hpp|cs|java|sql|sh|bash|bat|cmd|ps1|txt|log|svg|png|jpg|jpeg|gif|webp|pdf|rb|php|lua|r|scala|zig|vue|svelte|astro|gradle|properties|ini|conf';
 
 function cleanTrailingPunctuation(str: string): { clean: string; trailing: string } {
   const match = str.match(/([.,;:!?)]+)$/);
@@ -3280,12 +3529,35 @@ function cleanTrailingPunctuation(str: string): { clean: string; trailing: strin
   return { clean: str, trailing: '' };
 }
 
-function createClickableFileLink(filePath: string, displayText?: string): HTMLElement {
+export function createClickableFileLink(filePath: string, displayText?: string, showReviewBtn?: boolean): HTMLElement {
   const cleanPath = filePath.trim().replace(/^["']|["']$/g, '');
   const fileLink = document.createElement('span');
   fileLink.className = 'clickable-file-link';
   fileLink.title = `Click to open ${cleanPath}`;
-  fileLink.innerHTML = `<span style="font-size: 10px; opacity: 0.7;">📄</span> ${escapeHtml(displayText || cleanPath)}`;
+
+  const textSpan = document.createElement('span');
+  textSpan.className = 'file-link-text';
+  textSpan.innerHTML = `<span class="file-link-icon" style="font-size: 10px; opacity: 0.75;">📄</span> <span class="file-link-name">${escapeHtml(displayText || cleanPath)}</span>`;
+  textSpan.addEventListener('click', (e) => {
+    e.stopPropagation();
+    vscode.postMessage({ type: 'OPEN_FILE', filePath: cleanPath });
+  });
+  fileLink.appendChild(textSpan);
+
+  const shouldRenderReview = (showReviewBtn !== undefined ? showReviewBtn : true) && isReviewerEnabled;
+  if (shouldRenderReview) {
+    const reviewBtn = document.createElement('button');
+    reviewBtn.className = 'file-link-review-btn';
+    reviewBtn.type = 'button';
+    reviewBtn.title = `Send ${cleanPath} to Reviewer`;
+    reviewBtn.innerHTML = `🔍 Review`;
+    reviewBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'SEND_FILE_TO_REVIEWER', filePath: cleanPath });
+    });
+    fileLink.appendChild(reviewBtn);
+  }
+
   fileLink.addEventListener('click', (e) => {
     e.stopPropagation();
     vscode.postMessage({ type: 'OPEN_FILE', filePath: cleanPath });
@@ -3293,7 +3565,8 @@ function createClickableFileLink(filePath: string, displayText?: string): HTMLEl
   return fileLink;
 }
 
-function renderInlineMarkdown(text: string, container: HTMLElement) {
+function renderInlineMarkdown(text: string, container: HTMLElement, showReviewBtn?: boolean) {
+  const allowReviewBtn = (showReviewBtn !== undefined ? showReviewBtn : true) && isReviewerEnabled && !isInsideReviewerChat(container);
   // Regex pattern matching:
   // 1. Markdown link: [text](target)
   // 2. Inline code: `code`
@@ -3347,7 +3620,7 @@ function renderInlineMarkdown(text: string, container: HTMLElement) {
         a.textContent = linkText;
         container.appendChild(a);
       } else {
-        container.appendChild(createClickableFileLink(target, linkText));
+        container.appendChild(createClickableFileLink(target, linkText, allowReviewBtn));
       }
     } else if (match[4]) {
       // Inline code
@@ -3358,7 +3631,7 @@ function renderInlineMarkdown(text: string, container: HTMLElement) {
       const hasCommandSpaces = /\s/.test(trimmed) && /^(npm|npx|node|python|git|cd|mkdir|move|copy|dir|ls|cat|rm|del)\b/i.test(trimmed);
 
       if (isFileLike && !hasCommandSpaces) {
-        container.appendChild(createClickableFileLink(trimmed));
+        container.appendChild(createClickableFileLink(trimmed, undefined, allowReviewBtn));
       } else {
         const codeEl = document.createElement('code');
         codeEl.className = 'inline-code';
@@ -3385,13 +3658,13 @@ function renderInlineMarkdown(text: string, container: HTMLElement) {
     } else if (match[11] || match[12] || match[13]) {
       // Quoted file path
       const quotedPath = match[11] || match[12] || match[13];
-      container.appendChild(createClickableFileLink(quotedPath));
+      container.appendChild(createClickableFileLink(quotedPath, undefined, allowReviewBtn));
     } else {
       // Unquoted file path, standalone filename, or dotfile
       const rawPath = match[14] || match[15] || match[16] || match[17] || match[18];
       if (rawPath) {
         const { clean, trailing } = cleanTrailingPunctuation(rawPath);
-        container.appendChild(createClickableFileLink(clean));
+        container.appendChild(createClickableFileLink(clean, undefined, allowReviewBtn));
         if (trailing) {
           container.appendChild(document.createTextNode(trailing));
         }
@@ -3770,6 +4043,8 @@ export function renderTerminalCardContent(rawContent: string, container: HTMLEle
 }
 
 function renderMarkdownBlocks(text: string, container: HTMLElement) {
+  const isReviewerContext = isInsideReviewerChat(container);
+  const allowReview = isReviewerEnabled && !isReviewerContext;
   const lines = text.split(/\r?\n/);
   let currentList: HTMLUListElement | HTMLOListElement | null = null;
   let listType: 'ul' | 'ol' | null = null;
@@ -3778,9 +4053,12 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
   const flushParagraph = () => {
     if (currentParagraphLines.length > 0) {
       const p = document.createElement('p');
+      if (isReviewerContext) {
+        p.dataset.isReviewer = 'true';
+      }
       currentParagraphLines.forEach((line, idx) => {
         if (idx > 0) p.appendChild(document.createElement('br'));
-        renderInlineMarkdown(line, p);
+        renderInlineMarkdown(line, p, allowReview);
       });
       container.appendChild(p);
       currentParagraphLines = [];
@@ -3807,6 +4085,35 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
       flushList();
       const isPlan = !!planNoticeMatch;
       const artifactType = isPlan ? 'plan' : 'walkthrough';
+
+      // Intermediate step suppression: Walkthrough / Results docs cards must NEVER render on intermediate steps
+      const messageEl = container.closest ? (container.closest('.message') as HTMLElement | null) : null;
+      const isIntermediate = Boolean(
+        (container.closest && container.closest('.intermediate-step-details')) ||
+        (messageEl && (messageEl.classList.contains('auto-retry-message') || messageEl.dataset.isIntermediate === 'true'))
+      );
+      if (artifactType === 'walkthrough' && isIntermediate) {
+        continue;
+      }
+
+      // Exactly ONE walkthrough card per task: check if a walkthrough card already exists for this task
+      if (artifactType === 'walkthrough') {
+        const allMsgs = Array.from(messagesContainer.querySelectorAll('.message')) as HTMLElement[];
+        let lastUserIdx = -1;
+        for (let i = allMsgs.length - 1; i >= 0; i--) {
+          if (allMsgs[i].classList.contains('user')) {
+            lastUserIdx = i;
+            break;
+          }
+        }
+        const currentTaskMsgs = lastUserIdx >= 0 ? allMsgs.slice(lastUserIdx) : allMsgs;
+        const hasExistingWalkthroughCard = currentTaskMsgs.some((m) =>
+          m !== messageEl && m.querySelector('.chat-artifact-card-walkthrough')
+        );
+        if (hasExistingWalkthroughCard) {
+          continue;
+        }
+      }
 
       // Deduplication guard: Never render duplicate artifact cards of the same type in the same message container
       const rootContainer = (container.closest && container.closest('.message-body')) || container;
@@ -3874,26 +4181,28 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
         actionsWrapper.appendChild(proceedBtn);
       }
 
-      // On plans and walkthroughs, include active "Review" action
-      const reviewBtn = document.createElement('button');
-      reviewBtn.className = `chat-artifact-review-btn${isReviewerEnabled ? '' : ' hidden'}`;
-      reviewBtn.innerHTML = `
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="11" cy="11" r="8"></circle>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-        </svg>
-        <span>Review</span>
-      `;
-      reviewBtn.addEventListener('click', () => {
-        const msgParent = container.closest('.message') as HTMLElement | null;
-        const msgId = msgParent && msgParent.id ? msgParent.id.replace('msg-', '') : undefined;
-        vscode.postMessage({
-          type: 'START_REVIEW',
-          artifactType: isPlan ? 'plan' : 'walkthrough',
-          messageId: msgId,
+      // On plans and walkthroughs, include active "Review" action (suppressed if Reviewer Mode is off or in Reviewer chat)
+      if (allowReview) {
+        const reviewBtn = document.createElement('button');
+        reviewBtn.className = `chat-artifact-review-btn${isReviewerEnabled ? '' : ' hidden'}`;
+        reviewBtn.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <span>Review</span>
+        `;
+        reviewBtn.addEventListener('click', () => {
+          const msgParent = container.closest('.message') as HTMLElement | null;
+          const msgId = msgParent && msgParent.id ? msgParent.id.replace('msg-', '') : undefined;
+          vscode.postMessage({
+            type: 'START_REVIEW',
+            artifactType: isPlan ? 'plan' : 'walkthrough',
+            messageId: msgId,
+          });
         });
-      });
-      actionsWrapper.appendChild(reviewBtn);
+        actionsWrapper.appendChild(reviewBtn);
+      }
 
       card.appendChild(title);
       card.appendChild(actionsWrapper);
@@ -3923,7 +4232,10 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
       flushList();
       const level = Math.min(headingMatch[1].length, 4);
       const heading = document.createElement(`h${level}`);
-      renderInlineMarkdown(headingMatch[2], heading);
+      if (isReviewerContext) {
+        heading.dataset.isReviewer = 'true';
+      }
+      renderInlineMarkdown(headingMatch[2], heading, allowReview);
       container.appendChild(heading);
       continue;
     }
@@ -3934,7 +4246,10 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
       flushParagraph();
       flushList();
       const bq = document.createElement('blockquote');
-      renderInlineMarkdown(quoteMatch[1], bq);
+      if (isReviewerContext) {
+        bq.dataset.isReviewer = 'true';
+      }
+      renderInlineMarkdown(quoteMatch[1], bq, allowReview);
       container.appendChild(bq);
       continue;
     }
@@ -3949,7 +4264,10 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
         listType = 'ul';
       }
       const li = document.createElement('li');
-      renderInlineMarkdown(ulMatch[2], li);
+      if (isReviewerContext) {
+        li.dataset.isReviewer = 'true';
+      }
+      renderInlineMarkdown(ulMatch[2], li, allowReview);
       currentList.appendChild(li);
       continue;
     }
@@ -3964,7 +4282,10 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
         listType = 'ol';
       }
       const li = document.createElement('li');
-      renderInlineMarkdown(olMatch[2], li);
+      if (isReviewerContext) {
+        li.dataset.isReviewer = 'true';
+      }
+      renderInlineMarkdown(olMatch[2], li, allowReview);
       currentList.appendChild(li);
       continue;
     }
@@ -4116,6 +4437,9 @@ export function appendMessage(
     ? `message ${role} editor-message`
     : `message ${role}`;
   msgEl.dataset.rawContent = content;
+  if (isIntermediateStep) {
+    msgEl.dataset.isIntermediate = 'true';
+  }
   if (messageId) {
     msgEl.id = `msg-${messageId}`;
   }
@@ -4198,28 +4522,46 @@ export function appendMessage(
       quoteAspectToInput(content);
     });
     headerActions.appendChild(quoteBtn);
-  }
 
-  const copyBtn = document.createElement('button');
-  copyBtn.className = 'msg-copy-btn';
-  copyBtn.title = 'Copy message';
-  copyBtn.innerHTML = `
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-    </svg>
-    <span>Copy</span>
-  `;
-  copyBtn.addEventListener('click', () => {
-    navigator.clipboard.writeText(displayContent).then(() => {
-      const span = copyBtn.querySelector('span');
-      if (span) span.textContent = 'Copied!';
-      setTimeout(() => {
-        if (span) span.textContent = 'Copy';
-      }, 1800);
+    const reviewBtn = document.createElement('button');
+    reviewBtn.className = `msg-review-btn btn-review-msg${isReviewerEnabled ? '' : ' hidden'}`;
+    if (!isReviewerEnabled) {
+      reviewBtn.style.display = 'none';
+    }
+    reviewBtn.title = 'Send message or selected text to Reviewer';
+    reviewBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"></circle>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+      <span>Review</span>
+    `;
+    reviewBtn.addEventListener('click', () => {
+      handleReviewMessageAction(content);
     });
-  });
-  headerActions.appendChild(copyBtn);
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-copy-btn';
+    copyBtn.title = 'Copy message';
+    copyBtn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+      <span>Copy</span>
+    `;
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(displayContent).then(() => {
+        const span = copyBtn.querySelector('span');
+        if (span) span.textContent = 'Copied!';
+        setTimeout(() => {
+          if (span) span.textContent = 'Copy';
+        }, 1800);
+      });
+    });
+    headerActions.appendChild(copyBtn);
+    headerActions.appendChild(reviewBtn);
+  }
 
   // Always-visible Undo safety net on every user message (omitted for automated retries).
   // Becomes active once that user message has received an AI response (something to undo).
@@ -4440,12 +4782,23 @@ export function appendMessage(
 
   msgEl.appendChild(headerEl);
   msgEl.appendChild(bodyEl);
-  messagesContainer.appendChild(msgEl);
+
+  const shouldPlaceInDrawer = Boolean(
+    isIntermediateStep ||
+    (role === 'system' && isTerminalCard) ||
+    (role === 'system' && (content.includes('terminal-run-summary') || content.includes('Ran in terminal')))
+  );
+
+  if (shouldPlaceInDrawer) {
+    placeInIntermediateDrawer(msgEl);
+  } else {
+    messagesContainer.appendChild(msgEl);
+  }
 
   if (role === 'assistant') {
     parseAndRenderActions(content, msgEl, isHistory);
     if (isIntermediateStep) {
-      collapseIntermediateStepDetails(msgEl, bodyEl);
+      // collapseIntermediateStepDetails(msgEl, bodyEl);
     }
     mainScrollController.scrollToBottomIfAtBottom();
   } else {
@@ -4636,50 +4989,86 @@ function quoteAspectToInput(aspectText: string) {
 }
 
 // Floating Selection Toolbar for Assistant Output
-const floatingQuoteBtn = document.createElement('button');
-floatingQuoteBtn.className = 'floating-quote-btn hidden';
-floatingQuoteBtn.innerHTML = `
+const floatingSelectionToolbar = document.createElement('div');
+floatingSelectionToolbar.className = 'floating-selection-toolbar hidden';
+
+const floatingClarifyBtn = document.createElement('button');
+floatingClarifyBtn.className = 'floating-selection-btn btn-clarify-selection';
+floatingClarifyBtn.type = 'button';
+floatingClarifyBtn.title = 'Quote selection into chat input';
+floatingClarifyBtn.innerHTML = `
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
   </svg>
-  <span>Clarify Selection</span>
+  <span>Clarify</span>
 `;
-document.body.appendChild(floatingQuoteBtn);
+
+const floatingReviewBtn = document.createElement('button');
+floatingReviewBtn.className = 'floating-selection-btn btn-review-selection';
+floatingReviewBtn.type = 'button';
+floatingReviewBtn.title = 'Send selected text to Reviewer model';
+floatingReviewBtn.innerHTML = `
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="11" cy="11" r="8"></circle>
+    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+  </svg>
+  <span>Send to Reviewer</span>
+`;
+
+floatingSelectionToolbar.appendChild(floatingClarifyBtn);
+floatingSelectionToolbar.appendChild(floatingReviewBtn);
+if (!isReviewerEnabled) {
+  floatingReviewBtn.classList.add('hidden');
+  floatingReviewBtn.style.display = 'none';
+}
+document.body.appendChild(floatingSelectionToolbar);
 
 let selectedAssistantSnippet = '';
 
-function hideFloatingQuoteBtn() {
-  floatingQuoteBtn.classList.add('hidden');
+function hideFloatingSelectionToolbar() {
+  floatingSelectionToolbar.classList.add('hidden');
   selectedAssistantSnippet = '';
 }
 
-floatingQuoteBtn.addEventListener('mousedown', (e) => {
+floatingSelectionToolbar.addEventListener('mousedown', (e) => {
   e.preventDefault(); // Prevent clearing selection before click
 });
 
-floatingQuoteBtn.addEventListener('click', () => {
+floatingClarifyBtn.addEventListener('click', () => {
   if (selectedAssistantSnippet) {
     quoteAspectToInput(selectedAssistantSnippet);
-    hideFloatingQuoteBtn();
+    hideFloatingSelectionToolbar();
+    window.getSelection()?.removeAllRanges();
+  }
+});
+
+floatingReviewBtn.addEventListener('click', () => {
+  if (selectedAssistantSnippet) {
+    vscode.postMessage({
+      type: 'SEND_CONTENT_TO_REVIEWER',
+      content: selectedAssistantSnippet,
+      sourceLabel: 'Selected chat snippet',
+    });
+    hideFloatingSelectionToolbar();
     window.getSelection()?.removeAllRanges();
   }
 });
 
 document.addEventListener('selectionchange', () => {
   if (viewReviewer && !viewReviewer.classList.contains('hidden')) {
-    hideFloatingQuoteBtn();
+    hideFloatingSelectionToolbar();
     return;
   }
 
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed || !selection.rangeCount) {
-    hideFloatingQuoteBtn();
+    hideFloatingSelectionToolbar();
     return;
   }
 
   const selectedStr = selection.toString().trim();
   if (!selectedStr || selectedStr.length < 2) {
-    hideFloatingQuoteBtn();
+    hideFloatingSelectionToolbar();
     return;
   }
 
@@ -4691,28 +5080,44 @@ document.addEventListener('selectionchange', () => {
 
   const assistantMsg = anchorEl?.closest('.message.assistant') || focusEl?.closest('.message.assistant');
   if (!assistantMsg || !messagesContainer || !messagesContainer.contains(assistantMsg)) {
-    hideFloatingQuoteBtn();
+    hideFloatingSelectionToolbar();
     return;
   }
 
   selectedAssistantSnippet = selectedStr;
 
-  // Calculate coordinates to float button above the selection
+  // Calculate coordinates to float toolbar above the selection
   const range = selection.getRangeAt(0);
   const rect = range.getBoundingClientRect();
 
   if (rect && rect.width > 0 && rect.height > 0) {
-    floatingQuoteBtn.classList.remove('hidden');
-    const top = Math.max(10, rect.top - 36);
-    const left = Math.max(10, Math.min(window.innerWidth - 140, rect.left + (rect.width / 2) - 55));
-    floatingQuoteBtn.style.top = `${top}px`;
-    floatingQuoteBtn.style.left = `${left}px`;
+    if (floatingReviewBtn && floatingReviewBtn.classList) {
+      if (typeof floatingReviewBtn.classList.toggle === 'function') {
+        floatingReviewBtn.classList.toggle('hidden', !isReviewerEnabled);
+      } else {
+        if (!isReviewerEnabled) {
+          floatingReviewBtn.classList.add('hidden');
+        } else {
+          floatingReviewBtn.classList.remove('hidden');
+        }
+      }
+      if (!isReviewerEnabled) {
+        floatingReviewBtn.style.display = 'none';
+      } else {
+        floatingReviewBtn.style.display = '';
+      }
+    }
+    floatingSelectionToolbar.classList.remove('hidden');
+    const top = Math.max(10, rect.top - 40);
+    const left = Math.max(10, Math.min(window.innerWidth - 220, rect.left + (rect.width / 2) - 100));
+    floatingSelectionToolbar.style.top = `${top}px`;
+    floatingSelectionToolbar.style.left = `${left}px`;
   }
 });
 
 document.addEventListener('mousedown', (e) => {
-  if (e.target !== floatingQuoteBtn && !floatingQuoteBtn.contains(e.target as Node)) {
-    hideFloatingQuoteBtn();
+  if (e.target !== floatingSelectionToolbar && !floatingSelectionToolbar.contains(e.target as Node)) {
+    hideFloatingSelectionToolbar();
   }
 });
 
@@ -5557,6 +5962,91 @@ function handleReviewerAttachArtifact(data: {
   }
 }
 
+function handleReviewMessageAction(fullContent: string) {
+  const selection = window.getSelection()?.toString().trim();
+  if (selection && selection.length > 0) {
+    vscode.postMessage({
+      type: 'SEND_CONTENT_TO_REVIEWER',
+      content: selection,
+      sourceLabel: 'Selected chat snippet',
+    });
+  } else {
+    vscode.postMessage({
+      type: 'SEND_CONTENT_TO_REVIEWER',
+      content: fullContent,
+      sourceLabel: 'Assistant response',
+    });
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function handleReviewerContextPopulated(data: {
+  attachment?: {
+    filePath: string;
+    fileName?: string;
+    content: string;
+    sizeBytes: number;
+  };
+  contentSnippet?: {
+    text: string;
+    sourceLabel?: string;
+  };
+  promptText: string;
+}) {
+  // 1. Switch to dedicated reviewer view
+  switchToReviewerView();
+
+  // 2. Attach file or content snippet to reviewer input controller
+  if (reviewerChatInputController) {
+    reviewerChatInputController.clearAttachments();
+
+    if (data.attachment) {
+      const fileName =
+        data.attachment.fileName ||
+        data.attachment.filePath.split(/[\\/]/).pop() ||
+        data.attachment.filePath;
+      const sizeStr = formatBytes(data.attachment.sizeBytes);
+      const displayName = `${fileName} (${sizeStr})`;
+
+      reviewerChatInputController.addAttachment(
+        displayName,
+        data.attachment.content,
+        false, // isImage
+        false, // isArtifact
+        undefined,
+        false, // isQuote
+        false, // isReviewerFeedback
+        undefined,
+        data.attachment.filePath
+      );
+    } else if (data.contentSnippet) {
+      const snippet = data.contentSnippet.text;
+      const singleLine = snippet.replace(/\s+/g, ' ');
+      const preview = singleLine.length > 25 ? `${singleLine.slice(0, 25)}...` : singleLine;
+      const label = data.contentSnippet.sourceLabel || 'Snippet';
+      reviewerChatInputController.addAttachment(
+        `${label}: "${preview}"`,
+        snippet,
+        false,
+        false,
+        undefined,
+        true
+      );
+    }
+
+    // 3. Pre-fill prompt text and focus
+    reviewerChatInputController.setValue(data.promptText || '');
+    reviewerChatInputController.focus();
+  }
+
+  updateReviewerTokenMeter();
+}
+
 function updateReviewerTokenMeter() {
   if (!reviewerTokenMeter) return;
   const currentModel = loadedModels.find((m) => m.id === activeReviewerModelId);
@@ -5778,6 +6268,7 @@ function appendReviewerMessage(
 ): HTMLElement {
   const msgEl = document.createElement('div');
   msgEl.className = `message ${role}`;
+  msgEl.dataset.isReviewer = 'true';
   msgEl.dataset.rawContent = content;
   if (messageId) {
     msgEl.dataset.messageId = messageId;
@@ -5884,6 +6375,7 @@ function appendReviewerMessage(
 
   const bodyEl = document.createElement('div');
   bodyEl.className = 'message-body';
+  bodyEl.dataset.isReviewer = 'true';
 
   if (attachedFile) {
     const cardEl = document.createElement('div');
@@ -6031,6 +6523,7 @@ function handleReviewerStreamChunk(chunk: string) {
     // First chunk arrived: create the assistant bubble
     activeReviewerAssistantEl = document.createElement('div');
     activeReviewerAssistantEl.className = 'message assistant';
+    activeReviewerAssistantEl.dataset.isReviewer = 'true';
     activeReviewerAssistantEl.dataset.rawContent = accumulatedReviewerStream;
 
     const headerEl = document.createElement('div');
@@ -6087,6 +6580,7 @@ function handleReviewerStreamChunk(chunk: string) {
 
     activeReviewerAssistantContentEl = document.createElement('div');
     activeReviewerAssistantContentEl.className = 'message-body';
+    activeReviewerAssistantContentEl.dataset.isReviewer = 'true';
     activeReviewerAssistantEl.appendChild(activeReviewerAssistantContentEl);
 
     reviewerMessages.appendChild(activeReviewerAssistantEl);

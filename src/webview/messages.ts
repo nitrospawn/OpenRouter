@@ -176,6 +176,20 @@ export type HostToWebviewMessage =
       sessions: Array<{ id: string; title: string; createdAt: number; updatedAt: number; messageCount: number }>;
       activeSessionId?: string;
     }
+  | {
+      type: 'REVIEWER_CONTEXT_POPULATED';
+      attachment?: {
+        filePath: string;
+        fileName?: string;
+        content: string;
+        sizeBytes: number;
+      };
+      contentSnippet?: {
+        text: string;
+        sourceLabel?: string;
+      };
+      promptText: string;
+    }
   | { type: 'SET_REVIEWER_BUSY'; busy: boolean; statusText?: string }
   | { type: 'MESSAGE_RECEIVED'; message: ChatMessageItem }
   | { type: 'SET_BUSY'; busy: boolean; statusText?: string }
@@ -200,7 +214,8 @@ export type HostToWebviewMessage =
       error?: string;
     }
   | { type: 'PENDING_TERMINAL_COMMAND'; command: string }
-  | { type: 'PLAY_NOTIFICATION_SOUND'; tone?: 'bell' | 'chime' | 'pop' | 'ding' };
+  | { type: 'PLAY_NOTIFICATION_SOUND'; tone?: 'bell' | 'chime' | 'pop' | 'ding' }
+  | { type: 'SET_MESSAGE_INTERMEDIATE'; messageId: string; isIntermediate: boolean };
 
 // Webview -> Host messages
 export type WebviewToHostMessage =
@@ -269,4 +284,14 @@ export type WebviewToHostMessage =
   | { type: 'SWITCH_REVIEWER_SESSION'; sessionId: string }
   | { type: 'RENAME_REVIEWER_SESSION'; sessionId: string; newTitle: string }
   | { type: 'DELETE_REVIEWER_SESSION'; sessionId: string }
-  | { type: 'RESET_REVIEWER_CONTEXT' };
+  | { type: 'RESET_REVIEWER_CONTEXT' }
+  | {
+      type: 'SEND_FILE_TO_REVIEWER';
+      filePath: string;
+      customPrompt?: string;
+    }
+  | {
+      type: 'SEND_CONTENT_TO_REVIEWER';
+      content: string;
+      sourceLabel?: string;
+    };

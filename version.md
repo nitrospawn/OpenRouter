@@ -4,6 +4,25 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-10-09
+
+### Fixed
+- **Intermediate Execution Steps Drawer Scroll & Content Clipping:**
+  - Removed artificial single-line clamping (`collapseIntermediateStepDetails` summary compression) on step detail descriptions in the intermediate execution drawer so full operational details remain accessible.
+  - Added `flex-shrink: 0` to `.intermediate-steps-drawer` in `style.css` to prevent flex containers from compressing drawer dimensions during active execution or streaming.
+  - Enabled smooth vertical scrolling and unconstrained content visibility within the execution details dropdown, ensuring all diagnostic outputs and step summaries can be fully reviewed when expanded.
+
+## [0.5.0] - 2026-10-08
+
+### Added
+- **Universal "Send to Reviewer" from Chat:**
+  - Added one-click `🔍 Review File` action button directly in Proposed Edit diff card headers (`📁 Proposed Edit: <filePath>`), reading the target file from the workspace, switching to the Reviewer panel, and pre-filling the review context.
+  - Added dual **Floating Selection Toolbar** (`Clarify` & `Send to Reviewer`) that appears immediately upon highlighting any text in assistant message bubbles, allowing one-click forwarding of selected snippets to the Reviewer.
+  - Expanded in-chat file link & chip recognition to include Dart (`.dart`), Kotlin (`.kt`, `.kts`), Swift (`.swift`), Gradle (`.gradle`), etc., with hover action (`🔍 Review`) to send referenced workspace files directly to the Reviewer.
+  - Added `🔍 Review` action in assistant message bubble headers with intelligent text selection detection: forwards the highlighted text snippet when selected, or forwards the entire message body if no text is selected.
+  - Added Reviewer context population lifecycle (`SEND_FILE_TO_REVIEWER`, `SEND_CONTENT_TO_REVIEWER`, `REVIEWER_CONTEXT_POPULATED`) with automatic tab navigation, attachment pill rendering, file size formatting, and custom prompt pre-population.
+  - Added safe non-existent file guards preventing crashes when deleted or invalid file paths are clicked.
+
 ## [0.4.9] - 2026-10-08
 
 ### Added

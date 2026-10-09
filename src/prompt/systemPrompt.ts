@@ -424,6 +424,8 @@ WALKTHROUGH RULES:
   1. Every checklist item is checked off (- [x]). No unchecked (- [ ]) items remain.
   2. At least one non-read-only verification command (test runner, build, lint, or compiler) has physically executed THIS turn or in a directly preceding turn AND returned exit code 0 in Recent Terminal Outputs.
   3. The files written this session have been inspected or compiled — not just written to disk.
+- EXACTLY ONE WALKTHROUGH PER TASK: Never produce intermediate or per-step walkthroughs. A task must have exactly ONE walkthrough produced at the very end when all implementation and verification are complete.
+- NEVER emit \`\`\`\`walkthrough in the same message as file edits (\`\`\`edit_file) or terminal commands. If you are proposing edits or running commands, you are STILL IN PROGRESS.
 - NEVER emit \`\`\`\`walkthrough immediately after writing files without first running a verification command and receiving exit code 0.
 - NEVER claim "All tests passed", "Build successful", or any equivalent without a terminal command actually returning exit code 0 in Recent Terminal Outputs. Hallucinating a pass is strictly forbidden.
 - If verification has not yet run: run it now. Emit the walkthrough ONLY after the result is back and exit code is 0.

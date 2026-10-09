@@ -29,6 +29,12 @@ class MockElement {
     add: (c: string) => { this.classList.classes.add(c); this.className = Array.from(this.classList.classes).join(' '); },
     remove: (c: string) => { this.classList.classes.delete(c); this.className = Array.from(this.classList.classes).join(' '); },
     contains: (c: string) => this.classList.classes.has(c),
+    toggle: (c: string, force?: boolean) => {
+      const shouldAdd = force !== undefined ? force : !this.classList.classes.has(c);
+      if (shouldAdd) { this.classList.classes.add(c); } else { this.classList.classes.delete(c); }
+      this.className = Array.from(this.classList.classes).join(' ');
+      return shouldAdd;
+    },
   };
   
   constructor(tagName: string) {
