@@ -3639,7 +3639,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         timestamp: Date.now(),
         isIntermediateStep: true,
       };
-      
+
       // Proactively record significant terminal actions in MemoryManifest
       try {
         const sideEffectingRan = executedCommandsSummary.filter(c => !CommandRunner.isReadOnly(c.command));
@@ -3686,389 +3686,389 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           }
         }
 
-      const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
-      let match;
-      let cmdCount = 0;
-      const MAX_TERMINAL_RETRIES = 5;
+        const bashRegex = /```(?:bash|sh|shell|cmd|powershell)\s*([\s\S]*?)```/gi;
+        let match;
+        let cmdCount = 0;
+        const MAX_TERMINAL_RETRIES = 5;
 
-      // If file edits were successfully applied in this turn, reset failedCommands
-      // because workspace files changed, so repeating a verification command is testing new code
-      if (successfullyEditedFiles.length > 0 && retryContext?.failedCommands) {
-        retryContext.failedCommands.clear();
-      }
-
-      while ((match = bashRegex.exec(content)) !== null) {
-        if (this._activeAbortController?.signal.aborted) {
-          break;
+        // If file edits were successfully applied in this turn, reset failedCommands
+        // because workspace files changed, so repeating a verification command is testing new code
+        if (successfullyEditedFiles.length > 0 && retryContext?.failedCommands) {
+          retryContext.failedCommands.clear();
         }
-        const command = match[1].trim();
-        if (command) {
-          const isReadOnlyCmd = CommandRunner.isReadOnly(command);
-          // Side-effecting commands require explicit allow/allow_session to auto-run.
-          // In 'ask' mode, side-effecting commands render interactive UI cards for user approval.
-          // Also skip auto-running if user explicitly asked to run by themselves or not to run.
-          if (!isReadOnlyCmd && (!isRunTerminalAllowed || userRequestedManual)) {
-            this._postMessage({
-              type: 'PENDING_TERMINAL_COMMAND',
-              command,
-            });
-            this._postMessage({ type: 'PLAY_NOTIFICATION_SOUND' });
-            continue;
+
+        while ((match = bashRegex.exec(content)) !== null) {
+          if (this._activeAbortController?.signal.aborted) {
+            break;
           }
-
-          cmdCount++;
-          const statusDesc = isReadOnlyCmd
-            ? CommandRunner.getInspectionDescription(command)
-            : `Running in terminal: ${command.length > 35 ? command.slice(0, 32) + '...' : command}`;
-
-          this._postMessage({
-            type: 'SET_BUSY',
-            busy: true,
-            statusText: statusDesc,
-          });
-
-          if (!isReadOnlyCmd) {
-            this._postMessage({ type: 'TERMINAL_RUNNING', command });
-          }
-
-          let cmdCheckpointId: string | null = null;
-          let cmdAffectedFiles: string[] = [];
-          const workspaceFolders = vscode.workspace.workspaceFolders;
-          const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : '';
-          const preCommandSnapshots: Map<string, { uri: vscode.Uri; existed: boolean; content: string }> = new Map();
-
-          if (!isReadOnlyCmd) {
-            cmdAffectedFiles = this._extractFilesMutatedByCommand(command, root);
-            if (workspaceFolders && workspaceFolders.length > 0) {
-              for (const f of cmdAffectedFiles) {
-                const fileUri = path.isAbsolute(f) ? vscode.Uri.file(f) : vscode.Uri.joinPath(workspaceFolders[0].uri, f);
-                let existed = false;
-                let content = '';
-                try {
-                  const fileBytes = await vscode.workspace.fs.readFile(fileUri);
-                  content = new TextDecoder('utf-8').decode(fileBytes);
-                  existed = true;
-                } catch {
-                  existed = false;
-                }
-                preCommandSnapshots.set(f, { uri: fileUri, existed, content });
-              }
-            }
-
-            if (cmdAffectedFiles.length > 0 && this._checkpointManager) {
-              cmdCheckpointId = await this._checkpointManager.createCheckpoint(
-                cmdAffectedFiles,
-                `Before terminal command: ${command.slice(0, 40)}`
-              );
-              if (cmdCheckpointId) {
-                await this._tagCurrentTurnCheckpoint(cmdCheckpointId, cmdAffectedFiles);
-              }
-            }
-          }
-
-          const result = await CommandRunner.executeCommand(
-            command,
-            this._permissionManager,
-            this._usageStore,
-            { abortSignal: this._activeAbortController?.signal }
-          );
-
-          if (!isReadOnlyCmd) {
-            this._postMessage({
-              type: 'TERMINAL_RESULT',
-              command,
-              exitCode: result.exitCode ?? null,
-              stdout: result.stdout ?? '',
-              stderr: result.stderr ?? '',
-              executed: result.executed,
-              cancelled: result.cancelled,
-              timedOut: result.timedOut,
-              error: result.error,
-            });
-
-            if (!result.cancelled) {
-              const applyEditPerm = this._permissionManager.getPermission('applyEdit');
-              if (cmdAffectedFiles.length > 0 && preCommandSnapshots.size > 0) {
-                let fileIdx = 0;
-                for (const [filePath, snap] of preCommandSnapshots.entries()) {
-                  fileIdx++;
-                  let existsNow = false;
-                  let currentContent = '';
-                  try {
-                    const dataBytes = await vscode.workspace.fs.readFile(snap.uri);
-                    currentContent = new TextDecoder('utf-8').decode(dataBytes);
-                    existsNow = true;
-                  } catch {
-                    existsNow = false;
-                  }
-
-                  const wasMutated = (!snap.existed && existsNow) ||
-                    (snap.existed && !existsNow) ||
-                    (snap.existed && existsNow && currentContent !== snap.content);
-
-                  if (wasMutated) {
-                    const editId = `term-edit-${Date.now()}-${cmdCount}-${fileIdx}`;
-                    this._trackAppliedEdit(filePath, cmdCheckpointId ?? undefined, snap.content, editId);
-                    if (cmdCheckpointId) {
-                      await this._tagCurrentTurnCheckpoint(cmdCheckpointId, [filePath]);
-                    }
-
-                    if (applyEditPerm === 'ask') {
-                      // Process-Agnostic File Mutation Guard: Prompt to Accept / Reject (Non-blocking: AI continues execution)
-                      this._postMessage({
-                        type: 'PROPOSE_EDIT',
-                        editId,
-                        edit: {
-                          filePath,
-                          newContent: currentContent,
-                          diffExplanation: `Modified via terminal command: ${command.length > 50 ? command.slice(0, 47) + '...' : command}`,
-                        },
-                      });
-                    } else if (applyEditPerm === 'allow' || applyEditPerm === 'allow_session') {
-                      this._postMessage({
-                        type: 'EDIT_APPLIED',
-                        editId,
-                        success: true,
-                        checkpointId: cmdCheckpointId ?? undefined,
-                        filePath,
-                      });
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          let outcome = '(failed)';
-          if (result.cancelled) {
-            outcome = '(cancelled)';
-          } else if (result.timedOut) {
-            outcome = '(timed out after 120s)';
-          } else if (result.executed) {
-            outcome = result.exitCode === 0
-              ? '(completed, exit code: 0)'
-              : `(failed with exit code: ${result.exitCode ?? 'unknown'})`;
-          }
-
-          const rawSnippet = (result.stdout || result.stderr || result.error || '').trim();
-          const truncatedSnippet = rawSnippet.length > 1500
-            ? rawSnippet.substring(0, 1500) + '\n... [output truncated]'
-            : rawSnippet;
-
-          // Collect all executed commands into executedCommandsSummary for the consolidated 1-line execution drawer
-          executedCommandsSummary.push({
-            command,
-            outcome,
-            exitCode: result.exitCode ?? null,
-            output: truncatedSnippet,
-            timedOut: result.timedOut,
-            cancelled: result.cancelled,
-          });
-
-          // Track successful commands for automatic continuation response
-          if (result.executed && result.exitCode === 0 && !result.cancelled && !result.timedOut) {
-            successfulCommands.push({
-              command,
-              output: rawSnippet,
-            });
-          }
-
-          if (isReadOnlyCmd && !result.cancelled) {
-            executedInspectionCommands.push({
-              command,
-              success: result.executed && result.exitCode === 0,
-              output: truncatedSnippet,
-              exitCode: result.exitCode ?? null,
-            });
-          }
-
-          // Self-Healing Auto-Retry with Loop Protection (including timeouts)
-          const isFailed = (result.executed && result.exitCode !== 0) || (result.timedOut && !result.cancelled);
-          if (isFailed && !result.cancelled) {
-            const currentRetryCount = retryContext?.retryCount ?? 0;
-            const failedCommands = retryContext?.failedCommands ?? new Set<string>();
-
-            // Safeguard 1: Abort if user cancelled the stream/session
-            if (this._activeAbortController?.signal.aborted) {
-              break;
-            }
-
-            // Safeguard 2: Duplicate failing command detection (infinite loop breaker)
-            // Normalize command to catch flag/argument variations of the same command (e.g. flutter run vs flutter run -d chrome)
-            const normalizeCmdSignature = (cmd: string) => {
-              const cleaned = cmd.toLowerCase().replace(/start\s+\/b\s+cmd\s+\/c\s+/g, '').replace(/["']/g, '').trim();
-              const tokens = cleaned.split(/\s+/).filter(Boolean);
-              // Take base executable and primary verb/subcommand
-              return tokens.slice(0, 3).join(' ');
-            };
-            const cmdSig = normalizeCmdSignature(command);
-            const hasSimilarFailure = Array.from(failedCommands).some(fc => fc === command || normalizeCmdSignature(fc) === cmdSig);
-
-            // Extract failure diagnostics for reporting
-            const outputParts: string[] = [];
-            if (result.stdout?.trim()) {
-              outputParts.push(result.stdout.trim());
-            }
-            if (result.stderr?.trim()) {
-              outputParts.push(result.stderr.trim());
-            }
-            if (outputParts.length === 0 && result.error?.trim()) {
-              outputParts.push(result.error.trim());
-            }
-            const fullOutput = outputParts.join('\n') || (result.timedOut ? 'Command timed out after 120s' : 'Command exited with non-zero status');
-            const truncatedError = fullOutput.length > 3000
-              ? fullOutput.substring(0, 3000) + '\n... [output truncated]'
-              : fullOutput;
-            const failureHistory = `Command: ${command}\nOutcome: ${outcome} (Exit code: ${result.exitCode ?? 'unknown'})\nOutput:\n${truncatedError}`;
-
-            // Safeguard 2: Duplicate failing command detection (infinite loop breaker)
-            // If identical or equivalent command failed again and no files were edited,
-            // hand off back to the model once to force a strategic pivot rather than halting abruptly.
-            if ((failedCommands.has(command) || hasSimilarFailure) && successfullyEditedFiles.length === 0) {
-              await flushExecutedTerminalSummary();
-
-              if (!retryContext?.hasDelegatedFailure) {
-                const loopPivotSummary = `The model proposed repeating the failing command \`${command}\` without any workspace file modifications, which failed again:\n\n${failureHistory}\n\nCRITICAL: Do NOT propose this command again. Classify the error using the categories in your instructions (MISSING_SCHEMA, COMPILE_ERROR, ENV_ISSUE, etc.) and apply a completely different strategy, or clearly explain what is blocking progress and offer 2–3 concrete options to the user.`;
-
-                const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
-
-                await this._handleSendMessage(
-                  loopPivotSummary,
-                  targetModel,
-                  undefined,
-                  undefined,
-                  this._activeReasoningEffort,
-                  {
-                    retryCount: currentRetryCount + 1,
-                    failedCommands,
-                    autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
-                    isAutoFollowUp: true,
-                    hasDelegatedFailure: true,
-                  }
-                );
-                return true;
-              } else {
-                // Already asked the model to pivot and it still repeated a failing command; halt cleanly.
-                if (!isReadOnlyCmd) {
-                  const loopMsg = {
-                    id: `${Date.now()}-term-loop-${cmdCount}`,
-                    role: 'assistant' as const,
-                    content: `⚠️ Model repeated failing command \`${command}\` without workspace modifications after a strategic pivot request. Halting self-healing loop.`,
-                    timestamp: Date.now(),
-                  };
-                  if (this._historyStore?.appendMessage) {
-                    await this._historyStore.appendMessage(loopMsg);
-                  }
-                  this._postMessage({
-                    type: 'MESSAGE_RECEIVED',
-                    message: loopMsg,
-                  });
-                }
-                break;
-              }
-            }
-
-            // Safeguard 3: Hard limit on attempts reached — delegate failure context back to model once
-            if (currentRetryCount >= MAX_TERMINAL_RETRIES) {
-              await flushExecutedTerminalSummary();
-
-              if (!retryContext?.hasDelegatedFailure) {
-                const failureSummary = `The terminal self-healing loop has attempted ${currentRetryCount} times without success. Here is what happened:\n\n${failureHistory}\n\nDo NOT retry the same command. Classify the error using the categories in your instructions (MISSING_SCHEMA, COMPILE_ERROR, ENV_ISSUE, etc.) and apply a completely different strategy, or tell the user clearly what is blocking progress and offer 2–3 concrete options.`;
-
-                const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
-
-                await this._handleSendMessage(
-                  failureSummary,
-                  targetModel,
-                  undefined,
-                  undefined,
-                  this._activeReasoningEffort,
-                  {
-                    retryCount: currentRetryCount + 1,
-                    failedCommands,
-                    autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
-                    isAutoFollowUp: true,
-                    hasDelegatedFailure: true,
-                  }
-                );
-                return true;
-              } else {
-                // Post-delegation retry exhausted; halt cleanly
-                if (!isReadOnlyCmd) {
-                  const maxMsg = {
-                    id: `${Date.now()}-term-max-${cmdCount}`,
-                    role: 'assistant' as const,
-                    content: `⚠️ Terminal auto-retry limit reached (${MAX_TERMINAL_RETRIES}/${MAX_TERMINAL_RETRIES} attempts). Halting self-healing loop.`,
-                    timestamp: Date.now(),
-                  };
-                  if (this._historyStore?.appendMessage) {
-                    await this._historyStore.appendMessage(maxMsg);
-                  }
-                  this._postMessage({
-                    type: 'MESSAGE_RECEIVED',
-                    message: maxMsg,
-                  });
-                }
-                break;
-              }
-            }
-
-            // For read-only inspection commands (like dir, type, cat):
-            // Do NOT initiate side-effecting self-healing or abort the remaining commands.
-            // Continue the loop so other commands in the batch run, and record the failure outcome.
-            if (isReadOnlyCmd) {
-              executedCommandsSummary.push({
+          const command = match[1].trim();
+          if (command) {
+            const isReadOnlyCmd = CommandRunner.isReadOnly(command);
+            // Side-effecting commands require explicit allow/allow_session to auto-run.
+            // In 'ask' mode, side-effecting commands render interactive UI cards for user approval.
+            // Also skip auto-running if user explicitly asked to run by themselves or not to run.
+            if (!isReadOnlyCmd && (!isRunTerminalAllowed || userRequestedManual)) {
+              this._postMessage({
+                type: 'PENDING_TERMINAL_COMMAND',
                 command,
-                outcome,
-                exitCode: result.exitCode ?? null,
-                output: truncatedSnippet,
-                timedOut: result.timedOut,
-                cancelled: result.cancelled,
               });
+              this._postMessage({ type: 'PLAY_NOTIFICATION_SOUND' });
               continue;
             }
 
-            failedCommands.add(command);
+            cmdCount++;
+            const statusDesc = isReadOnlyCmd
+              ? CommandRunner.getInspectionDescription(command)
+              : `Running in terminal: ${command.length > 35 ? command.slice(0, 32) + '...' : command}`;
 
-            // Flush terminal execution summary before posting retry notice
-            await flushExecutedTerminalSummary();
-
-            const retryNotice = {
-              id: `${Date.now()}-term-retry-${cmdCount}`,
-              role: 'system' as const,
-              content: result.timedOut
-                ? `🔄 Terminal command \`${command}\` timed out after 120s. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`
-                : `🔄 Terminal command \`${command}\` failed with exit code ${result.exitCode}. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`,
-              timestamp: Date.now(),
-            };
-            if (this._historyStore?.appendMessage) {
-              await this._historyStore.appendMessage(retryNotice);
-            }
             this._postMessage({
-              type: 'MESSAGE_RECEIVED',
-              message: retryNotice,
+              type: 'SET_BUSY',
+              busy: true,
+              statusText: statusDesc,
             });
 
-            // Trigger regular self-healing retry turn using extracted failure diagnostics
+            if (!isReadOnlyCmd) {
+              this._postMessage({ type: 'TERMINAL_RUNNING', command });
+            }
 
-            const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
-            const retryPrompt = result.timedOut
-              ? `The previous terminal command \`${command}\` timed out after 120s.\nOutput before timeout:\n\`\`\`\n${truncatedError}\n\`\`\`\nPlease diagnose why this command hung or timed out. If this is a long-running process or watch server, run with a non-blocking, non-interactive, or single-run flag (e.g. \`flutter test\`, \`npm test -- --watchAll=false\`). Continue autonomously until all tasks and verifications succeed.`
-              : `The previous terminal command \`${command}\` failed with exit code ${result.exitCode ?? 'unknown'}.\nError output:\n\`\`\`\n${truncatedError}\n\`\`\`\nPlease diagnose and resolve this failure:\n- If this is a compiler, analysis, test, or code error in the workspace: generate the necessary file edit(s) to fix the code, then re-run the verification command.\n- If this is a terminal command syntax or environment error: provide the corrected command.\nContinue autonomously until all tasks and verifications succeed.`;
+            let cmdCheckpointId: string | null = null;
+            let cmdAffectedFiles: string[] = [];
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            const root = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : '';
+            const preCommandSnapshots: Map<string, { uri: vscode.Uri; existed: boolean; content: string }> = new Map();
 
-            // Trigger self-healing follow-up turn
-            await this._handleSendMessage(
-              retryPrompt,
-              targetModel,
-              undefined,
-              undefined,
-              this._activeReasoningEffort,
-              { retryCount: currentRetryCount + 1, failedCommands }
+            if (!isReadOnlyCmd) {
+              cmdAffectedFiles = this._extractFilesMutatedByCommand(command, root);
+              if (workspaceFolders && workspaceFolders.length > 0) {
+                for (const f of cmdAffectedFiles) {
+                  const fileUri = path.isAbsolute(f) ? vscode.Uri.file(f) : vscode.Uri.joinPath(workspaceFolders[0].uri, f);
+                  let existed = false;
+                  let content = '';
+                  try {
+                    const fileBytes = await vscode.workspace.fs.readFile(fileUri);
+                    content = new TextDecoder('utf-8').decode(fileBytes);
+                    existed = true;
+                  } catch {
+                    existed = false;
+                  }
+                  preCommandSnapshots.set(f, { uri: fileUri, existed, content });
+                }
+              }
+
+              if (cmdAffectedFiles.length > 0 && this._checkpointManager) {
+                cmdCheckpointId = await this._checkpointManager.createCheckpoint(
+                  cmdAffectedFiles,
+                  `Before terminal command: ${command.slice(0, 40)}`
+                );
+                if (cmdCheckpointId) {
+                  await this._tagCurrentTurnCheckpoint(cmdCheckpointId, cmdAffectedFiles);
+                }
+              }
+            }
+
+            const result = await CommandRunner.executeCommand(
+              command,
+              this._permissionManager,
+              this._usageStore,
+              { abortSignal: this._activeAbortController?.signal }
             );
 
-            return true;
+            if (!isReadOnlyCmd) {
+              this._postMessage({
+                type: 'TERMINAL_RESULT',
+                command,
+                exitCode: result.exitCode ?? null,
+                stdout: result.stdout ?? '',
+                stderr: result.stderr ?? '',
+                executed: result.executed,
+                cancelled: result.cancelled,
+                timedOut: result.timedOut,
+                error: result.error,
+              });
+
+              if (!result.cancelled) {
+                const applyEditPerm = this._permissionManager.getPermission('applyEdit');
+                if (cmdAffectedFiles.length > 0 && preCommandSnapshots.size > 0) {
+                  let fileIdx = 0;
+                  for (const [filePath, snap] of preCommandSnapshots.entries()) {
+                    fileIdx++;
+                    let existsNow = false;
+                    let currentContent = '';
+                    try {
+                      const dataBytes = await vscode.workspace.fs.readFile(snap.uri);
+                      currentContent = new TextDecoder('utf-8').decode(dataBytes);
+                      existsNow = true;
+                    } catch {
+                      existsNow = false;
+                    }
+
+                    const wasMutated = (!snap.existed && existsNow) ||
+                      (snap.existed && !existsNow) ||
+                      (snap.existed && existsNow && currentContent !== snap.content);
+
+                    if (wasMutated) {
+                      const editId = `term-edit-${Date.now()}-${cmdCount}-${fileIdx}`;
+                      this._trackAppliedEdit(filePath, cmdCheckpointId ?? undefined, snap.content, editId);
+                      if (cmdCheckpointId) {
+                        await this._tagCurrentTurnCheckpoint(cmdCheckpointId, [filePath]);
+                      }
+
+                      if (applyEditPerm === 'ask') {
+                        // Process-Agnostic File Mutation Guard: Prompt to Accept / Reject (Non-blocking: AI continues execution)
+                        this._postMessage({
+                          type: 'PROPOSE_EDIT',
+                          editId,
+                          edit: {
+                            filePath,
+                            newContent: currentContent,
+                            diffExplanation: `Modified via terminal command: ${command.length > 50 ? command.slice(0, 47) + '...' : command}`,
+                          },
+                        });
+                      } else if (applyEditPerm === 'allow' || applyEditPerm === 'allow_session') {
+                        this._postMessage({
+                          type: 'EDIT_APPLIED',
+                          editId,
+                          success: true,
+                          checkpointId: cmdCheckpointId ?? undefined,
+                          filePath,
+                        });
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            let outcome = '(failed)';
+            if (result.cancelled) {
+              outcome = '(cancelled)';
+            } else if (result.timedOut) {
+              outcome = '(timed out after 120s)';
+            } else if (result.executed) {
+              outcome = result.exitCode === 0
+                ? '(completed, exit code: 0)'
+                : `(failed with exit code: ${result.exitCode ?? 'unknown'})`;
+            }
+
+            const rawSnippet = (result.stdout || result.stderr || result.error || '').trim();
+            const truncatedSnippet = rawSnippet.length > 1500
+              ? rawSnippet.substring(0, 1500) + '\n... [output truncated]'
+              : rawSnippet;
+
+            // Collect all executed commands into executedCommandsSummary for the consolidated 1-line execution drawer
+            executedCommandsSummary.push({
+              command,
+              outcome,
+              exitCode: result.exitCode ?? null,
+              output: truncatedSnippet,
+              timedOut: result.timedOut,
+              cancelled: result.cancelled,
+            });
+
+            // Track successful commands for automatic continuation response
+            if (result.executed && result.exitCode === 0 && !result.cancelled && !result.timedOut) {
+              successfulCommands.push({
+                command,
+                output: rawSnippet,
+              });
+            }
+
+            if (isReadOnlyCmd && !result.cancelled) {
+              executedInspectionCommands.push({
+                command,
+                success: result.executed && result.exitCode === 0,
+                output: truncatedSnippet,
+                exitCode: result.exitCode ?? null,
+              });
+            }
+
+            // Self-Healing Auto-Retry with Loop Protection (including timeouts)
+            const isFailed = (result.executed && result.exitCode !== 0) || (result.timedOut && !result.cancelled);
+            if (isFailed && !result.cancelled) {
+              const currentRetryCount = retryContext?.retryCount ?? 0;
+              const failedCommands = retryContext?.failedCommands ?? new Set<string>();
+
+              // Safeguard 1: Abort if user cancelled the stream/session
+              if (this._activeAbortController?.signal.aborted) {
+                break;
+              }
+
+              // Safeguard 2: Duplicate failing command detection (infinite loop breaker)
+              // Normalize command to catch flag/argument variations of the same command (e.g. flutter run vs flutter run -d chrome)
+              const normalizeCmdSignature = (cmd: string) => {
+                const cleaned = cmd.toLowerCase().replace(/start\s+\/b\s+cmd\s+\/c\s+/g, '').replace(/["']/g, '').trim();
+                const tokens = cleaned.split(/\s+/).filter(Boolean);
+                // Take base executable and primary verb/subcommand
+                return tokens.slice(0, 3).join(' ');
+              };
+              const cmdSig = normalizeCmdSignature(command);
+              const hasSimilarFailure = Array.from(failedCommands).some(fc => fc === command || normalizeCmdSignature(fc) === cmdSig);
+
+              // Extract failure diagnostics for reporting
+              const outputParts: string[] = [];
+              if (result.stdout?.trim()) {
+                outputParts.push(result.stdout.trim());
+              }
+              if (result.stderr?.trim()) {
+                outputParts.push(result.stderr.trim());
+              }
+              if (outputParts.length === 0 && result.error?.trim()) {
+                outputParts.push(result.error.trim());
+              }
+              const fullOutput = outputParts.join('\n') || (result.timedOut ? 'Command timed out after 120s' : 'Command exited with non-zero status');
+              const truncatedError = fullOutput.length > 3000
+                ? fullOutput.substring(0, 3000) + '\n... [output truncated]'
+                : fullOutput;
+              const failureHistory = `Command: ${command}\nOutcome: ${outcome} (Exit code: ${result.exitCode ?? 'unknown'})\nOutput:\n${truncatedError}`;
+
+              // Safeguard 2: Duplicate failing command detection (infinite loop breaker)
+              // If identical or equivalent command failed again and no files were edited,
+              // hand off back to the model once to force a strategic pivot rather than halting abruptly.
+              if ((failedCommands.has(command) || hasSimilarFailure) && successfullyEditedFiles.length === 0) {
+                await flushExecutedTerminalSummary();
+
+                if (!retryContext?.hasDelegatedFailure) {
+                  const loopPivotSummary = `The model proposed repeating the failing command \`${command}\` without any workspace file modifications, which failed again:\n\n${failureHistory}\n\nCRITICAL: Do NOT propose this command again. Classify the error using the categories in your instructions (MISSING_SCHEMA, COMPILE_ERROR, ENV_ISSUE, etc.) and apply a completely different strategy, or clearly explain what is blocking progress and offer 2–3 concrete options to the user.`;
+
+                  const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+
+                  await this._handleSendMessage(
+                    loopPivotSummary,
+                    targetModel,
+                    undefined,
+                    undefined,
+                    this._activeReasoningEffort,
+                    {
+                      retryCount: currentRetryCount + 1,
+                      failedCommands,
+                      autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
+                      isAutoFollowUp: true,
+                      hasDelegatedFailure: true,
+                    }
+                  );
+                  return true;
+                } else {
+                  // Already asked the model to pivot and it still repeated a failing command; halt cleanly.
+                  if (!isReadOnlyCmd) {
+                    const loopMsg = {
+                      id: `${Date.now()}-term-loop-${cmdCount}`,
+                      role: 'assistant' as const,
+                      content: `⚠️ Model repeated failing command \`${command}\` without workspace modifications after a strategic pivot request. Halting self-healing loop.`,
+                      timestamp: Date.now(),
+                    };
+                    if (this._historyStore?.appendMessage) {
+                      await this._historyStore.appendMessage(loopMsg);
+                    }
+                    this._postMessage({
+                      type: 'MESSAGE_RECEIVED',
+                      message: loopMsg,
+                    });
+                  }
+                  break;
+                }
+              }
+
+              // Safeguard 3: Hard limit on attempts reached — delegate failure context back to model once
+              if (currentRetryCount >= MAX_TERMINAL_RETRIES) {
+                await flushExecutedTerminalSummary();
+
+                if (!retryContext?.hasDelegatedFailure) {
+                  const failureSummary = `The terminal self-healing loop has attempted ${currentRetryCount} times without success. Here is what happened:\n\n${failureHistory}\n\nDo NOT retry the same command. Classify the error using the categories in your instructions (MISSING_SCHEMA, COMPILE_ERROR, ENV_ISSUE, etc.) and apply a completely different strategy, or tell the user clearly what is blocking progress and offer 2–3 concrete options.`;
+
+                  const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+
+                  await this._handleSendMessage(
+                    failureSummary,
+                    targetModel,
+                    undefined,
+                    undefined,
+                    this._activeReasoningEffort,
+                    {
+                      retryCount: currentRetryCount + 1,
+                      failedCommands,
+                      autoTurnCount: (retryContext?.autoTurnCount ?? 0) + 1,
+                      isAutoFollowUp: true,
+                      hasDelegatedFailure: true,
+                    }
+                  );
+                  return true;
+                } else {
+                  // Post-delegation retry exhausted; halt cleanly
+                  if (!isReadOnlyCmd) {
+                    const maxMsg = {
+                      id: `${Date.now()}-term-max-${cmdCount}`,
+                      role: 'assistant' as const,
+                      content: `⚠️ Terminal auto-retry limit reached (${MAX_TERMINAL_RETRIES}/${MAX_TERMINAL_RETRIES} attempts). Halting self-healing loop.`,
+                      timestamp: Date.now(),
+                    };
+                    if (this._historyStore?.appendMessage) {
+                      await this._historyStore.appendMessage(maxMsg);
+                    }
+                    this._postMessage({
+                      type: 'MESSAGE_RECEIVED',
+                      message: maxMsg,
+                    });
+                  }
+                  break;
+                }
+              }
+
+              // For read-only inspection commands (like dir, type, cat):
+              // Do NOT initiate side-effecting self-healing or abort the remaining commands.
+              // Continue the loop so other commands in the batch run, and record the failure outcome.
+              if (isReadOnlyCmd) {
+                executedCommandsSummary.push({
+                  command,
+                  outcome,
+                  exitCode: result.exitCode ?? null,
+                  output: truncatedSnippet,
+                  timedOut: result.timedOut,
+                  cancelled: result.cancelled,
+                });
+                continue;
+              }
+
+              failedCommands.add(command);
+
+              // Flush terminal execution summary before posting retry notice
+              await flushExecutedTerminalSummary();
+
+              const retryNotice = {
+                id: `${Date.now()}-term-retry-${cmdCount}`,
+                role: 'system' as const,
+                content: result.timedOut
+                  ? `🔄 Terminal command \`${command}\` timed out after 120s. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`
+                  : `🔄 Terminal command \`${command}\` failed with exit code ${result.exitCode}. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`,
+                timestamp: Date.now(),
+              };
+              if (this._historyStore?.appendMessage) {
+                await this._historyStore.appendMessage(retryNotice);
+              }
+              this._postMessage({
+                type: 'MESSAGE_RECEIVED',
+                message: retryNotice,
+              });
+
+              // Trigger regular self-healing retry turn using extracted failure diagnostics
+
+              const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
+              const retryPrompt = result.timedOut
+                ? `The previous terminal command \`${command}\` timed out after 120s.\nOutput before timeout:\n\`\`\`\n${truncatedError}\n\`\`\`\nPlease diagnose why this command hung or timed out. If this is a long-running process or watch server, run with a non-blocking, non-interactive, or single-run flag (e.g. \`flutter test\`, \`npm test -- --watchAll=false\`). Continue autonomously until all tasks and verifications succeed.`
+                : `The previous terminal command \`${command}\` failed with exit code ${result.exitCode ?? 'unknown'}.\nError output:\n\`\`\`\n${truncatedError}\n\`\`\`\nPlease diagnose and resolve this failure:\n- If this is a compiler, analysis, test, or code error in the workspace: generate the necessary file edit(s) to fix the code, then re-run the verification command.\n- If this is a terminal command syntax or environment error: provide the corrected command.\nContinue autonomously until all tasks and verifications succeed.`;
+
+              // Trigger self-healing follow-up turn
+              await this._handleSendMessage(
+                retryPrompt,
+                targetModel,
+                undefined,
+                undefined,
+                this._activeReasoningEffort,
+                { retryCount: currentRetryCount + 1, failedCommands }
+              );
+
+              return true;
+            }
           }
-        }
         }
 
         // Flush any completed commands from the loop into a single consolidated 1-line dropdown
@@ -4122,7 +4122,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         const targetModel = modelId || Configuration.getLastModel() || 'openai/gpt-4o-mini';
 
         let continuationPrompt = `The following terminal command(s) were executed in the user's workspace:\n\n`;
-        
+
         if (successfulCommands.length > 0) {
           for (const item of successfulCommands) {
             const out = item.output.length > 3000
@@ -4705,15 +4705,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
     const storedRef: AttachedFileRef | undefined = (attachedFile || effectiveContent)
       ? {
-          name:
-            attachedFile?.name ||
-            this._activeReviewerArtifactName ||
-            (this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs'),
-          uri: attachedFile?.uri,
-          filePath: attachedFile?.filePath,
-          artifactType: attachedFile?.artifactType || this._activeReviewerArtifactType,
-          content: effectiveContent,
-        }
+        name:
+          attachedFile?.name ||
+          this._activeReviewerArtifactName ||
+          (this._activeReviewerArtifactType === 'walkthrough' ? 'Results docs' : 'Plan docs'),
+        uri: attachedFile?.uri,
+        filePath: attachedFile?.filePath,
+        artifactType: attachedFile?.artifactType || this._activeReviewerArtifactType,
+        content: effectiveContent,
+      }
       : undefined;
 
     const userMsgId = `${Date.now()}-user`;
@@ -4875,7 +4875,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const pinned = await this._loadPinnedContextContent();
     if (pinned) {
       pinnedTokenEst = Math.round(pinned.content.length / 4);
-      effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n# Pinned Workspace Context (${pinned.relativePath}):\n[Active Pinned Workspace Context: The file '${pinned.relativePath}' is pinned by the user as authoritative project baseline guidelines. It is read-only and loaded fresh from disk. Always consult its rules when reviewing documents or answering questions. If the user refers to 'pinned context' or 'pinned rules', cite this file.]\n${pinned.content}`;
+      effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n# Pinned Workspace Context (${pinned.relativePath}):\n[Active Pinned Workspace Context: The file '${pinned.relativePath}' contains authoritative project guidelines. Apply these rules implicitly. DO NOT explicitly mention, cite, or announce that you are using this pinned file in your response unless the user specifically asks about it.]\n${pinned.content}`;
     } else {
       effectiveSystemPrompt = `${effectiveSystemPrompt}\n\n[Pinned Workspace Context: None. No workspace file is currently pinned for this review session. If the user refers to pinned context or rules, inform them that no pinned file is currently attached and they can pin one via the 'Pin File' button at the top of the reviewer window.]`;
     }
@@ -4912,6 +4912,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       zdr: dataPolicy === 'deny',
     };
     const reviewerStartTime = Date.now();
+    let lastChunkPostTime = 0;
+    let pendingChunk = '';
 
     await OpenRouterClient.sendChatCompletionStream(
       apiKey,
@@ -4919,12 +4921,27 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       messages,
       (chunk) => {
         accumulatedChunk += chunk;
-        this._postMessage({
-          type: 'REVIEWER_STREAM_CHUNK',
-          chunk,
-        });
+        pendingChunk += chunk;
+        
+        const now = Date.now();
+        if (now - lastChunkPostTime > 50) {
+          this._postMessage({
+            type: 'REVIEWER_STREAM_CHUNK',
+            chunk: pendingChunk,
+          });
+          pendingChunk = '';
+          lastChunkPostTime = now;
+        }
       },
       async (usage) => {
+        if (pendingChunk) {
+          this._postMessage({
+            type: 'REVIEWER_STREAM_CHUNK',
+            chunk: pendingChunk,
+          });
+          pendingChunk = '';
+        }
+
         if (this._isReviewerUserCancelled || abortController.signal.aborted) {
           this._activeReviewerAbortController = undefined;
           this._postMessage({ type: 'SET_REVIEWER_BUSY', busy: false });

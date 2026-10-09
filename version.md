@@ -4,6 +4,25 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-10-09
+
+### Fixed
+- **Reviewer Stream UI Freeze (IPC Flooding):**
+  - Resolved an issue where generating massive AI responses (e.g. 8,000+ tokens via `glm-5.3-flash`) would flood the VS Code Webview IPC channel with thousands of unthrottled `REVIEWER_STREAM_CHUNK` messages, causing the UI to silently drop them and freeze at "Reviewer thinking".
+  - Implemented a 50ms batching throttle in `panelProvider.ts` to aggregate stream chunks before dispatching them to the frontend, exactly matching the safety mechanisms of the main chat stream.
+
+
+## [0.5.2] - 2026-10-09
+
+### Fixed
+- **Reviewer Pinned Context Hallucinations:**
+  - Modified the system prompt injection for the pinned context file to instruct the model to apply the rules implicitly.
+  - This prevents the model from repetitively announcing "Based on the pinned file..." in its responses unless directly asked.
+- **Notification Sound Autoplay Block:**
+  - Resolved an issue where agent completion notification sounds were silently suspended by the browser's strict Autoplay Policy because the `AudioContext` was initialized asynchronously.
+  - Added global event listeners (`click`, `keydown`) in the webview to silently unlock and warm up the `AudioContext` on the user's first UI interaction, ensuring subsequent agent notifications play reliably.
+
+
 ## [0.5.1] - 2026-10-09
 
 ### Fixed

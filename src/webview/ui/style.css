@@ -1328,7 +1328,7 @@ body {
 }
 
 .file-link-review-btn {
-  display: inline-flex;
+  display: none;
   align-items: center;
   gap: 2px;
   background: rgba(163, 113, 247, 0.25);
@@ -1343,7 +1343,7 @@ body {
   margin-left: 4px;
   transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
   text-decoration: none !important;
-  opacity: 0.9;
+  opacity: 0;
   flex-shrink: 0;
   vertical-align: middle;
   box-sizing: border-box;

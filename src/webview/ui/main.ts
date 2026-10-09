@@ -667,6 +667,21 @@ const testNotificationSoundBtn = document.getElementById('test-notification-soun
 let isNotificationSoundEnabled = true;
 let currentNotificationTone: 'bell' | 'chime' | 'pop' | 'ding' = 'bell';
 let notificationAudioContext: AudioContext | null = null;
+let audioContextUnlocked = false;
+const unlockAudioContext = () => {
+  if (audioContextUnlocked) return;
+  const ctx = getNotificationAudioContext();
+  if (ctx && ctx.state === 'suspended') {
+    ctx.resume().catch(() => {});
+  }
+  if (ctx && ctx.state === 'running') {
+    audioContextUnlocked = true;
+    document.removeEventListener('click', unlockAudioContext);
+    document.removeEventListener('keydown', unlockAudioContext);
+  }
+};
+document.addEventListener('click', unlockAudioContext);
+document.addEventListener('keydown', unlockAudioContext);
 
 function getNotificationAudioContext(): AudioContext | null {
   try {
