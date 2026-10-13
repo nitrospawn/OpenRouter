@@ -52,6 +52,7 @@ const saveKeyBtn = document.getElementById('save-key-btn') as HTMLButtonElement;
 const modelSearchInput = document.getElementById('model-search-input') as HTMLInputElement;
 const modelDropdown = document.getElementById('model-dropdown') as HTMLDivElement;
 const newChatBtn = document.getElementById('new-chat-btn') as HTMLButtonElement;
+const refreshModelsBtn = document.getElementById('refresh-models-btn') as HTMLButtonElement;
 const sessionDropdown = document.getElementById('session-dropdown') as HTMLDivElement;
 const sessionItemNew = document.getElementById('session-item-new') as HTMLDivElement;
 const sessionHistoryList = document.getElementById('session-history-list') as HTMLDivElement;
@@ -1037,7 +1038,7 @@ interface ProposedEditData {
 
 let loadedModels: ModelOption[] = [];
 let currentModelId = '';
-
+let uiErrorRetryCount = 0;
 export function getModelDisplayName(modelId?: string): string {
   if (!modelId) return 'OpenRouter';
   const found = loadedModels.find((m) => m.id === modelId);
@@ -1336,6 +1337,12 @@ if (newChatBtn) {
   });
 }
 
+if (refreshModelsBtn) {
+  refreshModelsBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'REFRESH_MODELS' });
+  });
+}
+
 if (sessionItemNew) {
   sessionItemNew.addEventListener('click', () => {
     closeSessionDropdown();
@@ -1511,6 +1518,13 @@ window.addEventListener('message', (event) => {
 
     case 'MODELS_LOADED':
       loadedModels = msg.models || [];
+      if (refreshModelsBtn) {
+        if (loadedModels.length > 0) {
+          refreshModelsBtn.classList.add('hidden');
+        } else {
+          refreshModelsBtn.classList.remove('hidden');
+        }
+      }
       hiddenZdrModelsCount = msg.hiddenZdrCount || 0;
       if (hiddenZdrModelsCount > 0 && isZdrOnlyPolicyActive && zdrHiddenBanner && zdrHiddenText) {
         zdrHiddenText.textContent = `🛡️ ${hiddenZdrModelsCount} models hidden — they do not support Zero Data Retention (ZDR).`;
@@ -1718,6 +1732,7 @@ window.addEventListener('message', (event) => {
       break;
 
     case 'MESSAGE_STREAM_CHUNK':
+      uiErrorRetryCount = 0;
       if (activeAssistantContentEl) {
         activeAssistantContentEl.textContent += msg.chunk;
         if (mainProgressManager) {
@@ -2111,6 +2126,7 @@ window.addEventListener('message', (event) => {
       break;
 
     case 'REVIEWER_STREAM_CHUNK':
+      uiErrorRetryCount = 0;
       handleReviewerStreamChunk(msg.chunk);
       break;
 
@@ -2315,6 +2331,10 @@ window.addEventListener('message', (event) => {
 
     case 'ERROR': {
       statusText.textContent = `Error: ${msg.message}`;
+      
+      if (msg.message && msg.message.toLowerCase().includes('fetch models') && refreshModelsBtn) {
+        refreshModelsBtn.classList.remove('hidden');
+      }
 
       const hadPartialContent = Boolean(
         activeAssistantContentEl && (activeAssistantContentEl.textContent || '').trim().length > 0
@@ -2341,14 +2361,33 @@ window.addEventListener('message', (event) => {
         .replace(/^Request failed:\s*/i, '')
         .replace(/^[⚠️!\s]+/, '');
 
-      const isStalledOrTimeout =
-        cleanErrorMsg.toLowerCase().includes('stalled') ||
-        cleanErrorMsg.toLowerCase().includes('timed out') ||
-        cleanErrorMsg.toLowerCase().includes('network') ||
-        cleanErrorMsg.toLowerCase().includes('econnreset') ||
-        cleanErrorMsg.toLowerCase().includes('connection lost') ||
-        cleanErrorMsg.toLowerCase().includes('empty response') ||
-        cleanErrorMsg.toLowerCase().includes('empty completion');
+      const cleanLower = cleanErrorMsg.toLowerCase();
+      const isProviderError =
+        cleanLower.includes('empty response') ||
+        cleanLower.includes('empty completion') ||
+        cleanLower.includes('without returning output text') ||
+        cleanLower.includes('502') ||
+        cleanLower.includes('504') ||
+        cleanLower.includes('timeout') ||
+        cleanLower.includes('stalled') ||
+        cleanLower.includes('gateway');
+
+      const isUserNetworkError =
+        cleanLower.includes('fetch failed') ||
+        cleanLower.includes('network') ||
+        cleanLower.includes('econnreset') ||
+        cleanLower.includes('connection lost');
+
+      const isStalledOrTimeout = isProviderError || isUserNetworkError;
+
+      if (isStalledOrTimeout) {
+        uiErrorRetryCount++;
+        if (isProviderError) {
+          remainingSeconds = uiErrorRetryCount <= 3 ? 30 : 300;
+        } else {
+          remainingSeconds = uiErrorRetryCount <= 5 ? 60 : 300;
+        }
+      }
 
       const triggerRetry = () => {
         clearCountdown();
@@ -2357,9 +2396,9 @@ window.addEventListener('message', (event) => {
         vscode.postMessage({
           type: 'SEND_MESSAGE',
           content: lastSentMessage.content,
-          modelId: lastSentMessage.modelId || currentModelId,
+          modelId: currentModelId || lastSentMessage.modelId,
           images: lastSentMessage.images,
-          reasoningEffort: lastSentMessage.reasoningEffort,
+          reasoningEffort: currentReasoningEffort || lastSentMessage.reasoningEffort,
           isRetry: true,
         });
       };
@@ -2370,8 +2409,8 @@ window.addEventListener('message', (event) => {
         vscode.postMessage({
           type: 'SEND_MESSAGE',
           content: 'The connection was interrupted. Please continue executing the active plan and verify results.',
-          modelId: lastSentMessage?.modelId || currentModelId,
-          reasoningEffort: lastSentMessage?.reasoningEffort,
+          modelId: currentModelId || lastSentMessage?.modelId,
+          reasoningEffort: currentReasoningEffort || lastSentMessage?.reasoningEffort,
           isRetry: false,
           isResume: true,
         });
@@ -2433,7 +2472,7 @@ window.addEventListener('message', (event) => {
         // Only start the countdown automatically for stalled/timeout or network issues
         if (isStalledOrTimeout && lastSentMessage) {
           const startTime = Date.now();
-          const targetDurationMs = 30000;
+          const targetDurationMs = remainingSeconds * 1000;
 
           autoRetryTimer = setInterval(() => {
             if (isDisarmed) return;
@@ -2645,7 +2684,7 @@ function parseAndRenderActions(content: string, parentEl: HTMLDivElement | null,
           content: lastSentMessage.content,
           modelId: currentModelId || lastSentMessage.modelId,
           images: lastSentMessage.images,
-          reasoningEffort: lastSentMessage.reasoningEffort,
+          reasoningEffort: currentReasoningEffort || lastSentMessage.reasoningEffort,
           isRetry: true,
         });
       }

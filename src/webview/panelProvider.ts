@@ -1360,6 +1360,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
           }
 
+          await vscode.workspace.saveAll(false);
+
           try {
             const result = await CommandRunner.executeCommand(
               data.command,
@@ -3766,6 +3768,11 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               }
             }
 
+            // Flush all dirty editor buffers to disk to prevent disk vs. buffer desyncs.
+            // This ensures terminal tools (like grep or cat) read the exact changes
+            // just applied via edit_file in the current model turn.
+            await vscode.workspace.saveAll(false);
+
             const result = await CommandRunner.executeCommand(
               command,
               this._permissionManager,
@@ -5108,6 +5115,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             </div>
             <div id="model-dropdown" class="combobox-dropdown hidden"></div>
           </div>
+          <button id="refresh-models-btn" class="icon-btn hidden" title="Refresh models">🔄</button>
           <div id="reasoning-effort-container" class="reasoning-effort-container hidden">
             <select id="reasoning-effort-select" class="reasoning-effort-select" title="Reasoning Effort">
               <option value="low">Low</option>

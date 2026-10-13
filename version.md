@@ -4,6 +4,32 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-10-10
+
+### Added
+- **Manual Model Refresh Button:**
+  - Added a dedicated "Refresh Models" (🔄) button next to the model selector dropdown in the chat view.
+  - Allows users to easily re-fetch the models list directly from the UI without restarting VS Code if a network error occurs during initial launch.
+  - The button is dynamically hidden when models load successfully and only appears when a fetch failure is detected.
+
+### Fixed
+- **Terminal Execution Disk Desync (Ghost Reverts):**
+  - Resolved a critical race condition where autonomous agents using terminal commands (`powershell`, `bash`) to verify their own `edit_file` changes would see outdated file contents.
+  - Injected a global `vscode.workspace.saveAll()` flush immediately before delegating any command to `CommandRunner.executeCommand`. This perfectly synchronizes unsaved VS Code editor buffers with the physical disk, preventing "disk vs. buffer" mismatches and autosave overwrites.
+- **Model Selection on Retry:**
+  - Fixed a bug where clicking "Retry" or "Resume" on a stream error card would always force the request to use the model that originally sent the message, ignoring any new model selected by the user in the dropdown while the error card was visible. Retry/Resume now correctly prioritize the currently selected model (`currentModelId`).
+
+
+## [0.5.4] - 2026-10-09
+
+### Added
+- **Infinite Auto-Retry Backoff for Autonomous Tasks:**
+  - Implemented an intelligent exponential backoff state tracker in the Webview UI.
+  - User Network Errors (e.g., connection lost) now auto-retry at 60s intervals for the first 5 attempts, then back off to 5-minute intervals infinitely.
+  - Provider Errors (e.g., empty response, 502/504 Bad Gateway, timeouts) auto-retry at 30s intervals for the first 3 attempts, then back off to 5-minute intervals infinitely.
+  - This guarantees that unattended/overnight autonomous tasks will simply pause and patiently poll during an internet outage or API downtime, rather than dying completely.
+
+
 ## [0.5.3] - 2026-10-09
 
 ### Fixed
