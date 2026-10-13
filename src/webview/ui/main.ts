@@ -2098,6 +2098,48 @@ window.addEventListener('message', (event) => {
             });
           }
         }
+
+        // Surface failure / cancellation message to user
+        if (msg.message === 'Cancelled') {
+          if (statusText) {
+            statusText.textContent = 'Undo cancelled';
+            statusText.style.color = '';
+            setTimeout(() => {
+              if (statusText.textContent === 'Undo cancelled') {
+                statusText.textContent = 'Ready';
+              }
+            }, 3000);
+          }
+        } else if (msg.message) {
+          if (statusText) {
+            statusText.textContent = `⚠️ Undo failed: ${msg.message}`;
+            statusText.style.color = '#f85149';
+          }
+          const targetEl = (currentMsgEl as HTMLElement | null) || (msg.messageId ? document.getElementById(`msg-${msg.messageId}`) : null);
+          if (targetEl) {
+            const existing = targetEl.querySelector('.undo-error-banner');
+            if (existing) existing.remove();
+
+            const banner = document.createElement('div');
+            banner.className = 'undo-error-banner';
+            banner.innerHTML = `
+              <div class="undo-error-banner-content">
+                <span class="undo-error-icon">⚠️</span>
+                <span class="undo-error-text">${escapeHtml(msg.message)}</span>
+              </div>
+              <button class="undo-error-dismiss" title="Dismiss">✕</button>
+            `;
+            const dismissBtn = banner.querySelector('.undo-error-dismiss');
+            if (dismissBtn) {
+              dismissBtn.addEventListener('click', () => banner.remove());
+            }
+            setTimeout(() => {
+              if (banner.parentElement) banner.remove();
+            }, 10000);
+            const bodyEl = targetEl.querySelector('.message-body') || targetEl;
+            bodyEl.appendChild(banner);
+          }
+        }
         
         updateAllUndoButtonsAvailability();
       }

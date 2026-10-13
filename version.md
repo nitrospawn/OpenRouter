@@ -4,6 +4,19 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-10-13
+
+### Added
+- **Surface Undo Failure Messages in Webview UI:**
+  - Added an actionable, dismissable `.undo-error-banner` inline alert inside the user message bubble when an Undo operation fails (e.g. running in standalone file mode without an opened workspace folder, or file restoration errors).
+  - Explicit guidance informs the user exactly how to resolve the issue (e.g. `Undo unavailable: open a folder or workspace in VS Code to enable file checkpoints and turn rollback.`).
+  - Status bar feedback: updates `#status-text` with `⚠️ Undo failed: <message>` in alert red (`#f85149`) with smooth automatic dismissal.
+  - User cancellation feedback: displays clean 3-second `Undo cancelled` status text when the user dismisses or cancels the confirmation modal, replacing silent button resets.
+
+### Fixed
+- **Host Diagnostic Logging for Undo Pipeline:**
+  - Added explicit diagnostic logs (`logger.warn('UNDO', ...)`, `logger.info('USER', ...)`, and `logger.error('UNDO', ...)`) capturing failure causes, pre-flight dialog cancellations, and drift warnings in `current.log`.
+
 ## [0.5.5] - 2026-10-10
 
 ### Added

@@ -989,12 +989,16 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           console.log('[panelProvider] Received UNDO_TURN request:', data);
           if (!this._scopedRestore || !this._checkpointManager) {
             console.warn('[panelProvider] UNDO_TURN unavailable: missing scopedRestore or checkpointManager');
+            logger.warn(
+              'UNDO',
+              `Undo turn ${data.messageId || 'unknown'} unavailable: missing workspace storage or active folder. Open a workspace folder in VS Code to enable file checkpoints and turn rollback.`
+            );
             this._postMessage({
               type: 'UNDO_RESULT',
               checkpointId: data.checkpointId,
               messageId: data.messageId,
               success: false,
-              message: 'Undo unavailable: no workspace storage active.',
+              message: 'Undo unavailable: open a folder or workspace in VS Code to enable file checkpoints and turn rollback.',
             });
             break;
           }
@@ -1038,6 +1042,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           );
 
           if (confirmChoice !== 'Continue') {
+            logger.info('USER', `Undo turn ${data.messageId} cancelled by user at pre-flight confirmation dialog`);
             this._postMessage({
               type: 'UNDO_RESULT',
               checkpointId,
@@ -1075,6 +1080,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
                 restoreSuccess = forced.success;
               } else {
                 // Cancelled drift warning — ABORT immediately without touching files or history
+                logger.info('USER', `Undo turn ${data.messageId} cancelled by user at manual modification drift warning`);
                 this._postMessage({
                   type: 'UNDO_RESULT',
                   checkpointId,
@@ -1094,6 +1100,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
           // 3. Scoped File Restore Verification
           if (!restoreSuccess) {
+            logger.error(
+              'UNDO',
+              `Failed to revert files (${targetFiles.join(', ')}) to checkpoint ${checkpointId ? checkpointId.substring(0, 7) : 'none'} for turn ${data.messageId}`
+            );
             this._postMessage({
               type: 'UNDO_RESULT',
               checkpointId,
@@ -1360,7 +1370,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             }
           }
 
-          await vscode.workspace.saveAll(false);
+          if (typeof (vscode.workspace as any).saveAll === 'function') {
+            await (vscode.workspace as any).saveAll(false);
+          }
 
           try {
             const result = await CommandRunner.executeCommand(
@@ -3771,7 +3783,9 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             // Flush all dirty editor buffers to disk to prevent disk vs. buffer desyncs.
             // This ensures terminal tools (like grep or cat) read the exact changes
             // just applied via edit_file in the current model turn.
-            await vscode.workspace.saveAll(false);
+            if (typeof (vscode.workspace as any).saveAll === 'function') {
+              await (vscode.workspace as any).saveAll(false);
+            }
 
             const result = await CommandRunner.executeCommand(
               command,
