@@ -138,5 +138,55 @@ test('buildSystemPrompt: enforces Autonomous Multi-Step Execution directive forb
   assert.ok(prompt.includes('Execute ALL steps without pausing. No mid-task check-ins.'));
 });
 
+test('conversational tier produces compact system prompt under 1200 estimated tokens', () => {
+  const prompt = buildSystemPrompt({ promptTier: 'conversational' });
+  const estimated = Math.ceil(prompt.length / 4);
+  assert.ok(estimated < 1200, `Expected conversational tier < 1200 tokens, got ${estimated}`);
+  // Gated sections must be excluded
+  assert.ok(!prompt.includes('SECTION 3 — HOW CONTEXT REACHES YOU'));
+  assert.ok(!prompt.includes('SECTION 4 — SECRET REDACTION'));
+  assert.ok(!prompt.includes('SECTION 8 — STEP 2: WHEN TO PLAN VS. WHEN TO ACT DIRECTLY'));
+  assert.ok(!prompt.includes('SECTION 9 — STEP 3: ACTING'));
+  assert.ok(!prompt.includes('SECTION 10 — STEP 4: VERIFY BEFORE DECLARING DONE'));
+  assert.ok(!prompt.includes('SECTION 10B — TERMINAL FAILURE RECOVERY'));
+  assert.ok(!prompt.includes('SECTION 12 — WORKSPACE ANALYSIS'));
+  assert.ok(!prompt.includes('QUICK REFERENCE — DECISION TREE'));
+  // Unconditional sections must be present
+  assert.ok(prompt.includes('SECTION 1 — WHO YOU ARE & HOW YOU SPEAK'));
+  assert.ok(prompt.includes('SECTION 2 — REASONING EFFORT'));
+  assert.ok(prompt.includes('SECTION 5 — OPERATING SYSTEM & SHELL'));
+  assert.ok(prompt.includes('SECTION 6 — THE FOUR-STEP RULE'));
+  assert.ok(prompt.includes('SECTION 7 — STEP 1: UNDERSTAND THE REQUEST'));
+});
+
+test('editing tier includes edit directives but excludes autonomous execution sections under 5500 tokens', () => {
+  const prompt = buildSystemPrompt({ promptTier: 'editing' });
+  const estimated = Math.ceil(prompt.length / 4);
+  assert.ok(estimated < 5500, `Expected editing tier < 5500 tokens, got ${estimated}`);
+  // Includes editing sections
+  assert.ok(prompt.includes('SECTION 3 — HOW CONTEXT REACHES YOU'));
+  assert.ok(prompt.includes('SECTION 8 — STEP 2: WHEN TO PLAN VS. WHEN TO ACT DIRECTLY'));
+  assert.ok(prompt.includes('SECTION 9 — STEP 3: ACTING'));
+  assert.ok(prompt.includes('SECTION 10 — STEP 4: VERIFY BEFORE DECLARING DONE'));
+  // Excludes execution-only sections
+  assert.ok(!prompt.includes('SECTION 10B — TERMINAL FAILURE RECOVERY'));
+  assert.ok(!prompt.includes('SECTION 12 — WORKSPACE ANALYSIS'));
+});
+
+test('executing tier includes all execution recovery directives', () => {
+  const prompt = buildSystemPrompt({ promptTier: 'executing' });
+  assert.ok(prompt.includes('SECTION 10B — TERMINAL FAILURE RECOVERY'));
+  assert.ok(prompt.includes('SECTION 12 — WORKSPACE ANALYSIS'));
+});
+
+test('diagnostics section 11 is injected only when problem token is present', () => {
+  const withProblems = buildSystemPrompt({ promptTier: 'conversational', hasCurrentProblemsToken: true });
+  assert.ok(withProblems.includes('SECTION 11 — DIAGNOSTICS'));
+
+  const withoutProblems = buildSystemPrompt({ promptTier: 'conversational', hasCurrentProblemsToken: false });
+  assert.ok(!withoutProblems.includes('SECTION 11 — DIAGNOSTICS'));
+});
+
+
 
 

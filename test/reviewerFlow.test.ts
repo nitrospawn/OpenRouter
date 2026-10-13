@@ -1946,7 +1946,7 @@ test('Reviewer Pinned Context: Loads workspace pinned file into system prompt an
       'System prompt must include pinned context header'
     );
     assert.ok(
-      systemMsg.content.includes('Active Pinned Workspace Context: The file \'docs/architecture_rules.md\' is pinned by the user as authoritative project baseline guidelines.'),
+      systemMsg.content.includes("Active Pinned Workspace Context: The file 'docs/architecture_rules.md' contains authoritative project guidelines."),
       'System prompt must include model awareness framing'
     );
     assert.ok(

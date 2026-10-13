@@ -4,6 +4,54 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] - 2026-10-13
+
+### Added
+- **Auto-Healing Diagnosis Collapsible Dropdown Integration:**
+  - Integrated `isAutoRetry` failure diagnosis cards into the intermediate execution steps drawer (`.intermediate-turn-drawer`) alongside intermediate steps and executed terminal command cards.
+  - Keeps the main chat feed clean and focused by eliminating loose, oversized self-healing logs overflowing below the execution steps accordion.
+  - Updated `updateIntermediateDrawerSummary()` in `main.ts` to dynamically detect and count `.auto-retry-message` elements, surfacing the diagnosis count in the header label (e.g., `19 execution steps (39 terminal commands, 4 auto-healing)` or `N auto-healing diagnoses`).
+  - Added user turn boundary detection in `getOrCreateIntermediateDrawer()` to ignore `auto-retry-message` items so the entire autonomous multi-retry cycle consolidates under a single collapsible drawer.
+  - Marked auto-retry messages and retry notices with `isIntermediateStep: true` in `panelProvider.ts` to persist collapsed status across chat sessions and history reloads.
+  - Added tailored compact styling (`.intermediate-turn-drawer-body .message.auto-retry-message`) in `style.css` for consistent, aesthetic nesting inside the drawer.
+
+### Fixed
+- **Premature Packing of Final Responses into Execution Dropdown:**
+  - Resolved an issue in `panelProvider.ts` where `confirmedIntermediate` evaluated to `true` whenever an edit block was present, even when no follow-up turn was triggered.
+  - Corrected `confirmedIntermediate` to strictly reflect `Boolean(triggeredFollowUp)`, ensuring that final completion steps and single-turn task answers remain fully visible and open in the chat feed instead of being collapsed inside `1 execution step completed`.
+  - Added auto-flow gating to `isIntermediateStep` so standalone single-turn requests from users are never tentatively marked intermediate during streaming.
+- **Autonomous Stall Recovery Loop on Task Completion:**
+  - Fixed an infinite loop where the extension repeatedly re-prompted models with continuation directives after all plan tasks were already finished and verified.
+  - Replaced broad `activePlanExists` check with `hasPendingPlanItems` to ensure stall recovery only engages when uncompleted `- [ ]` checklist items actually remain.
+  - Expanded `isExplicitlyComplete` detection to recognize completion declarations (e.g. `all plan items are complete`, `pass analysis clean`, `with no issues`, `done:`), gracefully halting execution.
+- **Eliminated Duplicate Task Summary Cards:**
+  - Removed redundant `renderTaskSummaryCard()` invocation in `main.ts` that caused task summaries to display twice in the message bubble (once as formatted markdown and a second time as a duplicate blue card below).
+
+## [0.5.7] - 2026-10-13
+
+### Added
+- **Three-Tier System Prompt Compression:**
+  - Implemented dynamic system prompt tiering in `buildSystemPrompt()` across three behavioral levels:
+    - **Conversational Tier (~940 tokens / ~500 words):** Includes only core identity, tone, reasoning effort, OS/shell, four-step rule, and request understanding (Sections 1, 2, 5, 6, 7). Strips out heavy editing, planning, and terminal instructions, saving ~4,000+ tokens on general questions and simple chat.
+    - **Editing Tier (~4,980 tokens):** Adds file reading tutorial (Section 3), secret redaction (Section 4), planning decision boundaries (Section 8), edit blocks (Section 9), and verification walkthrough rules (Section 10).
+    - **Executing Tier (~7,280 tokens):** Injects terminal failure recovery decision trees (Section 10B) and multi-file workspace inspection rules (Section 12).
+  - Isolated Diagnostics Section 11 as an on-demand add-on injected strictly when `@current_problems` or `@all_problems` is detected.
+- **File Pre-Injection Tightening & Auto-Continuation Guard:**
+  - Added auto-continuation bypass in `_handleSendMessage()` (`panelProvider.ts`) via `skipFilePreInjection = Boolean(retryContext?.isAutoFollowUp)`, eliminating redundant file reading loops and saving 5,000–15,000 tokens per auto-continuation turn.
+  - Added optional `promptTier` gating to `extractFileMentions()` to suppress bare filenames (Pattern 3) and intent phrases (Pattern 4) on conversational turns, eliminating false positives (e.g. matching `express.ts` from casual chat) while preserving explicit `@mentions` and quoted filenames.
+- **Visible Model Cost at Selection Point (Input / Output /M):**
+  - Integrated live token pricing directly into the model selector dropdowns (Main Chat combobox, Reviewer combobox, and Reviewer Settings combobox).
+  - Automatically converts OpenRouter's raw per-token rates (`prompt`, `completion`) into the industry-standard dollar rate per million tokens (e.g. `$3 / $15 /M`, `$0.15 / $0.60 /M`, or `Free`).
+  - Added clean badges (`.combobox-item-price` and `.combobox-item-price.free`) with full tooltips showing exact rates: `Input: $X.XX / 1M tokens • Output: $Y.YY / 1M tokens`.
+  - Added unit test suite in `test/pricingFormat.test.ts` covering free, micro-fractional, and standard model rates.
+
+### Fixed
+- **Intent-Driven Tier Derivation Heuristics:**
+  - Resolved an issue in `panelProvider.ts` where checking `applyEditPerm !== 'deny'` unconditionally caused non-editing questions to default to the editing tier for all users.
+  - Paired edit permission checks with explicit regex intent detection (`edit_file|create_file|patch` or actionable editing verbs `edit|fix|update|modify|refactor|create|add`), ensuring simple conversational questions cleanly trigger the conversational tier.
+- **System Prompt Tier Verification Suite:**
+  - Added calibrated unit tests in `test/systemPrompt.test.ts` validating token consumption bounds and strict section presence/exclusion per tier.
+
 ## [0.5.6] - 2026-10-13
 
 ### Added

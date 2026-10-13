@@ -36,7 +36,10 @@ import { EXTENSION_VERSION } from '../version';
  * Scans for explicit @mentions, quoted filenames, bare filenames with recognized extensions,
  * and common file operation intent patterns (e.g. "copy PRD.md into prdv2.md").
  */
-export function extractFileMentions(message: string): string[] {
+export function extractFileMentions(
+  message: string,
+  promptTier?: 'conversational' | 'editing' | 'executing'
+): string[] {
   if (!message || typeof message !== 'string') return [];
 
   const candidates: string[] = [];
@@ -86,16 +89,21 @@ export function extractFileMentions(message: string): string[] {
     addCandidate(m[1], m.index);
   }
 
-  // 3. Bare filenames with recognized extensions
-  const bareRegex = /\b([\w\-./\\]+\.(?:md|ts|js|tsx|jsx|json|yaml|yml|txt|dart|py|cs|java|swift|kt|go|rs|html|css|env|prisma|sql|sh|bat|ps1))\b/gi;
-  while ((m = bareRegex.exec(message)) !== null) {
-    addCandidate(m[1], m.index);
-  }
+  // Patterns 3 & 4 only on editing / executing tier.
+  // On conversational turns, only explicit @mentions and quoted filenames
+  // are safe signals — bare filenames produce too many false positives.
+  if (promptTier !== 'conversational') {
+    // 3. Bare filenames with recognized extensions
+    const bareRegex = /\b([\w\-./\\]+\.(?:md|ts|js|tsx|jsx|json|yaml|yml|txt|dart|py|cs|java|swift|kt|go|rs|html|css|env|prisma|sql|sh|bat|ps1))\b/gi;
+    while ((m = bareRegex.exec(message)) !== null) {
+      addCandidate(m[1], m.index);
+    }
 
-  // 4. Intent patterns (e.g. "copy PRD.md", "read foo.dart", "into bar.ts", "based on spec.md")
-  const intentRegex = /\b(?:copy|read|open|check|inspect|look at|view|into|from|to|update|edit|based on)\s+["'`\u2018\u2019\u201c\u201d]?([\w\-./\\]+\.[\w]{1,10})["'`\u2018\u2019\u201c\u201d]?(?=[^\w\-./\\]|$)/gi;
-  while ((m = intentRegex.exec(message)) !== null) {
-    addCandidate(m[1], m.index);
+    // 4. Intent patterns (e.g. "copy PRD.md", "read foo.dart", "into bar.ts", "based on spec.md")
+    const intentRegex = /\b(?:copy|read|open|check|inspect|look at|view|into|from|to|update|edit|based on)\s+["'`\u2018\u2019\u201c\u201d]?([\w\-./\\]+\.[\w]{1,10})["'`\u2018\u2019\u201c\u201d]?(?=[^\w\-./\\]|$)/gi;
+    while ((m = intentRegex.exec(message)) !== null) {
+      addCandidate(m[1], m.index);
+    }
   }
 
   return candidates.slice(0, 5);
@@ -2133,6 +2141,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       timestamp: Date.now(),
       isAutoRetry,
       isAutoFollowUp,
+      isIntermediateStep: isAutoRetry ? true : undefined,
       userTypedText,
       attachments,
     };
@@ -2216,9 +2225,55 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       };
     }
 
+    // Extract compact plan task anchor if a multi-step plan is currently in progress
+    let activePlanAnchor = '';
+    if (this._historyStore) {
+      try {
+        const hist = await this._historyStore.loadHistory();
+        const lastPlanMsg = [...hist].reverse().find(
+          (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+        );
+        const planText = lastPlanMsg?.planDocument || lastPlanMsg?.content;
+        if (planText) {
+          // Check if any unchecked items remain
+          const checklistMatches = planText.match(/^\s*-\s*\[[ xX]\].*$/gm);
+          if (checklistMatches && checklistMatches.some((item) => /-\s*\[ \]/i.test(item))) {
+            // Keep it ultra-compact: only checklist items, max 10 items
+            const compactItems = checklistMatches.slice(0, 10).map((l) => l.trim()).join('\n');
+            activePlanAnchor = compactItems;
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }
+
+    // Derive prompt tier for token-efficient system prompt injection
+    const isExecutingTier = Boolean(
+      retryContext?.isAutoFollowUp ||
+      (retryContext?.retryCount ?? 0) > 0 ||
+      activePlanAnchor
+    );
+
+    const applyEditPerm = this._permissionManager.getPermission('applyEdit');
+    const hasEditIntent = (
+      /```(?:edit_file|create_file|file|create|edit|patch)/i.test(processedContent) ||
+      /\b(edit|fix|update|modify|refactor|create|write|delete|remove|implement|add|replace|patch|change|rename)\b/i.test(processedContent)
+    );
+    const isEditingTier = !isExecutingTier && applyEditPerm !== 'deny' && hasEditIntent;
+
+    const promptTier: 'conversational' | 'editing' | 'executing' =
+      isExecutingTier ? 'executing'
+      : isEditingTier ? 'editing'
+      : 'conversational';
+
     const MAX_REFERENCED_CONTENT_CHARS = 120_000;
     let totalReferencedChars = 0;
     let remainingRefTokens = Math.min(availableFileTokens, 30000);
+
+    // Skip proactive file pre-injection on auto-continuation turns.
+    // The model already holds file context from the prior turn's history.
+    const skipFilePreInjection = Boolean(retryContext?.isAutoFollowUp);
 
     const referencedFileResults: Array<{ relativePath: string; content: string; batch?: FileBatchMetadata }> = [];
     let missingReferencedFile: string | undefined;
@@ -2227,94 +2282,96 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const activeRelativeNorm = editorCtx.relativePath ? normalizePathForCompare(editorCtx.relativePath) : '';
 
     // Proactively scan user message for file references and resolve before building prompt
-    const candidateMentions = extractFileMentions(processedContent);
+    const candidateMentions = extractFileMentions(processedContent, promptTier);
     if (content && content !== processedContent) {
-      for (const m of extractFileMentions(content)) {
+      for (const m of extractFileMentions(content, promptTier)) {
         if (!candidateMentions.includes(m)) {
           candidateMentions.push(m);
         }
       }
     }
 
-    for (const candidate of candidateMentions) {
-      if (remainingRefTokens <= 1000 || totalReferencedChars >= MAX_REFERENCED_CONTENT_CHARS) {
-        break;
-      }
-      const candNorm = normalizePathForCompare(candidate);
-      const isCandidateActive = activeRelativeNorm && (
-        candNorm === activeRelativeNorm ||
-        activeRelativeNorm.endsWith('/' + candNorm) ||
-        candNorm.endsWith('/' + activeRelativeNorm)
-      );
-      if (isCandidateActive) continue;
-
-      const isAlreadyReferenced = referencedFileResults.some(r => {
-        const rNorm = normalizePathForCompare(r.relativePath);
-        return rNorm === candNorm || rNorm.endsWith('/' + candNorm) || candNorm.endsWith('/' + rNorm);
-      });
-      if (isAlreadyReferenced) continue;
-
-      try {
-        const baseName = path.basename(candidate);
-        this._postMessage({
-          type: 'AGENT_PROGRESS',
-          phase: 'reading',
-          label: 'Reading referenced file',
-          detail: baseName,
-        });
-        this._postMessage({
-          type: 'SET_BUSY',
-          busy: true,
-          statusText: `Reading file: ${baseName}...`,
-        });
-
-        const matched = await ContextReader.findAndReadWorkspaceFile(candidate, this._permissionManager);
-        if (matched) {
-          const matchedNorm = normalizePathForCompare(matched.relativePath);
-          if (activeRelativeNorm && (matchedNorm === activeRelativeNorm || matchedNorm.endsWith('/' + activeRelativeNorm))) {
-            continue;
-          }
-          if (referencedFileResults.some(r => normalizePathForCompare(r.relativePath) === matchedNorm)) {
-            continue;
-          }
-
-          let refContent = matched.content;
-          let refBatch: FileBatchMetadata | undefined;
-          if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
-            const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
-            const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
-            refContent = chosenBatch.content;
-            refBatch = {
-              batchIndex: chosenBatch.batchIndex,
-              totalBatches: chosenBatch.totalBatches,
-              startLine: chosenBatch.startLine,
-              endLine: chosenBatch.endLine,
-              totalLines: chosenBatch.totalLines,
-            };
-          }
-
-          if (totalReferencedChars + refContent.length > MAX_REFERENCED_CONTENT_CHARS) {
-            const allowed = MAX_REFERENCED_CONTENT_CHARS - totalReferencedChars;
-            if (allowed <= 0) break;
-            refContent = refContent.slice(0, allowed);
-          }
-
-          const tokensUsed = ChunkManager.estimateTokens(refContent);
-          remainingRefTokens -= tokensUsed;
-          totalReferencedChars += refContent.length;
-
-          referencedFileResults.push({
-            relativePath: matched.relativePath,
-            content: refContent,
-            batch: refBatch,
-          });
-        } else {
-          if (!missingReferencedFile) {
-            missingReferencedFile = candidate;
-          }
+    if (!skipFilePreInjection) {
+      for (const candidate of candidateMentions) {
+        if (remainingRefTokens <= 1000 || totalReferencedChars >= MAX_REFERENCED_CONTENT_CHARS) {
+          break;
         }
-      } catch {
-        // Fail silently
+        const candNorm = normalizePathForCompare(candidate);
+        const isCandidateActive = activeRelativeNorm && (
+          candNorm === activeRelativeNorm ||
+          activeRelativeNorm.endsWith('/' + candNorm) ||
+          candNorm.endsWith('/' + activeRelativeNorm)
+        );
+        if (isCandidateActive) continue;
+
+        const isAlreadyReferenced = referencedFileResults.some(r => {
+          const rNorm = normalizePathForCompare(r.relativePath);
+          return rNorm === candNorm || rNorm.endsWith('/' + candNorm) || candNorm.endsWith('/' + rNorm);
+        });
+        if (isAlreadyReferenced) continue;
+
+        try {
+          const baseName = path.basename(candidate);
+          this._postMessage({
+            type: 'AGENT_PROGRESS',
+            phase: 'reading',
+            label: 'Reading referenced file',
+            detail: baseName,
+          });
+          this._postMessage({
+            type: 'SET_BUSY',
+            busy: true,
+            statusText: `Reading file: ${baseName}...`,
+          });
+
+          const matched = await ContextReader.findAndReadWorkspaceFile(candidate, this._permissionManager);
+          if (matched) {
+            const matchedNorm = normalizePathForCompare(matched.relativePath);
+            if (activeRelativeNorm && (matchedNorm === activeRelativeNorm || matchedNorm.endsWith('/' + activeRelativeNorm))) {
+              continue;
+            }
+            if (referencedFileResults.some(r => normalizePathForCompare(r.relativePath) === matchedNorm)) {
+              continue;
+            }
+
+            let refContent = matched.content;
+            let refBatch: FileBatchMetadata | undefined;
+            if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
+              const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
+              const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
+              refContent = chosenBatch.content;
+              refBatch = {
+                batchIndex: chosenBatch.batchIndex,
+                totalBatches: chosenBatch.totalBatches,
+                startLine: chosenBatch.startLine,
+                endLine: chosenBatch.endLine,
+                totalLines: chosenBatch.totalLines,
+              };
+            }
+
+            if (totalReferencedChars + refContent.length > MAX_REFERENCED_CONTENT_CHARS) {
+              const allowed = MAX_REFERENCED_CONTENT_CHARS - totalReferencedChars;
+              if (allowed <= 0) break;
+              refContent = refContent.slice(0, allowed);
+            }
+
+            const tokensUsed = ChunkManager.estimateTokens(refContent);
+            remainingRefTokens -= tokensUsed;
+            totalReferencedChars += refContent.length;
+
+            referencedFileResults.push({
+              relativePath: matched.relativePath,
+              content: refContent,
+              batch: refBatch,
+            });
+          } else {
+            if (!missingReferencedFile) {
+              missingReferencedFile = candidate;
+            }
+          }
+        } catch {
+          // Fail silently
+        }
       }
     }
 
@@ -2374,7 +2431,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     }
 
     // 2b. Extract file mentions without extension (e.g. "to prd file", "in auth file", "open config file")
-    const extensionlessRegex = /\b(?:(?:to|in|at|check|open|update|edit|modify|add to|on)\s+(?:the\s+)?)?([a-zA-Z0-9_\-]+)\s+file\b|\bfile\s+([a-zA-Z0-9_\-]+)\b/gi;
+    const extensionlessRegex = /\b(?:(?:to|in|at|check|open|update|edit|modify|add to|on)\s+(?:the\\s+)?)?([a-zA-Z0-9_\-]+)\s+file\b|\bfile\s+([a-zA-Z0-9_\-]+)\b/gi;
     let efm;
     while ((efm = extensionlessRegex.exec(processedContent)) !== null) {
       const cand = (efm[1] || efm[2] || '').trim().toLowerCase();
@@ -2394,71 +2451,73 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     }
 
     // Allocate token budget across mentioned files (up to availableFileTokens or 30,000 tokens)
-    for (const wf of mentionedFiles.slice(0, 8)) {
-      if (remainingRefTokens <= 1000 || totalReferencedChars >= MAX_REFERENCED_CONTENT_CHARS) break;
-      const wfNorm = normalizePathForCompare(wf);
-      if (referencedFileResults.some(r => {
-        const rNorm = normalizePathForCompare(r.relativePath);
-        return rNorm === wfNorm || rNorm.endsWith('/' + wfNorm) || wfNorm.endsWith('/' + rNorm);
-      })) {
-        continue;
-      }
-      const baseName = path.basename(wf);
-      this._postMessage({
-        type: 'AGENT_PROGRESS',
-        phase: 'reading',
-        label: 'Reading file',
-        detail: baseName,
-      });
-      this._postMessage({
-        type: 'SET_BUSY',
-        busy: true,
-        statusText: `Reading file: ${baseName}...`,
-      });
-      try {
-        const matched = await ContextReader.findAndReadWorkspaceFile(wf, this._permissionManager);
-        if (matched) {
-          const matchedNorm = normalizePathForCompare(matched.relativePath);
-          if (activeRelativeNorm && (matchedNorm === activeRelativeNorm || matchedNorm.endsWith('/' + activeRelativeNorm))) {
-            continue;
-          }
-          if (referencedFileResults.some(r => normalizePathForCompare(r.relativePath) === matchedNorm)) {
-            continue;
-          }
-
-          let refContent = matched.content;
-          let refBatch: FileBatchMetadata | undefined;
-          if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
-            const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
-            const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
-            refContent = chosenBatch.content;
-            refBatch = {
-              batchIndex: chosenBatch.batchIndex,
-              totalBatches: chosenBatch.totalBatches,
-              startLine: chosenBatch.startLine,
-              endLine: chosenBatch.endLine,
-              totalLines: chosenBatch.totalLines,
-            };
-          }
-
-          if (totalReferencedChars + refContent.length > MAX_REFERENCED_CONTENT_CHARS) {
-            const allowed = MAX_REFERENCED_CONTENT_CHARS - totalReferencedChars;
-            if (allowed <= 0) break;
-            refContent = refContent.slice(0, allowed);
-          }
-
-          const tokensUsed = ChunkManager.estimateTokens(refContent);
-          remainingRefTokens -= tokensUsed;
-          totalReferencedChars += refContent.length;
-
-          referencedFileResults.push({
-            relativePath: matched.relativePath,
-            content: refContent,
-            batch: refBatch,
-          });
+    if (!skipFilePreInjection) {
+      for (const wf of mentionedFiles.slice(0, 8)) {
+        if (remainingRefTokens <= 1000 || totalReferencedChars >= MAX_REFERENCED_CONTENT_CHARS) break;
+        const wfNorm = normalizePathForCompare(wf);
+        if (referencedFileResults.some(r => {
+          const rNorm = normalizePathForCompare(r.relativePath);
+          return rNorm === wfNorm || rNorm.endsWith('/' + wfNorm) || wfNorm.endsWith('/' + rNorm);
+        })) {
+          continue;
         }
-      } catch {
-        // Fail silently
+        const baseName = path.basename(wf);
+        this._postMessage({
+          type: 'AGENT_PROGRESS',
+          phase: 'reading',
+          label: 'Reading file',
+          detail: baseName,
+        });
+        this._postMessage({
+          type: 'SET_BUSY',
+          busy: true,
+          statusText: `Reading file: ${baseName}...`,
+        });
+        try {
+          const matched = await ContextReader.findAndReadWorkspaceFile(wf, this._permissionManager);
+          if (matched) {
+            const matchedNorm = normalizePathForCompare(matched.relativePath);
+            if (activeRelativeNorm && (matchedNorm === activeRelativeNorm || matchedNorm.endsWith('/' + activeRelativeNorm))) {
+              continue;
+            }
+            if (referencedFileResults.some(r => normalizePathForCompare(r.relativePath) === matchedNorm)) {
+              continue;
+            }
+
+            let refContent = matched.content;
+            let refBatch: FileBatchMetadata | undefined;
+            if (!ChunkManager.fitsWithinContext(refContent, remainingRefTokens)) {
+              const batches = ChunkManager.createFileBatches(refContent, remainingRefTokens);
+              const chosenBatch = ChunkManager.selectRelevantBatch(batches, processedContent);
+              refContent = chosenBatch.content;
+              refBatch = {
+                batchIndex: chosenBatch.batchIndex,
+                totalBatches: chosenBatch.totalBatches,
+                startLine: chosenBatch.startLine,
+                endLine: chosenBatch.endLine,
+                totalLines: chosenBatch.totalLines,
+              };
+            }
+
+            if (totalReferencedChars + refContent.length > MAX_REFERENCED_CONTENT_CHARS) {
+              const allowed = MAX_REFERENCED_CONTENT_CHARS - totalReferencedChars;
+              if (allowed <= 0) break;
+              refContent = refContent.slice(0, allowed);
+            }
+
+            const tokensUsed = ChunkManager.estimateTokens(refContent);
+            remainingRefTokens -= tokensUsed;
+            totalReferencedChars += refContent.length;
+
+            referencedFileResults.push({
+              relativePath: matched.relativePath,
+              content: refContent,
+              batch: refBatch,
+            });
+          }
+        } catch {
+          // Fail silently
+        }
       }
     }
 
@@ -2472,29 +2531,6 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
 
     const isMemoryEnabled = Configuration.getWorkspaceMemoryInContext();
     const recentActivities = isMemoryEnabled ? await MemoryManifest.formatForPrompt() : '';
-
-    // Extract compact plan task anchor if a multi-step plan is currently in progress
-    let activePlanAnchor = '';
-    if (this._historyStore) {
-      try {
-        const hist = await this._historyStore.loadHistory();
-        const lastPlanMsg = [...hist].reverse().find(
-          (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
-        );
-        const planText = lastPlanMsg?.planDocument || lastPlanMsg?.content;
-        if (planText) {
-          // Check if any unchecked items remain
-          const checklistMatches = planText.match(/^\s*-\s*\[[ xX]\].*$/gm);
-          if (checklistMatches && checklistMatches.some((item) => /-\s*\[ \]/i.test(item))) {
-            // Keep it ultra-compact: only checklist items, max 10 items
-            const compactItems = checklistMatches.slice(0, 10).map((l) => l.trim()).join('\n');
-            activePlanAnchor = compactItems;
-          }
-        }
-      } catch {
-        // non-fatal
-      }
-    }
 
     const systemPrompt = buildSystemPrompt({
       activeFile: editorCtx.hasContext && (editorCtx.relativePath || editorCtx.isArtifactDocument) ? {
@@ -2512,7 +2548,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       missingReferencedFile,
       terminalOutputs: terminalOutputs || undefined,
       permissions: {
-        applyEdit: this._permissionManager.getPermission('applyEdit'),
+        applyEdit: applyEditPerm,
         runTerminalCommand: this._permissionManager.getPermission('runTerminalCommand'),
       },
       environment: {
@@ -2522,6 +2558,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       reasoningEffort: (reasoningEffort || this._activeReasoningEffort) as 'low' | 'medium' | 'high' | undefined,
       recentActivities: recentActivities || undefined,
       activePlanAnchor: activePlanAnchor || undefined,
+      promptTier,
+      hasCurrentProblemsToken: hasCurrentProblemsToken || hasAllProblemsToken,
     });
 
     // Phase 7: Secret Scanning & Redaction Pipeline
@@ -2835,6 +2873,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         // We will finalize whether it is intermediate in the finally block after auto-execution resolves.
         const isIntermediateStep = Boolean(
           !walkthroughDocument &&
+          Boolean(retryContext?.isAutoFollowUp || (retryContext?.autoTurnCount ?? 0) > 0 || (retryContext?.retryCount ?? 0) > 0) &&
           (/(?:```|````)(?:bash|sh|shell|cmd|powershell|create_file|edit_file|file|create|edit|patch)/i.test(finalContent))
         );
 
@@ -3092,7 +3131,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           }
         } finally {
           if (assistantMessageId && !isEmptyResponse) {
-            const confirmedIntermediate = Boolean(triggeredFollowUp || isIntermediateStep);
+            const confirmedIntermediate = Boolean(triggeredFollowUp);
             if (this._historyStore) {
               await this._historyStore.setMessageIntermediate(assistantMessageId, confirmedIntermediate);
             }
@@ -3598,6 +3637,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         role: 'system' as const,
         content: `🔄 File edit to \`${firstFailed.relativePath}\` failed (${firstFailed.error}). Initiating self-healing retry (${currentRetryCount + 1}/${MAX_RETRIES})...`,
         timestamp: Date.now(),
+        isIntermediateStep: true,
       };
       if (this._historyStore?.appendMessage) {
         await this._historyStore.appendMessage(retryNotice);
@@ -4061,6 +4101,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
                   ? `🔄 Terminal command \`${command}\` timed out after 120s. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`
                   : `🔄 Terminal command \`${command}\` failed with exit code ${result.exitCode}. Initiating self-healing retry (${currentRetryCount + 1}/${MAX_TERMINAL_RETRIES})...`,
                 timestamp: Date.now(),
+                isIntermediateStep: true,
               };
               if (this._historyStore?.appendMessage) {
                 await this._historyStore.appendMessage(retryNotice);
@@ -4242,15 +4283,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     }
 
     // 5. Autonomous Conversational Stall Recovery:
-    // Only engage if an active multi-step implementation plan is underway AND edits or commands were expected.
-    // NEVER engage for questions, status checks, or when no plan exists or no files were modified.
-    // Check if the model's message indicates completion or status check
+    // Only engage if an active multi-step implementation plan is underway AND has pending checklist items.
+    // NEVER engage when all plan items are done, or when the model states the work is complete.
     const isExplicitlyComplete =
-      /\b(task is complete|check is complete|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree)\b/i.test(content);
+      /\b(all plan items are complete|all tasks are complete|task is complete|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i.test(content);
 
     if (
       isExecutionActive &&
-      activePlanExists &&
+      hasPendingPlanItems &&
       !isExplicitlyComplete &&
       successfullyEditedFiles.length === 0 &&
       successfulCommands.length === 0 &&

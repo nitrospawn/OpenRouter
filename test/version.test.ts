@@ -14,7 +14,7 @@ test('Version Consistency: EXTENSION_VERSION matches package.json and version.md
     pkg.version,
     `src/version.ts (${EXTENSION_VERSION}) must match package.json version (${pkg.version})`
   );
-  assert.strictEqual(EXTENSION_VERSION, '0.5.6');
+  assert.strictEqual(EXTENSION_VERSION, '0.5.8');
 
   const versionMdPath = path.resolve(__dirname, '../../version.md');
   const versionMd = fs.readFileSync(versionMdPath, 'utf8');

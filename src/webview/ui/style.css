@@ -2448,6 +2448,30 @@ body:not(.reviewer-enabled) .btn-review-selection {
   color: #e3b341;
 }
 
+.combobox-item-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.combobox-item-price {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--vscode-descriptionForeground, #9da5b4);
+  white-space: nowrap;
+}
+
+.combobox-item-price.free {
+  background: rgba(46, 160, 67, 0.2);
+  color: #7ee787;
+  font-weight: 600;
+}
+
 /* In-Chat Stream Error Card & Single-Line Auto-Retry */
 .stream-error-card {
   margin-top: 8px;
@@ -3612,5 +3636,10 @@ body:not(.reviewer-enabled) .btn-review-selection {
 
 .intermediate-turn-drawer-body .message {
   margin: 2px 0;
+}
+
+.intermediate-turn-drawer-body .message.auto-retry-message {
+  margin: 4px 0 !important;
+  border-radius: 6px;
 }
 

@@ -40,4 +40,48 @@ export class PricingCalculator {
     }
     return `$${cost.toFixed(2)}`;
   }
+
+  /**
+   * Formats a single per-token rate string into dollars per million tokens ($/M).
+   */
+  public static formatRatePerMillion(rateStr?: string): string {
+    const num = parseFloat(rateStr || '0') || 0;
+    if (num === 0) return '$0';
+    const perMillion = num * 1_000_000;
+    if (perMillion >= 100) {
+      return `$${Math.round(perMillion)}`;
+    }
+    if (perMillion >= 1) {
+      return `$${parseFloat(perMillion.toFixed(2))}`;
+    }
+    if (perMillion >= 0.01) {
+      return `$${parseFloat(perMillion.toFixed(3))}`;
+    }
+    return `$${parseFloat(perMillion.toFixed(4))}`;
+  }
+
+  /**
+   * Formats a model's prompt and completion rates into standard Input / Output /M badge label.
+   */
+  public static formatModelPricing(pricing?: ModelPricing): { label: string; isFree: boolean; tooltip: string } | null {
+    if (!pricing) return null;
+    const pRate = parseFloat(pricing.prompt || '0') || 0;
+    const cRate = parseFloat(pricing.completion || '0') || 0;
+
+    if (pRate === 0 && cRate === 0) {
+      return {
+        label: 'Free',
+        isFree: true,
+        tooltip: 'Free model ($0 / 1M tokens)',
+      };
+    }
+
+    const pPerM = PricingCalculator.formatRatePerMillion(pricing.prompt);
+    const cPerM = PricingCalculator.formatRatePerMillion(pricing.completion);
+    const label = `${pPerM} / ${cPerM} /M`;
+    const tooltip = `Input: ${pPerM} / 1M tokens • Output: ${cPerM} / 1M tokens`;
+
+    return { label, isFree: false, tooltip };
+  }
 }
+

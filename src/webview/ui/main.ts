@@ -6,6 +6,7 @@ import { shouldSwitchDirectToReviewer, setReviewerButtonActivity, preserveStream
 import { AttachedFileRef } from '../messages';
 import { SmartScrollController } from './smartScroll';
 import { isReadOnly } from '../../terminal/commandClassifier';
+import { PricingCalculator } from '../../api/pricing';
 // Declared VS Code Webview API
 declare function acquireVsCodeApi(): {
   postMessage(message: any): void;
@@ -1024,10 +1025,24 @@ interface ModelOption {
   id: string;
   name: string;
   context_length?: number;
+  pricing?: {
+    prompt?: string;
+    completion?: string;
+    request?: string;
+    image?: string;
+  };
   supports_zdr?: boolean;
   supports_reasoning_effort?: boolean;
   supported_reasoning_efforts?: string[];
   supports_vision?: boolean;
+}
+
+export function formatRatePerMillion(rateStr?: string): string {
+  return PricingCalculator.formatRatePerMillion(rateStr);
+}
+
+export function formatModelPricing(pricing?: ModelOption['pricing']): { label: string; isFree: boolean; tooltip: string } | null {
+  return PricingCalculator.formatModelPricing(pricing);
 }
 
 interface ProposedEditData {
@@ -1115,14 +1130,29 @@ function filterAndRenderModels(filter: string) {
     title.textContent = model.name || model.id;
     titleRow.appendChild(title);
 
+    const badgesContainer = document.createElement('div');
+    badgesContainer.className = 'combobox-item-badges';
+
+    // Show pricing badge (Input / Output /M)
+    const priceInfo = formatModelPricing(model.pricing);
+    if (priceInfo) {
+      const priceBadge = document.createElement('span');
+      priceBadge.className = 'combobox-item-price' + (priceInfo.isFree ? ' free' : '');
+      priceBadge.textContent = priceInfo.label;
+      priceBadge.title = priceInfo.tooltip;
+      badgesContainer.appendChild(priceBadge);
+    }
+
     // Show ZDR badge only for compliant models; do not show May Train warning badge
     if (model.supports_zdr !== false) {
       const zdrBadge = document.createElement('span');
       zdrBadge.className = 'combobox-item-zdr ok';
       zdrBadge.textContent = '🛡️ ZDR';
       zdrBadge.title = 'Zero Data Retention / No Training';
-      titleRow.appendChild(zdrBadge);
+      badgesContainer.appendChild(zdrBadge);
     }
+
+    titleRow.appendChild(badgesContainer);
 
     const meta = document.createElement('div');
     meta.className = 'combobox-item-meta';
@@ -1197,14 +1227,29 @@ function filterAndRenderReviewerModels(filter: string) {
     title.textContent = model.name || model.id;
     titleRow.appendChild(title);
 
+    const badgesContainer = document.createElement('div');
+    badgesContainer.className = 'combobox-item-badges';
+
+    // Show pricing badge (Input / Output /M)
+    const priceInfo = formatModelPricing(model.pricing);
+    if (priceInfo) {
+      const priceBadge = document.createElement('span');
+      priceBadge.className = 'combobox-item-price' + (priceInfo.isFree ? ' free' : '');
+      priceBadge.textContent = priceInfo.label;
+      priceBadge.title = priceInfo.tooltip;
+      badgesContainer.appendChild(priceBadge);
+    }
+
     // Show ZDR badge only for compliant models; do not show May Train warning badge
     if (model.supports_zdr !== false) {
       const zdrBadge = document.createElement('span');
       zdrBadge.className = 'combobox-item-zdr ok';
       zdrBadge.textContent = '🛡️ ZDR';
       zdrBadge.title = 'Zero Data Retention / No Training';
-      titleRow.appendChild(zdrBadge);
+      badgesContainer.appendChild(zdrBadge);
     }
+
+    titleRow.appendChild(badgesContainer);
 
     const meta = document.createElement('div');
     meta.className = 'combobox-item-meta';
@@ -2695,10 +2740,7 @@ function parseAndRenderActions(content: string, parentEl: HTMLDivElement | null,
     }
   }
 
-  // 3. Detect Task Summary sections (e.g. "### Summary of changes", "**Task Summary:**", "### Task Summary", etc.)
-  if (!parentEl.querySelector('.task-summary-card')) {
-    renderTaskSummaryCard(content, parentEl);
-  }
+
 
   // 4. Render interactive Retry Button if response indicates empty completion or provider failure
   if (content.includes('⚠️ The model returned an empty response') && !parentEl.querySelector('.empty-response-banner')) {
@@ -2826,7 +2868,7 @@ export function getOrCreateIntermediateDrawer(targetChild?: HTMLElement | null):
   const allChildren = Array.from(messagesContainer.children) as HTMLElement[];
   let lastUserIdx = -1;
   for (let i = allChildren.length - 1; i >= 0; i--) {
-    if (allChildren[i].classList?.contains('user')) {
+    if (allChildren[i].classList?.contains('user') && !allChildren[i].classList?.contains('auto-retry-message')) {
       lastUserIdx = i;
       break;
     }
@@ -2894,18 +2936,24 @@ export function updateIntermediateDrawerSummary(drawer: HTMLDetailsElement) {
   const childMessages = Array.from(bodyEl.querySelectorAll<HTMLElement>('.message'));
   const assistantSteps = childMessages.filter((m) => m.classList.contains('assistant')).length;
   const terminalItems = Array.from(bodyEl.querySelectorAll('.terminal-run-summary, .terminal-run-item, .terminal-card')).length;
+  const autoHealingItems = Array.from(bodyEl.querySelectorAll('.auto-retry-message')).length;
 
   let text = '';
+  const healingNote = autoHealingItems > 0 ? `, ${autoHealingItems} auto-healing` : '';
   if (assistantSteps > 0 && terminalItems > 0) {
     const stepWord = assistantSteps === 1 ? 'step' : 'steps';
     const cmdWord = terminalItems === 1 ? 'terminal command' : 'terminal commands';
-    text = `${assistantSteps} execution ${stepWord} (${terminalItems} ${cmdWord})`;
+    text = `${assistantSteps} execution ${stepWord} (${terminalItems} ${cmdWord}${healingNote})`;
   } else if (assistantSteps > 0) {
     const stepWord = assistantSteps === 1 ? 'step' : 'steps';
-    text = `${assistantSteps} execution ${stepWord} completed`;
+    const healingSuffix = autoHealingItems > 0 ? ` (${autoHealingItems} auto-healing)` : ' completed';
+    text = `${assistantSteps} execution ${stepWord}${healingSuffix}`;
   } else if (terminalItems > 0) {
     const cmdWord = terminalItems === 1 ? 'command' : 'commands';
-    text = `${terminalItems} terminal ${cmdWord} executed`;
+    const healingSuffix = autoHealingItems > 0 ? ` (${autoHealingItems} auto-healing)` : '';
+    text = `${terminalItems} terminal ${cmdWord} executed${healingSuffix}`;
+  } else if (autoHealingItems > 0) {
+    text = `${autoHealingItems} auto-healing ${autoHealingItems === 1 ? 'diagnosis' : 'diagnoses'}`;
   } else {
     text = `${childMessages.length} intermediate execution items`;
   }
@@ -4533,7 +4581,7 @@ export function appendMessage(
     ? `message ${role} editor-message`
     : `message ${role}`;
   msgEl.dataset.rawContent = content;
-  if (isIntermediateStep) {
+  if (isIntermediateStep || isAutoRetry) {
     msgEl.dataset.isIntermediate = 'true';
   }
   if (messageId) {
@@ -4881,6 +4929,7 @@ export function appendMessage(
 
   const shouldPlaceInDrawer = Boolean(
     isIntermediateStep ||
+    isAutoRetry ||
     (role === 'system' && isTerminalCard) ||
     (role === 'system' && (content.includes('terminal-run-summary') || content.includes('Ran in terminal')))
   );
@@ -7186,7 +7235,28 @@ function filterAndRenderReviewerPanelModels(query: string) {
   filtered.slice(0, 40).forEach((m) => {
     const item = document.createElement('div');
     item.className = `combobox-item ${m.id === activeReviewerModelId ? 'selected' : ''}`;
-    item.textContent = m.name || m.id;
+
+    const titleRow = document.createElement('div');
+    titleRow.style.display = 'flex';
+    titleRow.style.alignItems = 'center';
+    titleRow.style.justifyContent = 'space-between';
+
+    const title = document.createElement('div');
+    title.className = 'combobox-item-title';
+    title.textContent = m.name || m.id;
+    titleRow.appendChild(title);
+
+    const priceInfo = formatModelPricing(m.pricing);
+    if (priceInfo) {
+      const priceBadge = document.createElement('span');
+      priceBadge.className = 'combobox-item-price' + (priceInfo.isFree ? ' free' : '');
+      priceBadge.textContent = priceInfo.label;
+      priceBadge.title = priceInfo.tooltip;
+      titleRow.appendChild(priceBadge);
+    }
+
+    item.appendChild(titleRow);
+
     item.addEventListener('click', () => {
       activeReviewerModelId = m.id;
       if (reviewerPanelModelInput) reviewerPanelModelInput.value = m.name || m.id;

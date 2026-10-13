@@ -50,6 +50,7 @@ async function run() {
       'test/notificationSound.test.ts',
       'test/sendToReviewer.test.ts',
       'test/walkthroughDedup.test.ts',
+      'test/pricingFormat.test.ts',
     ],
     bundle: true,
     outdir: 'dist/test',
@@ -110,6 +111,7 @@ async function run() {
       'dist/test/notificationSound.test.js',
       'dist/test/sendToReviewer.test.js',
       'dist/test/walkthroughDedup.test.js',
+      'dist/test/pricingFormat.test.js',
     ],
     {
       stdio: 'inherit',

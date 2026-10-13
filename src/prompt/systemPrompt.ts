@@ -53,6 +53,8 @@ export interface SystemPromptContext {
   reasoningEffort?: 'low' | 'medium' | 'high';
   recentActivities?: string;
   activePlanAnchor?: string;
+  promptTier?: 'conversational' | 'editing' | 'executing';
+  hasCurrentProblemsToken?: boolean;
 }
 
 export function buildSystemPrompt(context: SystemPromptContext = {}): string {
@@ -64,6 +66,10 @@ export function buildSystemPrompt(context: SystemPromptContext = {}): string {
     ? (process.env.ComSpec ? path.basename(process.env.ComSpec) : 'cmd.exe')
     : (process.env.SHELL ? path.basename(process.env.SHELL) : 'bash');
   const shell = context.environment?.shell || defaultShell;
+
+  const tier = context.promptTier ?? 'editing';
+  const isConversational = tier === 'conversational';
+  const isExecuting = tier === 'executing';
 
   let prompt = `You are an expert AI software engineer embedded directly inside VS Code.
 
@@ -78,7 +84,7 @@ SECTION 1 — WHO YOU ARE & HOW YOU SPEAK
 - When asked what happened in this session or past work in this workspace (e.g. "what did we do last?", "did you edit that file?"):
   1. Check the conversation history first.
   2. If the user asks about prior work, past sessions, or what was done previously, consult the recent_workspace_activities section injected into this prompt. Summarize what was accomplished from those recorded activities rather than claiming no memory.
-- When you finish a simple task with no walkthrough block, end with one brief plain-text sentence saying what was done.
+- When you finish an edit or task without a walkthrough block, conclude with a concise "### Summary of changes" or "### Task Summary" section summarizing what was changed, key decisions, and next steps so the user has an immediate, clear overview.
 - Copy-Intended Content & Code Block Fencing: Any content the user should copy (code, commands, configs, file paths) MUST be inside a dedicated fenced code block with the correct language tag (e.g. \`\`\`typescript, \`\`\`bash, \`\`\`json). NEVER embed copy-intended multi-line or distinct snippets directly inside a conversational prose paragraph.
 
 ======================================================================
@@ -97,7 +103,8 @@ SECTION 2 — REASONING EFFORT
     prompt += `Use balanced effort — thorough but concise.\n`;
   }
 
-  prompt += `
+  if (!isConversational) {
+    prompt += `
 ======================================================================
 SECTION 3 — HOW CONTEXT REACHES YOU (READ THIS CAREFULLY)
 ======================================================================
@@ -185,7 +192,10 @@ This extension automatically masks secrets before sending context to you. Masked
 - Never try to guess, reconstruct, or complete a redacted value.
 - Never paste a redacted placeholder into generated code.
 - If the real value is needed, tell the user it was masked and ask them to supply it via a .env file.
+`;
+  }
 
+  prompt += `
 ======================================================================
 SECTION 5 — OPERATING SYSTEM & SHELL
 ======================================================================
@@ -224,7 +234,10 @@ SECTION 7 — STEP 1: UNDERSTAND THE REQUEST
 - If the location is unclear, check the workspace file list and open editor context before asking anything.
 - Only ask a clarifying question if you have genuinely tried and failed to resolve ambiguity from the available context.
 - When you do ask, give concrete options in plain language: "I found two candidate files — login.ts and signup.ts. Which one did you mean?"
+`;
 
+  if (!isConversational) {
+    prompt += `
 ======================================================================
 SECTION 8 — STEP 2: WHEN TO PLAN VS. WHEN TO ACT DIRECTLY
 ======================================================================
@@ -442,7 +455,11 @@ WALKTHROUGH RULES:
    - C# / .NET: \`dotnet test\`, \`dotnet build /p:EmitCompilerGeneratedFiles=false\`
 2. NEVER run heavy production bundling, release packaging, or binary generation (e.g. \`flutter build apk\`, \`docker build\`, \`assembleRelease\`, \`electron-builder\`, \`pyinstaller\`) as a verification step, unless the user explicitly requested building a release binary/package. Heavy builds waste minutes, slow down the system, and are not required for code correctness checks.
 3. Synchronous execution only: NEVER detach verification into background processes (\`Start-Process\`, \`nohup\`, \`&\`, \`screen\`) or redirect to a background log file. All verification commands must run synchronously in the terminal so exit code 0 or compiler errors are directly captured.
+`;
+  }
 
+  if (isExecuting) {
+    prompt += `
 ======================================================================
 SECTION 10B — TERMINAL FAILURE RECOVERY (READ THIS ON EVERY FAILED COMMAND)
 ======================================================================
@@ -595,7 +612,11 @@ ABSOLUTE RULES — apply to every failure regardless of category
 ✓ ALWAYS change strategy between attempts.
 ✓ ALWAYS show the user what you are doing and why.
 ✓ ALWAYS end in a state where the user knows what happened and what comes next.
+`;
+  }
 
+  if (context.hasCurrentProblemsToken) {
+    prompt += `
 ======================================================================
 SECTION 11 — DIAGNOSTICS (@current_problems / @all_problems)
 ======================================================================
@@ -606,7 +627,11 @@ When the user's message contains a VS Code diagnostics list from @current_proble
 - Do not ask for code — it is already in the context. If a specific file is missing, ask the user to open it.
 - After all fixes, summarise: how many diagnostics were addressed, root causes found, items needing manual attention.
 - @current_problems = active file only. @all_problems = entire workspace.
+`;
+  }
 
+  if (isExecuting) {
+    prompt += `
 ======================================================================
 SECTION 12 — WORKSPACE ANALYSIS FOR MULTI-FILE TASKS
 ======================================================================
@@ -621,6 +646,7 @@ When the task involves multiple files, reviewer feedback, or cross-file changes:
 4. NEVER pause and ask the user to open files. Read them yourself first.
 5. Form your plan or edits based on what you actually read from the codebase.
 `;
+  }
 
   if (context.activeFile) {
     const af = context.activeFile;
@@ -749,7 +775,8 @@ CRITICAL INSTRUCTION: You are actively executing the plan above. Focus STRICTLY 
 `;
   }
 
-  prompt += `
+  if (!isConversational) {
+    prompt += `
 ======================================================================
 QUICK REFERENCE — DECISION TREE (use this when unsure what to do)
 ======================================================================
@@ -785,7 +812,10 @@ ${isWindows
       : `     sed -n '1,100p' file.md
      sed -n '101,200p' file.md  (next chunk)
      NEVER use \`cat\` alone — truncates silently at ~3,000 characters.`}
+`;
+  }
 
+  prompt += `
 ======================================================================
 Respond helpfully, directly, and concisely.
 `;

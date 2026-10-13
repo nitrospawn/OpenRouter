@@ -2,7 +2,7 @@
   "name": "openrouter",
   "displayName": "OpenRouter",
   "description": "VS Code extension connecting to OpenRouter for flexible model choice, in-editor assistance, and transparent cost tracking.",
-  "version": "0.5.6",
+  "version": "0.5.8",
   "publisher": "qubators",
   "engines": {
     "vscode": "^1.85.0"

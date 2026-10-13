@@ -42,3 +42,25 @@ test('extractFileMentions: limits output to maximum 5 candidates', () => {
   assert.strictEqual(result.length, 5);
   assert.deepStrictEqual(result, ['f1.ts', 'f2.ts', 'f3.ts', 'f4.ts', 'f5.ts']);
 });
+
+test('extractFileMentions: conversational tier suppresses bare filenames and intent patterns', () => {
+  // Bare filenames like express.ts or intent patterns like "copy foo.ts" should be ignored on conversational tier
+  const bareMsg = 'I want something similar to express.ts and copy foo.ts';
+  const conversationalResult = extractFileMentions(bareMsg, 'conversational');
+  assert.deepStrictEqual(conversationalResult, []);
+
+  // Explicit @ mentions and quoted filenames should still be extracted on conversational tier
+  const explicitMsg = 'What does @src/index.ts and "PRD.md" do? Also express.ts';
+  const explicitResult = extractFileMentions(explicitMsg, 'conversational');
+  assert.deepStrictEqual(explicitResult, ['src/index.ts', 'PRD.md']);
+
+  // Editing and executing tiers still extract bare filenames and intent patterns
+  const editingResult = extractFileMentions(bareMsg, 'editing');
+  assert.ok(editingResult.includes('express.ts'));
+  assert.ok(editingResult.includes('foo.ts'));
+
+  const executingResult = extractFileMentions(bareMsg, 'executing');
+  assert.ok(executingResult.includes('express.ts'));
+  assert.ok(executingResult.includes('foo.ts'));
+});
+
