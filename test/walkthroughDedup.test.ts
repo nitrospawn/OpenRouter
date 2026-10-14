@@ -121,3 +121,29 @@ test('Walkthrough Guard: main.ts suppresses walkthrough cards on intermediate st
     'main.ts must enforce at most one walkthrough card per task turn'
   );
 });
+
+test('Walkthrough Guard: panelProvider.ts avoids re-prompt loop on intentional plan-gated suppression and explicit completion', () => {
+  const providerPath = path.resolve(__dirname, '../../src/webview/panelProvider.ts');
+  const providerContent = fs.readFileSync(providerPath, 'utf8');
+
+  // Verify isVerificationFailure is tracked and distinguishes plan-gated / duplicate suppressions
+  assert.ok(
+    providerContent.includes('let isVerificationFailure = false;'),
+    'panelProvider.ts must track isVerificationFailure'
+  );
+  assert.ok(
+    providerContent.includes('isVerificationFailure = false;'),
+    'panelProvider.ts must set isVerificationFailure to false for plan-gated and duplicate suppressions'
+  );
+
+  // Verify Premature Walkthrough Auto-Correction requires isVerificationFailure and !isContentComplete
+  assert.ok(
+    providerContent.includes('if (!triggeredFollowUp && isVerificationFailure && prematureWalkthroughReason && !isContentComplete'),
+    'Premature walkthrough auto-correction must guard against re-prompting when isVerificationFailure is false or content is complete'
+  );
+
+  // Verify isContentComplete matches "all plan items are complete and verified"
+  const sampleSummary = 'All plan items are complete and verified — no further steps pending.';
+  const regex = /\b(all plan items are complete|all work is complete|implementation is complete|everything is complete|all tasks are complete|task is complete|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i;
+  assert.ok(regex.test(sampleSummary), 'Completion regex must match complete and verified assistant summary');
+});

@@ -4,6 +4,35 @@ All notable changes, bug fixes, architectural enhancements, and operational upda
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.9] - 2026-10-14
+
+### Fixed
+- **Premature Walkthrough Auto-Correction Re-Prompt Loop (8-Turn Execution Drawer Loop):**
+  - Resolved bug where discarding a walkthrough for plan-gated suppression (Check 5: no implementation plan created) or duplicate suppression (Check 4) triggered the *Premature Walkthrough Auto-Correction* loop, repeatedly re-prompting the model with *"You emitted a walkthrough block before the task was fully verified..."* until the auto-followup turn limit was reached.
+  - Added `isVerificationFailure` distinction in `panelProvider.ts` to separate genuine verification failures (Check 1, Check 2, Check 3) from intentional suppression rules (Check 4 duplicate, Check 5 plan-gated), ensuring that suppressed walkthroughs end the task cleanly without re-prompting.
+  - Added explicit completion regex protection (`isContentComplete`) to the Premature Walkthrough Auto-Correction guard so that when a model outputs a complete, verified executive summary (e.g. *"All plan items are complete and verified — no further steps pending"*), the turn concludes immediately and renders the final summary without generating redundant intermediate walkthrough turns.
+  - Expanded `isExplicitlyComplete` in Autonomous Conversational Stall Recovery to recognize `all work is complete`, `implementation is complete`, `everything is complete`, `no further steps`, `no pending steps`, and `no pending checklist items`.
+- **Post-Plan Walkthrough & Autonomous Continuation Loop Elimination (Token Burn Fix):**
+  - Resolved severe issue where models (e.g., GLM 5.3 Flash, Claude Sonnet) produced 8+ walkthroughs and repeated follow-ups after finishing an active plan, burning tokens in an endless execution loop.
+  - **Scoped Plan Item Checks to Current Task:** Scoped `hasPendingPlanItems` to evaluate only messages *after the latest user prompt* (`taskScopeHistory`), preventing stale `- [ ]` checklist items from earlier conversations in history from artificially activating the elevated 30-turn automated cap (`MAX_AUTO_FOLLOWUPS`).
+  - **Walkthrough-in-History Loop Breakers:** Added `walkthroughInHistory` checks in `panelProvider.ts` for both Autonomous File-Edit Continuation (Section 4) and Conversational Stall Recovery (Section 5). Once a walkthrough document has been generated and recorded for the active task, auto-followups immediately halt, preventing the system from continuously re-injecting *"emit the final \`\`\`\`walkthrough block"* prompts when the model responds with prose summaries.
+- **Repetitive Fix Explanation on User Acknowledgments:**
+  - Resolved an issue where replying with an acknowledgment or confirmation (e.g. *"its fine now thank you"*, *"that fixed it"*, *"works now"*) caused the model to re-output the entire 3-part technical briefing (Root Cause, What Was Fixed, Verification & How to Test) from the preceding turn.
+  - Updated Section 1 in `systemPrompt.ts` to explicitly distinguish active bug-fixing turns from user acknowledgments, instructing models to respond conversationally and concisely without re-dumping past technical briefings when no new work was requested.
+- **Simultaneous Plan Docs and Results Docs Artifact Cards:**
+  - Resolved an issue where a final task response rendered both `[📄 Plan docs  ✓ Proceed]` and `[📄 Results docs  👁 View]` cards when models repeated plan blocks alongside the final walkthrough block.
+  - Added an artifact exclusivity guard in `responseParser.ts` to suppress `planDocument` and strip residual `📄 Plan docs ready` tokens whenever a completion `walkthroughDocument` is present.
+  - Added a backend confirmation cleanup in `panelProvider.ts` to ensure confirmed walkthrough completions completely reset any residual `planDocument`.
+  - Added a UI-level rendering guard in `main.ts` so that messages containing Results docs notices or cards automatically suppress Plan docs cards.
+
+### Added
+- **Plan-Gated Results Docs / Walkthrough Generation:**
+  - Added strict gating across `systemPrompt.ts` (Section 10) and `panelProvider.ts` (Check 5) to ensure `walkthroughDocument` and `Results docs` cards are ONLY generated if an implementation plan was created for the task, or if the user explicitly requested a walkthrough / results docs.
+  - For direct bug fixes, single-file edits, or unplanned tasks, models now present a comprehensive, structured in-chat explanation (root cause, concrete files and methods modified, and verification steps & how to test) without generating an unnecessary results document modal.
+- **Rich, Factual Standalone Summaries (Plan Docs & Results Docs):**
+  - Upgraded Section 8 (Implementation Plan) in `systemPrompt.ts` to require a self-contained, fact-filled Executive Summary directly in chat (architecture overview, explicit list of files & key symbols to modify/create, and verification command plan).
+  - Upgraded Section 10 (Results Walkthrough) in `systemPrompt.ts` to require a comprehensive factual briefing (root cause & solution summary, exact file paths and classes/functions changed, and concrete verification outputs like exit codes and pass counts). Users no longer need to open the document viewer to understand the full context.
+
 ## [0.5.8] - 2026-10-13
 
 ### Added

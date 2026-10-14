@@ -2248,22 +2248,26 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    // Detect purely conversational closure or acknowledgment from user (e.g. "thanks", "its fine now thank you", "works now")
+    const isPureClosure = /^(?:thanks?(?:\s+you)?|thank\s+you|it(?:'s|s| is)\s+(?:fine|working|fixed|good)(?:\s+(?:now|already))?(?:\s+(?:thanks?|thank\s+you))?|works\s+now|all\s+good|perfect|ok|okay)[!.]*$/i.test(processedContent.trim());
+
     // Derive prompt tier for token-efficient system prompt injection
-    const isExecutingTier = Boolean(
+    const isExecutingTier = !isPureClosure && Boolean(
       retryContext?.isAutoFollowUp ||
       (retryContext?.retryCount ?? 0) > 0 ||
       activePlanAnchor
     );
 
     const applyEditPerm = this._permissionManager.getPermission('applyEdit');
-    const hasEditIntent = (
+    const hasEditIntent = !isPureClosure && (
       /```(?:edit_file|create_file|file|create|edit|patch)/i.test(processedContent) ||
       /\b(edit|fix|update|modify|refactor|create|write|delete|remove|implement|add|replace|patch|change|rename)\b/i.test(processedContent)
     );
     const isEditingTier = !isExecutingTier && applyEditPerm !== 'deny' && hasEditIntent;
 
     const promptTier: 'conversational' | 'editing' | 'executing' =
-      isExecutingTier ? 'executing'
+      isPureClosure ? 'conversational'
+      : isExecutingTier ? 'executing'
       : isEditingTier ? 'editing'
       : 'conversational';
 
@@ -2770,7 +2774,8 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         }
 
         // Extract two-tier artifacts (plan / walkthrough) from the raw model response
-        const { planDocument, walkthroughDocument: rawWalkthroughDocument, chatSummary: rawChatSummary } = extractArtifacts(finalContent);
+        const { planDocument: rawPlanDocument, walkthroughDocument: rawWalkthroughDocument, chatSummary: rawChatSummary } = extractArtifacts(finalContent);
+        let planDocument = rawPlanDocument;
         let chatSummary = rawChatSummary;
 
         // Premature & Multiple Walkthrough Guard:
@@ -2779,8 +2784,10 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
         // 2. An active implementation plan exists and still has uncompleted checklist items (- [ ]).
         // 3. No non-read-only verification command has succeeded with exit code 0 for this task in Recent Terminal Outputs.
         // 4. A walkthrough document already exists for this active task session (strictly ONE walkthrough per task).
+        // 5. Plan-gated walkthrough suppression: No plan was created for this task.
         let walkthroughDocument = rawWalkthroughDocument;
         let prematureWalkthroughReason: string | undefined;
+        let isVerificationFailure = false;
 
         if (walkthroughDocument) {
           // Check 1: Pending edits or terminal commands in the same response
@@ -2788,6 +2795,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           const hasPendingCommands = /(?:```|````)(?:bash|sh|shell|cmd|powershell|pwsh)\b/i.test(finalContent);
           if (hasPendingEdits || hasPendingCommands) {
             prematureWalkthroughReason = 'The response contains pending file edits or terminal commands that have not yet executed or completed.';
+            isVerificationFailure = true;
           }
 
           // Check 2: Active plan with unchecked items
@@ -2808,6 +2816,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             const hasUncheckedItems = /^\s*-\s*\[ \]/m.test(activePlanContent);
             if (hasUncheckedItems) {
               prematureWalkthroughReason = 'There are uncompleted checklist items (- [ ]) remaining in the active implementation plan.';
+              isVerificationFailure = true;
             }
           }
 
@@ -2834,10 +2843,12 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             );
             if (!hasVerifiedExitZero) {
               prematureWalkthroughReason = 'No non-read-only verification command (test runner, build, lint, or compiler) has physically executed and returned exit code 0 for this task in Recent Terminal Outputs.';
+              isVerificationFailure = true;
             }
           }
 
           // Check 4: Exactly ONE walkthrough per task session (prevent generating multiple walkthroughs)
+          // NOTE: This is an intentional duplicate suppression, NOT a verification failure!
           if (!prematureWalkthroughReason && this._historyStore) {
             try {
               const hist = await this._historyStore.loadHistory();
@@ -2852,6 +2863,39 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
               const existingWalkthroughMsg = subsequentMessages.find((m) => m.walkthroughDocument);
               if (existingWalkthroughMsg) {
                 prematureWalkthroughReason = `A walkthrough document already exists for this task (${existingWalkthroughMsg.id}). Only one walkthrough document is allowed per task.`;
+                isVerificationFailure = false;
+              }
+            } catch {
+              // non-fatal
+            }
+          }
+
+          // Check 5: Plan-Gated Walkthrough — do not create Results docs if no implementation plan existed for this task
+          // unless the user explicitly requested a walkthrough / results docs.
+          // NOTE: This is an intentional suppression, NOT a verification failure! Do NOT auto-re-prompt the model!
+          if (!prematureWalkthroughReason && this._historyStore) {
+            try {
+              const hist = await this._historyStore.loadHistory();
+              let lastUserIdx = -1;
+              for (let i = hist.length - 1; i >= 0; i--) {
+                if (hist[i].role === 'user') {
+                  lastUserIdx = i;
+                  break;
+                }
+              }
+              const lastUserPrompt = lastUserIdx >= 0 ? (hist[lastUserIdx]?.content || '') : '';
+              const userExplicitlyRequestedWalkthrough = /\b(walkthrough|results?\s+docs?|result\s+doc)\b/i.test(lastUserPrompt);
+
+              if (!userExplicitlyRequestedWalkthrough) {
+                // Check if any plan was created for this active task
+                const taskMessages = lastUserIdx >= 0 ? hist.slice(lastUserIdx) : hist;
+                const hadPlanInTask = taskMessages.some(
+                  (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+                );
+                if (!hadPlanInTask) {
+                  prematureWalkthroughReason = 'No implementation plan was created for this task. Results docs are only created for planned tasks or when explicitly requested by the user.';
+                  isVerificationFailure = false;
+                }
               }
             } catch {
               // non-fatal
@@ -2864,6 +2908,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             // Clean up chatSummary so it NEVER has "📄 Results docs ready — [view]" when discarded
             chatSummary = chatSummary
               .replace(/📄\s*(?:Results docs ready|Results docs|Walkthrough result|Walkthrough ready|Result walkthrough)\s*(?:[—–-]\s*\[view\])?/gi, '')
+              .trim();
+          } else {
+            // Task is confirmed complete with a valid walkthrough document.
+            // Ensure no leftover planDocument or Plan docs notice accompanies the final result.
+            planDocument = undefined;
+            chatSummary = chatSummary
+              .replace(/📄\s*(?:Plan docs ready|Plan docs|Implementation plan ready|Plan ready)\s*(?:[—–-]\s*\[view\])?/gi, '')
+              .replace(/[ \t]+\n/g, '\n')
+              .replace(/\n{3,}/g, '\n\n')
               .trim();
           }
         }
@@ -3070,9 +3123,15 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             );
 
             // Premature Walkthrough Auto-Correction:
-            // If the model produced a premature walkthrough that was discarded, and auto-execution
-            // did not trigger another action (like running a command or handling errors), prompt the model to verify.
-            if (!triggeredFollowUp && prematureWalkthroughReason && !this._isUserCancelled && !this._activeAbortController?.signal.aborted) {
+            // If the model produced a premature walkthrough due to a real verification failure (e.g. pending edits,
+            // uncompleted plan checklist items, or unverified exit code 0), and auto-execution did not trigger
+            // another action, prompt the model to verify.
+            // NOTE: If the walkthrough was suppressed because of plan-gating (no plan created) or duplicate
+            // suppression, or if the model's summary explicitly states all work is complete, NEVER trigger an auto-followup!
+            const isContentComplete =
+              /\b(all plan items are complete|all work is complete|implementation is complete|everything is complete|all tasks are complete|task is complete|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i.test(accumulatedContent);
+
+            if (!triggeredFollowUp && isVerificationFailure && prematureWalkthroughReason && !isContentComplete && !this._isUserCancelled && !this._activeAbortController?.signal.aborted) {
               const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
               const MAX_AUTO_FOLLOWUPS = (planDocument || retryContext?.isAutoFollowUp) ? 30 : 10;
               if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
@@ -4165,11 +4224,22 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     // If a multi-step plan is active and has pending checklist items, permit continuous execution
     // (up to 30 continuous automated steps) as long as forward progress is occurring.
     // If no plan is active, retain the standard conversational follow-up cap of 10.
-    const hasPendingPlanItems = activePlanExists && historyForPlanCheck.some(m => {
+    // IMPORTANT: Only look at messages AFTER the last user request to avoid false positives
+    // from completed plans in earlier conversations that still contain - [ ] items.
+    const lastUserMsgIdx = (() => {
+      for (let i = historyForPlanCheck.length - 1; i >= 0; i--) {
+        if (historyForPlanCheck[i].role === 'user') return i;
+      }
+      return -1;
+    })();
+    const taskScopeHistory = lastUserMsgIdx >= 0 ? historyForPlanCheck.slice(lastUserMsgIdx) : historyForPlanCheck;
+    const hasPendingPlanItems = activePlanExists && taskScopeHistory.some(m => {
       if (m.role !== 'assistant') return false;
       const text = m.planDocument || m.content;
       return /^\s*-\s*\[ \]/m.test(text);
     });
+    // Also detect if this task already has a valid walkthrough (i.e., task is done)
+    const walkthroughInHistory = taskScopeHistory.some(m => m.role === 'assistant' && m.walkthroughDocument);
     const MAX_AUTO_FOLLOWUPS = hasPendingPlanItems ? 30 : 10;
 
     // 3. Auto-continue conversation with terminal outputs so the model can complete its response
@@ -4249,12 +4319,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     // If file edits were applied, but no terminal commands were run,
     // and no final walkthrough was emitted yet, auto-continue so the model executes the next step without pausing!
     // (Only engage if NOT in 'ask' mode and an active multi-step plan is underway!)
+    // GUARD: If a walkthrough already exists in history for this task, the task is DONE — do NOT continue.
     if (
       !isAskMode &&
       isExecutionActive &&
       successfulCommands.length === 0 &&
       successfullyEditedFiles.length > 0 &&
       !walkthroughDocument &&
+      !walkthroughInHistory &&
       !hasPlan &&
       !hasPlanApprovalQuestion &&
       !this._isUserCancelled &&
@@ -4285,12 +4357,14 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     // 5. Autonomous Conversational Stall Recovery:
     // Only engage if an active multi-step implementation plan is underway AND has pending checklist items.
     // NEVER engage when all plan items are done, or when the model states the work is complete.
+    // GUARD: If a walkthrough already exists in this task session, the task is DONE — stop immediately.
     const isExplicitlyComplete =
-      /\b(all plan items are complete|all tasks are complete|task is complete|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i.test(content);
+      /\b(all plan items are complete|all work is complete|implementation is complete|everything is complete|all tasks are complete|task is complete|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i.test(content);
 
     if (
       isExecutionActive &&
       hasPendingPlanItems &&
+      !walkthroughInHistory &&
       !isExplicitlyComplete &&
       successfullyEditedFiles.length === 0 &&
       successfulCommands.length === 0 &&

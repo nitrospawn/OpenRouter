@@ -187,6 +187,33 @@ test('diagnostics section 11 is injected only when problem token is present', ()
   assert.ok(!withoutProblems.includes('SECTION 11 — DIAGNOSTICS'));
 });
 
+test('systemPrompt: Section 1 distinguishes active code fixes from user acknowledgments and closure', () => {
+  const prompt = buildSystemPrompt({ promptTier: 'conversational' });
+  assert.ok(
+    prompt.includes('Explaining Fixes vs. Responding to Acknowledgments'),
+    'Prompt must contain the distinction between active fixes and acknowledgments'
+  );
+  assert.ok(
+    prompt.includes('DO NOT repeat the previous turn\'s technical briefing'),
+    'Prompt must instruct model not to repeat past briefings on acknowledgments'
+  );
+});
+
+test('conversational closure regex matches user acknowledgment phrases', () => {
+  const isPureClosure = (text: string) =>
+    /^(?:thanks?(?:\s+you)?|thank\s+you|it(?:'s|s| is)\s+(?:fine|working|fixed|good)(?:\s+(?:now|already))?(?:\s+(?:thanks?|thank\s+you))?|works\s+now|all\s+good|perfect|ok|okay)[!.]*$/i.test(text.trim());
+
+  assert.strictEqual(isPureClosure('its fine now thank you'), true);
+  assert.strictEqual(isPureClosure("it's fine now thank you"), true);
+  assert.strictEqual(isPureClosure('thanks!'), true);
+  assert.strictEqual(isPureClosure('thank you'), true);
+  assert.strictEqual(isPureClosure('works now'), true);
+  assert.strictEqual(isPureClosure('it is fixed'), true);
+  assert.strictEqual(isPureClosure('all good'), true);
+  assert.strictEqual(isPureClosure('fix the delete button in note_editor_screen.dart'), false);
+  assert.strictEqual(isPureClosure('why did that happen?'), false);
+});
+
 
 
 

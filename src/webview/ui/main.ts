@@ -4259,6 +4259,17 @@ function renderMarkdownBlocks(text: string, container: HTMLElement) {
         }
       }
 
+      // Mutual exclusivity guard: A completion message with a Results docs card must NEVER also render a Plan docs card
+      if (isPlan) {
+        const rootContainerCheck = (container.closest && container.closest('.message-body')) || container;
+        const hasWalkthroughInMsg =
+          Boolean(rootContainerCheck.querySelector && rootContainerCheck.querySelector('.chat-artifact-card-walkthrough')) ||
+          lines.some((l) => /^📄\s*(?:Results docs ready|Results docs|Walkthrough result|Walkthrough ready|Result walkthrough)\s*(?:[—–-]\[view\])?/i.test(l.trim()));
+        if (hasWalkthroughInMsg) {
+          continue;
+        }
+      }
+
       // Deduplication guard: Never render duplicate artifact cards of the same type in the same message container
       const rootContainer = (container.closest && container.closest('.message-body')) || container;
       const alreadyHasCard = Array.from(

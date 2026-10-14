@@ -296,6 +296,18 @@ export function extractArtifacts(rawContent: string): ExtractedArtifacts {
     chatSummary = chatSummary.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   }
 
+  // Mutual exclusivity guard: If a completion walkthrough / Results docs is present,
+  // this turn is a completion turn. Suppress any extraneous planDocument or plan notices
+  // that a model may have echoed alongside the walkthrough.
+  if (walkthroughDocument) {
+    planDocument = undefined;
+    chatSummary = chatSummary
+      .replace(/📄\s*(?:Plan docs ready|Plan docs|Implementation plan ready|Plan ready)\s*(?:[—–-]\s*\[view\])?/gi, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
   // Check whether the remaining chat summary contains conversational text beyond the artifact notice tokens
   const strippedOfNotices = chatSummary
     .replace(/📄 (?:Plan docs ready|Implementation plan ready) — \[view\]/g, '')
