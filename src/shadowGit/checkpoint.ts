@@ -52,8 +52,7 @@ export class CheckpointManager {
       logger.info('SHADOW_GIT', `Creating checkpoint for ${validFiles.length} file(s): [${validFiles.join(', ')}] — "${description}"`);
 
       // Stage the affected files.
-      // If batch add fails (e.g. one or more files in validFiles are new files being created that
-      // do not exist on disk yet), stage existing files individually so new files don't abort checkpointing.
+      // 1. Standard batch add (fast path for exact matches)
       try {
         await this.shadowRepo.runGit(['add', '--', ...validFiles]);
       } catch {
@@ -62,6 +61,21 @@ export class CheckpointManager {
             await this.shadowRepo.runGit(['add', '--', rel]);
           } catch {
             // Non-existent file on disk (brand new file to be created) — safe to skip pre-staging
+          }
+        }
+      }
+
+      // 2. Case-insensitive staging for pre-existing files on disk.
+      // On Windows/macOS, if the path casing in Git's index differs from validFiles (e.g. Docs/ vs docs/),
+      // git add without :(icase) silently exits 0 without staging the modified file into the index,
+      // which would result in an empty checkpoint that misses preceding turns' edits.
+      for (const rel of validFiles) {
+        const fullPath = path.isAbsolute(rel) ? rel : path.join(workTree, rel);
+        if (fs.existsSync(fullPath)) {
+          try {
+            await this.shadowRepo.runGit(['add', '--', `:(icase)${rel}`]);
+          } catch {
+            // non-fatal
           }
         }
       }

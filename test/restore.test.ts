@@ -15,6 +15,10 @@ class MockShadowRepo {
     return this.workTree;
   }
 
+  public async initialize(): Promise<boolean> {
+    return true;
+  }
+
   public async runGit(args: string[]): Promise<{ stdout: string; stderr: string }> {
     this.executedCommands.push(args);
     if (args[0] === 'diff') {
@@ -438,7 +442,7 @@ test('ScopedRestore: deletes newly created files that did not exist in the check
       mockRepo.executedCommands.push(args);
       if (args[0] === 'checkout') {
         const file = args[args.length - 1];
-        if (file === aiCreatedFile || args.includes(aiCreatedFile)) {
+        if (file === aiCreatedFile || args.includes(aiCreatedFile) || args.some((a) => a.includes(aiCreatedFile))) {
           throw new Error(`error: pathspec '${aiCreatedFile}' did not match any file(s) known to git`);
         }
       }
@@ -451,6 +455,131 @@ test('ScopedRestore: deletes newly created files that did not exist in the check
     assert.strictEqual(result.success, true, 'Restore must succeed when deleting newly created file');
     assert.strictEqual(fs.existsSync(aiCreatedFullPath), false, 'Newly created file must be deleted from disk on undo');
     assert.strictEqual(fs.existsSync(userFullPath), true, 'User file must remain completely untouched on disk');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('ScopedRestore: restores pre-existing file with case mismatch (e.g. docs/future.md vs Docs/future.md) and does NOT delete it', async () => {
+  const os = await import('os');
+  const fs = await import('fs');
+  const path = await import('path');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scoped-restore-casemismatch-test-'));
+  try {
+    const gitKnownPath = 'Docs/future.md';
+    const requestedPath = 'docs/future.md';
+
+    const fullDiskPath = path.join(tempDir, 'Docs', 'future.md');
+    fs.mkdirSync(path.dirname(fullDiskPath), { recursive: true });
+    fs.writeFileSync(fullDiskPath, 'Pre-edit file content');
+
+    const mockRepo = new MockShadowRepo();
+    mockRepo.workTree = tempDir;
+
+    // Simulate Git: exact 'docs/future.md' fails pathspec match, but case-insensitive ':(icase)docs/future.md' succeeds!
+    mockRepo.runGit = async (args: string[]) => {
+      mockRepo.executedCommands.push(args);
+      if (args[0] === 'checkout') {
+        const file = args[args.length - 1];
+        if (file.includes(':(icase)')) {
+          // Case-insensitive checkout succeeds!
+          return { stdout: '', stderr: '' };
+        }
+        if (file === requestedPath || args.includes(requestedPath)) {
+          throw new Error(`error: pathspec '${requestedPath}' did not match any file(s) known to git`);
+        }
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const restore = new ScopedRestore(mockRepo as any);
+    const result = await restore.restore('cp-case-test', [requestedPath], true);
+
+    assert.strictEqual(result.success, true, 'Restore must succeed using case-insensitive fallback');
+    assert.strictEqual(fs.existsSync(fullDiskPath), true, 'Pre-existing file must NEVER be deleted on undo');
+
+    // Verify case-insensitive checkout command was executed
+    const ranIcaseCheckout = mockRepo.executedCommands.some(
+      (cmd) => cmd[0] === 'checkout' && cmd.some((arg) => arg.includes(':(icase)'))
+    );
+    assert.strictEqual(ranIcaseCheckout, true, 'Case-insensitive checkout must be attempted when exact checkout fails');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('Multi-turn undo with case-mismatch preserves preceding turn edits and does not revert to initial state', async () => {
+  const os = await import('os');
+  const fs = await import('fs');
+  const path = await import('path');
+  const { CheckpointManager } = await import('../src/shadowGit/checkpoint');
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shadow-multiturn-test-'));
+  try {
+    const requestedPath = 'docs/future.md';
+    const fullDiskPath = path.join(tempDir, 'Docs', 'future.md');
+    fs.mkdirSync(path.dirname(fullDiskPath), { recursive: true });
+
+    // Initial content before Turn 1
+    fs.writeFileSync(fullDiskPath, 'ORIGINAL_CONTENT\n');
+
+    let stagedFiles: string[] = [];
+    let commits: Array<{ id: string; content: string }> = [
+      { id: 'commit-initial', content: 'ORIGINAL_CONTENT\n' },
+    ];
+
+    const mockRepo = new MockShadowRepo();
+    mockRepo.workTree = tempDir;
+    mockRepo.runGit = async (args: string[]) => {
+      mockRepo.executedCommands.push(args);
+      if (args[0] === 'add') {
+        const fileArg = args[args.length - 1];
+        if (fileArg.includes(':(icase)')) {
+          stagedFiles.push(fileArg);
+        }
+      } else if (args[0] === 'commit') {
+        const newCommitId = `commit-turn-${commits.length}`;
+        const currentContent = fs.readFileSync(fullDiskPath, 'utf8');
+        commits.push({ id: newCommitId, content: stagedFiles.length > 0 ? currentContent : commits[commits.length - 1].content });
+        stagedFiles = [];
+        return { stdout: '', stderr: '' };
+      } else if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
+        return { stdout: commits[commits.length - 1].id, stderr: '' };
+      } else if (args[0] === 'checkout') {
+        const commitId = args[1];
+        const match = commits.find((c) => c.id === commitId);
+        if (match) {
+          fs.writeFileSync(fullDiskPath, match.content);
+        }
+        return { stdout: '', stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    };
+
+    const checkpointMgr = new CheckpointManager(mockRepo as any);
+    const restore = new ScopedRestore(mockRepo as any);
+
+    // Turn 1 applies edit: adds requirement
+    fs.writeFileSync(fullDiskPath, 'ORIGINAL_CONTENT\n+ REQUIREMENT_A_ADDED\n');
+
+    // Turn 2 begins: checkpoint created before Turn 2 edit
+    const cpTurn2 = await checkpointMgr.createCheckpoint([requestedPath], 'Before Turn 2 edit');
+    assert.ok(cpTurn2, 'Checkpoint before Turn 2 must be created');
+
+    // Turn 2 applies edit: removes requirement A
+    fs.writeFileSync(fullDiskPath, 'ORIGINAL_CONTENT\n');
+
+    // User triggers Undo on Turn 2
+    const undoRes = await restore.restore(cpTurn2!, [requestedPath], true);
+    assert.strictEqual(undoRes.success, true, 'Turn 2 undo must succeed');
+
+    // The restored file MUST have Turn 1's content (+ REQUIREMENT_A_ADDED), NOT the original content
+    const finalContent = fs.readFileSync(fullDiskPath, 'utf8');
+    assert.ok(
+      finalContent.includes('+ REQUIREMENT_A_ADDED'),
+      'Turn 2 undo must restore Turn 1 state, preserving added requirements rather than wiping to initial state'
+    );
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

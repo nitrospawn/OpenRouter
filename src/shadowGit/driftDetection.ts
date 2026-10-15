@@ -23,12 +23,27 @@ export class DriftDetection {
         }
 
         // Compare file with checkpoint blob using git diff
-        const { stdout } = await this.shadowRepo.runGit([
+        let { stdout } = await this.shadowRepo.runGit([
           'diff',
           checkpointId,
           '--',
           relFile,
         ]);
+
+        if (stdout.trim().length === 0) {
+          // If exact match yielded no diff, check if casing differs in git index/tree
+          try {
+            const icaseRes = await this.shadowRepo.runGit([
+              'diff',
+              checkpointId,
+              '--',
+              `:(icase)${relFile}`,
+            ]);
+            stdout = icaseRes.stdout;
+          } catch {
+            // non-fatal
+          }
+        }
 
         if (stdout.trim().length > 0) {
           logger.warn('SHADOW_GIT', `Drift detected: file ${relFile} was modified on disk since checkpoint ${checkpointId.substring(0, 7)}`);

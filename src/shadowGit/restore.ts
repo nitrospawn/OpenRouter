@@ -59,20 +59,44 @@ export class ScopedRestore {
       logger.info('SHADOW_GIT', `Batch restore successful from checkpoint ${checkpointId.substring(0, 7)} for: [${normalizedFiles.join(', ')}]`);
       return { success: true };
     } catch (err) {
-      // If batch checkout failed (e.g. one or more files in affectedFiles were newly created
-      // after checkpointId and thus do not exist in that commit), restore each affected file individually:
-      // - If the file existed in the checkpoint commit: checkout from commit.
-      // - If the file did not exist in the checkpoint commit: delete it from the workspace disk.
+      // If batch checkout failed (e.g. casing mismatch or one or more files were newly created
+      // after checkpointId and do not exist in that commit), first try case-insensitive batch checkout:
+      try {
+        const icaseFiles = normalizedFiles.map((f) => `:(icase)${f}`);
+        await this.shadowRepo.runGit(['checkout', checkpointId, '--', ...icaseFiles]);
+        await this._syncOpenDocuments(normalizedFiles, workTree);
+        logger.info('SHADOW_GIT', `Batch case-insensitive restore successful from checkpoint ${checkpointId.substring(0, 7)} for: [${normalizedFiles.join(', ')}]`);
+        return { success: true };
+      } catch {
+        // Fall back to individual file restore
+      }
+
       try {
         let anyRestored = false;
 
         for (const rel of normalizedFiles) {
+          let fileRestored = false;
+
+          // 1. Try exact checkout
           try {
             await this.shadowRepo.runGit(['checkout', checkpointId, '--', rel]);
+            fileRestored = true;
             anyRestored = true;
             logger.info('SHADOW_GIT', `Individually restored ${rel} from checkpoint ${checkpointId.substring(0, 7)}`);
           } catch {
-            // File did not exist in the checkpoint commit (newly created file by the AI).
+            // 2. Try case-insensitive checkout for platforms / git trees where casing differs
+            try {
+              await this.shadowRepo.runGit(['checkout', checkpointId, '--', `:(icase)${rel}`]);
+              fileRestored = true;
+              anyRestored = true;
+              logger.info('SHADOW_GIT', `Individually restored ${rel} (case-insensitive) from checkpoint ${checkpointId.substring(0, 7)}`);
+            } catch {
+              // File does not exist in checkpoint commit in any casing
+            }
+          }
+
+          if (!fileRestored) {
+            // File did not exist in the checkpoint commit in ANY casing (brand new file created by the AI).
             // Safely delete it from the workspace disk only if strictly inside workTree.
             const fullPath = path.isAbsolute(rel) ? rel : path.join(workTree, rel);
             const relCheck = path.relative(workTree, fullPath);
