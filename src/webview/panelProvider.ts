@@ -2018,7 +2018,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     images?: Array<{ name: string; dataUrl: string }>,
     clientMessageId?: string,
     reasoningEffort?: string,
-    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number; hasDelegatedFailure?: boolean },
+    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number; hasDelegatedFailure?: boolean; prematureWalkthroughAttempts?: number },
     isRetry?: boolean,
     userTypedText?: string,
     attachments?: any[]
@@ -2798,53 +2798,57 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             isVerificationFailure = true;
           }
 
-          // Check 2: Active plan with unchecked items
-          let activePlanContent = planDocument;
-          if (!prematureWalkthroughReason && !activePlanContent && this._historyStore) {
+          // Pre-calculate whether a physical verification command has executed with exit code 0 for this task
+          let taskStartTimestamp = 0;
+          if (this._historyStore) {
             try {
               const hist = await this._historyStore.loadHistory();
-              const lastPlanMsg = [...hist].reverse().find(
-                (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
-              );
-              activePlanContent = lastPlanMsg?.planDocument || lastPlanMsg?.content;
+              const lastUserMsg = [...hist].reverse().find((m) => m.role === 'user');
+              taskStartTimestamp = lastUserMsg?.timestamp || 0;
             } catch {
               // non-fatal
             }
           }
 
-          if (!prematureWalkthroughReason && activePlanContent) {
-            const hasUncheckedItems = /^\s*-\s*\[ \]/m.test(activePlanContent);
-            if (hasUncheckedItems) {
-              prematureWalkthroughReason = 'There are uncompleted checklist items (- [ ]) remaining in the active implementation plan.';
-              isVerificationFailure = true;
-            }
-          }
+          const recentOutputs = TerminalOutputTracker.getRecentOutputs();
+          const hasVerifiedExitZero = recentOutputs.some(
+            (out) =>
+              out.exitCode === 0 &&
+              out.status === 'success' &&
+              !CommandRunner.isReadOnly(out.command) &&
+              (taskStartTimestamp === 0 || out.timestamp >= taskStartTimestamp - 5000)
+          );
 
-          // Check 3: Physical verification command with exit code 0 for this task
+          // Check 2: Active plan with unchecked items
+          // If the model produced a plan in the CURRENT turn (rawPlanDocument) that still has unchecked items (- [ ]),
+          // emitting a walkthrough in that same turn is contradictory and premature.
+          // For historic plans in history, if a verification command has physically passed (hasVerifiedExitZero),
+          // the plan tasks have been completed and verified, so historic unchecked items do not block completion.
           if (!prematureWalkthroughReason) {
-            let taskStartTimestamp = 0;
-            if (this._historyStore) {
+            if (rawPlanDocument && /^\s*-\s*\[ \]/m.test(rawPlanDocument)) {
+              prematureWalkthroughReason = 'There are uncompleted checklist items (- [ ]) remaining in the implementation plan emitted this turn.';
+              isVerificationFailure = true;
+            } else if (!hasVerifiedExitZero && this._historyStore) {
               try {
                 const hist = await this._historyStore.loadHistory();
-                const lastUserMsg = [...hist].reverse().find((m) => m.role === 'user');
-                taskStartTimestamp = lastUserMsg?.timestamp || 0;
+                const lastPlanMsg = [...hist].reverse().find(
+                  (m) => m.role === 'assistant' && (m.planDocument || /```plan/i.test(m.content))
+                );
+                const activePlanContent = lastPlanMsg?.planDocument || lastPlanMsg?.content;
+                if (activePlanContent && /^\s*-\s*\[ \]/m.test(activePlanContent)) {
+                  prematureWalkthroughReason = 'There are uncompleted checklist items (- [ ]) remaining in the active implementation plan, and no verification command has returned exit code 0.';
+                  isVerificationFailure = true;
+                }
               } catch {
                 // non-fatal
               }
             }
+          }
 
-            const recentOutputs = TerminalOutputTracker.getRecentOutputs();
-            const hasVerifiedExitZero = recentOutputs.some(
-              (out) =>
-                out.exitCode === 0 &&
-                out.status === 'success' &&
-                !CommandRunner.isReadOnly(out.command) &&
-                (taskStartTimestamp === 0 || out.timestamp >= taskStartTimestamp - 5000)
-            );
-            if (!hasVerifiedExitZero) {
-              prematureWalkthroughReason = 'No non-read-only verification command (test runner, build, lint, or compiler) has physically executed and returned exit code 0 for this task in Recent Terminal Outputs.';
-              isVerificationFailure = true;
-            }
+          // Check 3: Physical verification command with exit code 0 for this task
+          if (!prematureWalkthroughReason && !hasVerifiedExitZero) {
+            prematureWalkthroughReason = 'No non-read-only verification command (test runner, build, lint, or compiler) has physically executed and returned exit code 0 for this task in Recent Terminal Outputs.';
+            isVerificationFailure = true;
           }
 
           // Check 4: Exactly ONE walkthrough per task session (prevent generating multiple walkthroughs)
@@ -3129,9 +3133,29 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
             // NOTE: If the walkthrough was suppressed because of plan-gating (no plan created) or duplicate
             // suppression, or if the model's summary explicitly states all work is complete, NEVER trigger an auto-followup!
             const isContentComplete =
-              /\b(all plan items are complete|all work is complete|implementation is complete|everything is complete|all tasks are complete|task is complete|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i.test(accumulatedContent);
+              Boolean(walkthroughDocument) ||
+              /\b(all plan items are (?:complete|completed|implemented|verified)|all work is (?:complete|completed)|implementation is (?:complete|completed)|everything is (?:complete|completed)|all tasks are (?:complete|completed)|task is (?:complete|completed)|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification (?:complete|passed|clean)|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues|analyze clean|tests? pass(?:ed)?|all tests pass|fully implemented|implemented and verified)\b/i.test(accumulatedContent) ||
+              /\b(?:Root Cause & Solution Summary|Verification Facts|How to Test)\b/i.test(accumulatedContent);
 
-            if (!triggeredFollowUp && isVerificationFailure && prematureWalkthroughReason && !isContentComplete && !this._isUserCancelled && !this._activeAbortController?.signal.aborted) {
+            // GUARD: If a valid walkthrough was just accepted this turn, the task is done — never re-prompt.
+            // Also check walkthroughInHistory (loaded inside _handleAutoExecution) via a quick inline check.
+            let walkthroughAlreadyInHistory = Boolean(walkthroughDocument);
+            if (!walkthroughAlreadyInHistory && this._historyStore) {
+              try {
+                const histCheck = await this._historyStore.loadHistory();
+                let lastUserIdxCheck = -1;
+                for (let i = histCheck.length - 1; i >= 0; i--) {
+                  if (histCheck[i].role === 'user') { lastUserIdxCheck = i; break; }
+                }
+                const taskScope = lastUserIdxCheck >= 0 ? histCheck.slice(lastUserIdxCheck) : histCheck;
+                walkthroughAlreadyInHistory = taskScope.some(m => m.role === 'assistant' && m.walkthroughDocument);
+              } catch {
+                // non-fatal
+              }
+            }
+
+            const prematureAttempts = (retryContext as any)?.prematureWalkthroughAttempts ?? 0;
+            if (!triggeredFollowUp && isVerificationFailure && prematureWalkthroughReason && !isContentComplete && !walkthroughAlreadyInHistory && prematureAttempts < 1 && !this._isUserCancelled && !this._activeAbortController?.signal.aborted) {
               const currentAutoTurns = retryContext?.autoTurnCount ?? 0;
               const MAX_AUTO_FOLLOWUPS = (planDocument || retryContext?.isAutoFollowUp) ? 30 : 10;
               if (currentAutoTurns < MAX_AUTO_FOLLOWUPS) {
@@ -3148,6 +3172,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
                     failedCommands: retryContext?.failedCommands ?? new Set<string>(),
                     autoTurnCount: currentAutoTurns + 1,
                     isAutoFollowUp: true,
+                    prematureWalkthroughAttempts: prematureAttempts + 1,
                   }
                 );
               }
@@ -3321,7 +3346,7 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
   private async _handleAutoExecution(
     content: string,
     modelId?: string,
-    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number; hasDelegatedFailure?: boolean },
+    retryContext?: { retryCount: number; failedCommands: Set<string>; autoTurnCount?: number; isAutoFollowUp?: boolean; emptyRetryCount?: number; hasDelegatedFailure?: boolean; prematureWalkthroughAttempts?: number },
     walkthroughDocument?: string,
     planDocument?: string,
     assistantMessageId?: string
@@ -4243,9 +4268,13 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     const MAX_AUTO_FOLLOWUPS = hasPendingPlanItems ? 30 : 10;
 
     // 3. Auto-continue conversation with terminal outputs so the model can complete its response
+    // GUARD: If a walkthrough was accepted this turn or already exists in history, the task is DONE.
+    // Do NOT send any more continuation prompts — this is the primary defense against the infinite walkthrough loop.
     const hasCommandsToReport = successfulCommands.length > 0 || executedInspectionCommands.length > 0;
     if (
       hasCommandsToReport &&
+      !walkthroughDocument &&
+      !walkthroughInHistory &&
       !this._isUserCancelled &&
       !this._activeAbortController?.signal.aborted
     ) {
@@ -4294,7 +4323,23 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
           if (hasFailedProbe) {
             continuationPrompt += "CRITICAL NOTE: A network/port probe failed above. Do NOT sleep or repeat the same probe. Immediately inspect the background process output or crash log (e.g. Get-Content <log>) or verify environment prerequisites (e.g. java -version). If prerequisites are missing or the service crashed, classify as [ENV_ISSUE] and clearly explain the blocking prerequisite with 2–3 options.";
           } else {
-            continuationPrompt += "Based on the terminal command results and applied changes above, please continue executing the plan autonomously until all tasks are complete and verified. Do NOT emit a walkthrough block during intermediate steps; conclude with the final walkthrough block only when all tasks and verifications are complete.";
+            // Detect if all plan items are now complete AND a verification command just
+            // passed exit code 0. If so, this IS the final step - prompt the model to
+            // emit the walkthrough NOW instead of another prose summary.
+            const allPlanItemsDone = !taskScopeHistory.some(m => {
+              if (m.role !== 'assistant') return false;
+              const text = m.planDocument || m.content;
+              return /^\s*-\s*\[ \]/m.test(text);
+            });
+            const hasJustVerified =
+              successfulCommands.length > 0 ||
+              executedInspectionCommands.some(c => c.success && c.exitCode === 0);
+
+            if (allPlanItemsDone && hasJustVerified) {
+              continuationPrompt += "All plan checklist items are complete and the verification command above passed with exit code 0. The task is fully verified.\n\nNow conclude by providing:\n1. The detailed results briefing with these exact headings:\n- **Root Cause & Solution Summary**: Clear explanation of what was addressed.\n- **Files & Key Changes**: Bullet points with exact files, widgets/methods/functions modified.\n- **Verification Facts**: Exact verification command executed and exit code.\n- **How to Test**: Step-by-step user instructions for manual validation.\n\n2. The formal ````walkthrough block directly below the summary (starting with ````walkthrough on its own line, containing # Implementation Walkthrough with ## Changes Made, ## Implementation Decisions, and ## Verification Results).";
+            } else {
+              continuationPrompt += "Based on the terminal command results and applied changes above, please continue executing the plan autonomously until all tasks are complete and verified. Do NOT emit a walkthrough block during intermediate steps; conclude with the final \`\`\`\`walkthrough block only when all tasks and verifications are complete.";
+            }
           }
         }
 
@@ -4358,14 +4403,18 @@ export class OpenRouterPanelProvider implements vscode.WebviewViewProvider {
     // Only engage if an active multi-step implementation plan is underway AND has pending checklist items.
     // NEVER engage when all plan items are done, or when the model states the work is complete.
     // GUARD: If a walkthrough already exists in this task session, the task is DONE — stop immediately.
+    const hasWalkthroughInResponse = Boolean(walkthroughDocument) || /(?:```|````)walkthrough/i.test(content);
     const isExplicitlyComplete =
-      /\b(all plan items are complete|all work is complete|implementation is complete|everything is complete|all tasks are complete|task is complete|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i.test(content);
+      hasWalkthroughInResponse ||
+      /\b(all plan items are (?:complete|completed|implemented|verified)|all work is (?:complete|completed)|implementation is (?:complete|completed)|everything is (?:complete|completed)|all tasks are (?:complete|completed)|task is (?:complete|completed)|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification (?:complete|passed|clean)|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues|analyze clean|tests? pass(?:ed)?|all tests pass|fully implemented|implemented and verified)\b/i.test(content) ||
+      /\b(?:Root Cause & Solution Summary|Verification Facts|How to Test)\b/i.test(content);
 
     if (
       isExecutionActive &&
       hasPendingPlanItems &&
       !walkthroughInHistory &&
       !isExplicitlyComplete &&
+      !hasWalkthroughInResponse &&
       successfullyEditedFiles.length === 0 &&
       successfulCommands.length === 0 &&
       failedEdits.length === 0 &&

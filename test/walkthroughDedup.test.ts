@@ -147,3 +147,28 @@ test('Walkthrough Guard: panelProvider.ts avoids re-prompt loop on intentional p
   const regex = /\b(all plan items are complete|all work is complete|implementation is complete|everything is complete|all tasks are complete|task is complete|no further steps|no pending steps|no pending checklist items|check is complete|done:|nothing to implement|no code changes were requested|verification complete|ready for your next request|no pending edits|unmodified|clean working tree|passes? clean|pass analysis clean|with no issues)\b/i;
   assert.ok(regex.test(sampleSummary), 'Completion regex must match complete and verified assistant summary');
 });
+
+test('Walkthrough Guard: panelProvider.ts ensures successful verification exit code 0 fulfills active plan and caps auto-correction', () => {
+  const providerPath = path.resolve(__dirname, '../../src/webview/panelProvider.ts');
+  const providerContent = fs.readFileSync(providerPath, 'utf8');
+
+  // Verify hasVerifiedExitZero is calculated before Check 2
+  assert.ok(
+    providerContent.includes('const hasVerifiedExitZero = recentOutputs.some('),
+    'panelProvider.ts must compute hasVerifiedExitZero'
+  );
+
+  // Verify Check 2 allows historic plan when hasVerifiedExitZero is true
+  assert.ok(
+    providerContent.includes('else if (!hasVerifiedExitZero && this._historyStore)'),
+    'panelProvider.ts must only check historic plan unchecked items if verification has not succeeded'
+  );
+
+  // Verify auto-correction attempt cap (prematureAttempts < 1) prevents endless re-prompt loops
+  assert.ok(
+    providerContent.includes('prematureAttempts < 1') &&
+      providerContent.includes('prematureWalkthroughAttempts: prematureAttempts + 1'),
+    'panelProvider.ts must cap premature walkthrough auto-correction attempts'
+  );
+});
+

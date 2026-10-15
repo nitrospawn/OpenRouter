@@ -421,16 +421,19 @@ When a complex task is fully done, produce a walkthrough block:
 - Known gaps or follow-up work
 \`\`\`\`
 
-[RICH FACTUAL RESULTS BRIEFING — OUTSIDE the block]
+[RICH FACTUAL RESULTS BRIEFING — MANDATORY UPON COMPLETION]
 Provide a detailed, self-contained factual summary directly in the chat so the user gets the complete picture without having to open the results document:
 1. **Root Cause & Solution Summary**: Clearly state what was wrong/missing and how the changes resolve it.
 2. **Files & Key Changes**: Bullet points detailing each modified or created file along with the exact classes, functions, or widgets added or updated.
-3. **Verification Facts**: Exact verification commands run (e.g. \`flutter analyze\`, \`npm test\`), exit codes, and test results (e.g. \`14 passed, 0 failed, exit code 0\`).
-Never write a terse 1-liner like "The refactor is complete." Always provide the full factual breakdown.
+3. **Verification Facts**: Exact verification commands run (e.g. \`flutter analyze\`, \`npm test\`), exit codes, and test results (e.g. \`exit code 0\`, \`no issues found\`).
+4. **How to Test**: Concrete steps the user can execute on their machine/device to verify the fix works as expected.
+Never write a terse 1-liner or brief paragraph. Always provide all 4 factual sections above.
+
+When an implementation plan was executed, emit the formal \`\`\`\`walkthrough block immediately below this briefing. Ensure \`\`\`\`walkthrough is on its own line with no leading text or backtick typos.
 
 WALKTHROUGH RULES:
 - PLAN-GATED WALKTHROUGHS (HARD RULE): Do NOT emit a \`\`\`\`walkthrough block unless an implementation plan was created for this task or the user explicitly asked for a walkthrough / results docs.
-  • For direct bug fixes, single-file edits, or tasks executed without a plan: do NOT create a \`\`\`\`walkthrough block or Results docs card. Instead, provide a clear, comprehensive factual explanation directly in chat (What the Root Cause Was, What Was Fixed, and Verification Outcome & How to Test).
+  • For direct bug fixes, single-file edits, or tasks executed without a plan: do NOT create a \`\`\`\`walkthrough block or Results docs card. Instead, provide the 4-part factual briefing directly in chat (Root Cause, Files & Key Changes, Verification Facts, and How to Test).
   • Produce a \`\`\`\`walkthrough block ONLY for tasks that went through an implementation plan or when the user explicitly requests one.
 - PHYSICAL EXECUTION GATE (HARD RULE): The \`\`\`\`walkthrough block is the VERY LAST artifact produced in a task. Before emitting it, ALL three conditions must be true:
   1. Every checklist item is checked off (- [x]). No unchecked (- [ ]) items remain.

@@ -19,11 +19,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Repetitive Fix Explanation on User Acknowledgments:**
   - Resolved an issue where replying with an acknowledgment or confirmation (e.g. *"its fine now thank you"*, *"that fixed it"*, *"works now"*) caused the model to re-output the entire 3-part technical briefing (Root Cause, What Was Fixed, Verification & How to Test) from the preceding turn.
   - Updated Section 1 in `systemPrompt.ts` to explicitly distinguish active bug-fixing turns from user acknowledgments, instructing models to respond conversationally and concisely without re-dumping past technical briefings when no new work was requested.
+- **Walkthrough Code Block Detection & Raw Markdown Fallback:**
+  - Resolved an issue where walkthrough documents emitted by certain models (e.g., GLM 5.3 Flash) with leading spaces or indentation before code fences were rendered as raw markdown inside chat rather than being captured as interactive `[📄 Results docs  👁 View]` artifact cards.
+  - Updated `findTopLevelFence` in `responseParser.ts` to accommodate arbitrary leading whitespace (`^\s*(```|~~~)`) on opening tags.
+  - Expanded the resilient fallback in `responseParser.ts` to detect unfenced `# Implementation Walkthrough` markdown structures containing sections like `## Changes Made` or `## Verification Results`, transforming them into first-class Results docs cards.
 - **Simultaneous Plan Docs and Results Docs Artifact Cards:**
   - Resolved an issue where a final task response rendered both `[📄 Plan docs  ✓ Proceed]` and `[📄 Results docs  👁 View]` cards when models repeated plan blocks alongside the final walkthrough block.
   - Added an artifact exclusivity guard in `responseParser.ts` to suppress `planDocument` and strip residual `📄 Plan docs ready` tokens whenever a completion `walkthroughDocument` is present.
   - Added a backend confirmation cleanup in `panelProvider.ts` to ensure confirmed walkthrough completions completely reset any residual `planDocument`.
   - Added a UI-level rendering guard in `main.ts` so that messages containing Results docs notices or cards automatically suppress Plan docs cards.
+
+### Added
+- **Mandatory 4-Part Completion Briefing (Root Cause, Changes, Verification, Test):**
+  - Updated `systemPrompt.ts` (Section 10) and `panelProvider.ts` final continuation prompt to explicitly require all 4 structured completion sections across every task:
+    1. **Root Cause & Solution Summary**
+    2. **Files & Key Changes** (classes, functions, widgets modified)
+    3. **Verification Facts** (exact commands run and exit code 0)
+    4. **How to Test** (step-by-step user instructions for testing)
+  - Eliminates overly brief/terse 1-2 sentence conclusions while ensuring the formal ````walkthrough block is emitted directly below.
 
 ### Added
 - **Plan-Gated Results Docs / Walkthrough Generation:**

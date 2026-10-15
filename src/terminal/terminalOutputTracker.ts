@@ -60,8 +60,8 @@ export class TerminalOutputTracker {
       timestamp: Date.now(),
     });
 
-    // Keep the last 5 completed outputs to prevent context bloating
-    if (this.recentOutputs.length > 5) {
+    // Keep the last 20 completed outputs in memory for verification tracking
+    if (this.recentOutputs.length > 20) {
       this.recentOutputs.shift();
     }
   }
@@ -95,8 +95,8 @@ export class TerminalOutputTracker {
           timestamp: Date.now()
         });
 
-        // Keep only the last 5 completed outputs to prevent context bloating
-        if (this.recentOutputs.length > 5) {
+        // Keep only the last 20 completed outputs in memory for verification tracking
+        if (this.recentOutputs.length > 20) {
           this.recentOutputs.shift();
         }
       }
@@ -123,8 +123,9 @@ export class TerminalOutputTracker {
   public static getRecentOutputsFormatted(): string {
     const parts: string[] = [];
 
-    // 1. Completed outputs
-    for (const out of this.recentOutputs) {
+    // 1. Completed outputs (take the last 5 for prompt context economy)
+    const outputsForPrompt = this.recentOutputs.slice(-5);
+    for (const out of outputsForPrompt) {
       let statusHeader = '';
       if (out.status === 'success') {
         statusHeader = `[Exit code: 0 (Success)]`;

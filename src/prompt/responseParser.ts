@@ -24,8 +24,8 @@ function findTopLevelFence(text: string, tag: 'plan' | 'walkthrough'): FenceInfo
   const pattern = tag === 'plan'
     ? '(?:plan|implementation[-_]?plan|plan[-_]?document|plan[-_]?docs)'
     : '(?:walkthrough|results?|result[-_]?walkthrough|verification[-_]?walkthrough|walkthrough[-_]?document)';
-  // Support 3 or more backticks (or tildes) followed by the tag
-  const openRegex = new RegExp(`^(\`{3,}|~{3,})${pattern}[^\\r\\n]*$`, 'im');
+  // Support 3 or more backticks (or tildes) followed by the tag, allowing optional leading horizontal whitespace
+  const openRegex = new RegExp(`^[ \\t]*(\`{3,}|~{3,})\\s*${pattern}[^\\r\\n]*$`, 'im');
   const openMatch = openRegex.exec(text);
   if (!openMatch) return undefined;
 
@@ -249,10 +249,11 @@ export function extractArtifacts(rawContent: string): ExtractedArtifacts {
   // Only attempt this fallback if the message does NOT contain pending file edits or terminal commands
   const hasEditsOrCommands = /(?:```|````)(?:create_file|edit_file|file|create|edit|patch|bash|sh|shell|cmd|powershell|pwsh)\b/i.test(rawContent);
   if (!walkthroughFence && !walkthroughDocument && !hasEditsOrCommands) {
-    const unfencedWalkthroughMatch = /(?:^|\n)(#{1,3}\s+(?:(?:Final\s+)?Walkthrough|Verification\s+(?:&|and)\s+Walkthrough|Walkthrough\s+(?:Report|Result))[\s\S]*)$/i.exec(chatSummary);
+    const unfencedWalkthroughMatch = /(?:^|\n)(#{1,3}\s+(?:(?:Implementation|Final|Verification|Task)?\s*Walkthrough|Walkthrough\s+(?:Report|Result|Overview)?)\b[\s\S]*)$/i.exec(chatSummary);
     if (unfencedWalkthroughMatch && unfencedWalkthroughMatch[1].trim().length > 30) {
       const candidateWalkthrough = unfencedWalkthroughMatch[1].trim();
-      if (candidateWalkthrough.includes('\n')) {
+      // Ensure it contains structured walkthrough sections like Changes Made or Verification Results
+      if (candidateWalkthrough.includes('\n') && (/#{2,3}\s+(?:Changes\s+Made|Verification|Implementation|Files)/i.test(candidateWalkthrough) || /^[-*\d]\.?\s+/m.test(candidateWalkthrough))) {
         walkthroughDocument = candidateWalkthrough;
         const prefix = chatSummary.slice(0, unfencedWalkthroughMatch.index).trim();
         if (prefix.length > 0) {
